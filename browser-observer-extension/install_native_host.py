@@ -18,6 +18,9 @@ import secrets
 import shlex
 import sys
 
+# 见 native_host.py：被 serve.py 导入时不得把 __pycache__ 落到扩展目录。
+sys.dont_write_bytecode = True
+
 BRIDGE = Path(__file__).resolve().parent.parent / 'cua-mcp-bridge'
 if not (BRIDGE / 'browser_events.py').is_file():
     print('Missing companion component: ../cua-mcp-bridge/browser_events.py; '

@@ -5,6 +5,10 @@ from pathlib import Path
 import struct
 import sys
 
+# 扩展目录内不得出现 __pycache__：Chrome 会递归扫描，凡是 "_" 开头的
+# 文件/目录一律拒载（Cannot load extension with file or directory name）。
+sys.dont_write_bytecode = True
+
 BRIDGE = Path(__file__).resolve().parent.parent / 'cua-mcp-bridge'
 if not (BRIDGE / 'browser_events.py').is_file():
     print('Missing companion component: ../cua-mcp-bridge/browser_events.py; '

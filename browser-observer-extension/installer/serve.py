@@ -26,6 +26,9 @@ from urllib.parse import urlsplit
 
 BASE = Path(__file__).resolve().parent
 EXTENSION = BASE.parent
+# 必须早于下面的 import：否则 import install_native_host 会在扩展目录里
+# 生成 __pycache__，而 Chrome 拒载任何 "_" 开头的条目。
+sys.dont_write_bytecode = True
 sys.path.insert(0, str(EXTENSION))
 
 import install_native_host as host  # noqa: E402  单一事实来源：扩展 ID 与宿主计划都来自它
@@ -150,10 +153,29 @@ def runtime_state(plan):
     return stated
 
 
+def packaging_state():
+    """Chrome 会递归扫描扩展目录：凡是以 "_" 开头的文件或目录一律拒载
+    （Cannot load extension with file or directory name …）。典型来源是
+    Python 的 __pycache__。这里提前查出来，避免用户点"加载已解压"才发现。"""
+    reserved = []
+    if EXTENSION.is_dir():
+        for root, dirnames, filenames in os.walk(EXTENSION):
+            for name in list(dirnames) + list(filenames):
+                if name.startswith('_'):
+                    reserved.append(str(Path(root, name).relative_to(EXTENSION)))
+    manifest_ready = (EXTENSION / 'manifest.json').is_file()
+    return {
+        'manifestReady': manifest_ready,
+        'reservedEntries': sorted(reserved),
+        'ready': manifest_ready and not reserved,
+    }
+
+
 def status():
     plan = host.plan()
     registration = registration_state(plan)
     runtime = runtime_state(plan)
+    packaging = packaging_state()
     installs = extension_state(plan['extensionId'])
     installed = any(item['enabled'] for item in installs) or bool(installs)
     enabled = any(item['enabled'] for item in installs)
@@ -161,6 +183,11 @@ def status():
     blockers = []
     if not EXTENSION.is_dir():
         blockers.append('扩展源码目录不存在')
+    elif not packaging['manifestReady']:
+        blockers.append('扩展目录缺少 manifest.json')
+    elif packaging['reservedEntries']:
+        blockers.append('扩展目录含 "_" 前缀条目，Chrome 会整包拒载：%s'
+                        % '、'.join(packaging['reservedEntries']))
     if not registration['registered']:
         blockers.append('原生宿主尚未登记：%s' % registration['reason'])
     if not runtime['ready']:
@@ -180,6 +207,7 @@ def status():
         'chromeRunning': chrome_running(),
         'host': {'registrationPath': plan['manifestPath'], **registration},
         'runtime': runtime,
+        'packaging': packaging,
         'extension': {'installed': installed, 'enabled': enabled,
                       'permissionGranted': granted, 'profiles': installs},
         'blockers': blockers,
