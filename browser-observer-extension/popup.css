@@ -1,0 +1,7 @@
+body { width: 390px; margin: 16px; font: 13px/1.5 system-ui, sans-serif; color: #18202c; }
+h1 { font-size: 18px; }
+label { display: block; margin: 10px 0; }
+input:not([type]) { box-sizing: border-box; width: 100%; padding: 7px; }
+button { padding: 7px; margin-right: 5px; }
+pre { white-space: pre-wrap; overflow-wrap: anywhere; background: #f0f3f6; padding: 10px; }
+#error { color: #a11; }

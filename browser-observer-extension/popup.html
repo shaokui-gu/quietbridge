@@ -1,0 +1,16 @@
+<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"><title>WorkbuddyExtension</title><link rel="stylesheet" href="popup.css"></head>
+<body><h1>WorkbuddyExtension</h1>
+<p>一次授权普通 HTTP/HTTPS 全站。任务和目标由可信原生端内部派发，无需填写任务 ID、逐任务配对或逐站授权。</p>
+<p>仅观察已分配标签的脱敏 URL（无凭据、查询和片段）、readyState、布局布尔值及元素计数。不读取 cookies、input 值或正文。</p>
+<p><strong>能力边界</strong>：可为任务新建专用窗口（不抢前台、复用当前配置文件的登录态，不做数据隔离）；可在已分配页面执行快照、诊断、点击、填写、选择、滚动与导航。<strong>这些是页面内事件，不等同可信硬件输入</strong>；需要真实用户手势的控件（文件选择、部分支付）不会被绕过。不执行桌面输入。</p>
+<div><button id="enable">一次授权并启用</button><button id="disable">停用观察</button><button id="refresh">刷新状态</button></div>
+<p>全站权限 globalPermission：<strong id="permission">正在检查</strong></p>
+<p>原生连接 nativeConnection：<strong id="connection">正在检查</strong></p>
+<p>任务分配 taskAssignment：<strong id="assignment">正在检查</strong></p>
+<p>扩展 ID extensionId：<code id="extid">—</code></p>
+<p>未明确目标时保持 needs_target_selection，不接管当前标签。浏览器标签与系统窗口的自动映射尚未实现；browserWindowId 不是 CGWindowID，mappingVerified 始终 false，不授权桌面输入。</p>
+<p>允许同一已绑定标签跨普通 HTTP(S) 站点导航；受限页暂停。撤销权限立即清空观察，重新授权后由内部重新分配。停用不撤销 Chrome 已授予权限。</p>
+<p>contentReady 始终 unknown（null）；生命周期及可选任务 CSS 条件不代表业务就绪，不作为 wait_ready 成功依据。</p>
+<pre id="state">无任务分配</pre><p id="error" role="alert"></p>
+<script src="popup.js"></script></body></html>

@@ -1,0 +1,46 @@
+// Generated base from native/generate-protocol.ts; local browserSession extension mirrors protocol.schema.json.
+enum NativeProtocol {
+    static let modelMethods: [String] = ["activate", "browserSession", "click", "drag", "findApps", "getApp", "getCapabilities", "getState", "hover", "listApps", "listWindows", "paste", "performSecondaryAction", "powerGuard", "pressKey", "preview", "screenshot", "scroll", "selectText", "setValue", "show", "typeText", "visualState"]
+    static let fields: [String: Set<String>] = [
+        "activate": ["appHandle"],
+        "applicationIcons": ["paths"],
+        "browserSession": ["action", "sessionId", "confirm", "pid", "windowId"],
+        "click": ["appHandle", "clickCount", "elementIndex", "holdMs", "modifiers", "mouseButton", "snapshotId", "windowId", "x", "y"],
+        "drag": ["appHandle", "durationMs", "fromX", "fromY", "modifiers", "mouseButton", "snapshotId", "steps", "toX", "toY", "windowId"],
+        "findApps": ["maxAppMatches", "query"],
+        "getApp": ["selector"],
+        "getCapabilities": [],
+        "getState": ["appHandle", "details", "includeMenus", "maxDepth", "maxElements", "windowId"],
+        "hover": ["appHandle", "elementIndex", "snapshotId", "windowId", "x", "y"],
+        "launchApp": ["appHandle"],
+        "listApps": [],
+        "listWindows": ["appHandle"],
+        "openPermissionSettings": ["permission"],
+        "paste": ["appHandle", "format", "maxClipboardBytes", "maxDepth", "maxElements", "pasteReadTimeoutMs", "text"],
+        "performSecondaryAction": ["action", "appHandle", "elementIndex", "snapshotId"],
+        "permissionStatus": [],
+        "powerGuard": ["action", "durationSeconds"],
+        "pressKey": ["appHandle", "key", "modifiers"],
+        "preview": ["action", "appHandle", "durationSeconds", "source", "windowId"],
+        "requestPermission": ["permission"],
+        "screenshot": ["appHandle", "windowId"],
+        "visualState": ["appHandle", "windowId"],
+        "scroll": ["appHandle", "deltaLinesX", "deltaLinesY", "snapshotId", "windowId", "x", "y"],
+        "selectText": ["appHandle", "elementIndex", "prefix", "selectionType", "snapshotId", "suffix", "text"],
+        "setValue": ["appHandle", "elementIndex", "snapshotId", "value"],
+        "show": ["appHandle", "windowId"],
+        "typeText": ["appHandle", "text"],
+    ]
+    static let stringEnums: [String: [String: Set<String>]] = [
+        "browserSession": ["action": ["prepare", "list", "start", "attach"]],
+        "click": ["modifiers": ["command", "control", "fn", "option", "shift"], "mouseButton": ["left", "middle", "right"]],
+        "drag": ["modifiers": ["command", "control", "fn", "option", "shift"], "mouseButton": ["left", "middle", "right"]],
+        "openPermissionSettings": ["permission": ["accessibility", "screenRecording"]],
+        "paste": ["format": ["html", "text"]],
+        "pressKey": ["modifiers": ["command", "control", "fn", "option", "shift"]],
+        "powerGuard": ["action": ["hold", "release", "status"]],
+        "preview": ["action": ["hold", "release", "status"], "source": ["desktop", "window"]],
+        "requestPermission": ["permission": ["accessibility", "screenRecording"]],
+        "selectText": ["selectionType": ["cursor_after", "cursor_before", "text"]],
+    ]
+}

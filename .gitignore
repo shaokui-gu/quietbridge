@@ -1,0 +1,40 @@
+# 构建产物与临时目录
+.build/
+build/
+ModuleCache/
+__pycache__/
+cua-helper-build/tmp/
+*.pyc
+*.pcm
+*.o
+*.swiftmodule
+*.dSYM/
+
+# 编译出的可执行文件与历史快照
+workbuddy-cua-native
+workbuddy-cua-native.*
+dsh-cua-native
+dsh-cua-native.*
+*.backup
+*.backup-*
+*.pre-*
+
+# 应用包与签名材料（含开发者证书链信息）
+*.app/
+*.provisionprofile
+*.mobileprovision
+*.p12
+*.cer
+
+# 测试证据与截图：体积大，且包含本机画面与路径
+verify-2/
+output/
+cua-mcp-bridge/shots/
+*.log
+
+# 运行时配置
+.cua-config/
+
+# 本机记忆与编辑器
+.workbuddy/
+.DS_Store
