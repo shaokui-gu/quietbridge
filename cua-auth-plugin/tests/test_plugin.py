@@ -27,49 +27,69 @@ class PluginABITests(unittest.TestCase):
             self.assertEqual(run.returncode, 0, run.stderr)
             self.assertIn("PASS", run.stdout)
 
-    @unittest.skip("旧版模拟服务仅支持协议 1；不能作为协议 2 与真实授权宿主的验证")
+    def _build(self, directory):
+        host = Path(directory) / "PluginHost"
+        server = Path(directory) / "LoginAuthorizationTestServer"
+        common = ["/usr/bin/xcrun", "--sdk", "macosx", "clang"]
+        compile_host = subprocess.run(common + [
+            "-framework", "Security", "-o", str(host),
+            str(ROOT / "tests" / "PluginHost.c"),
+        ], check=False, capture_output=True, text=True)
+        self.assertEqual(compile_host.returncode, 0, compile_host.stderr)
+        compile_server = subprocess.run(common + [
+            "-o", str(server),
+            str(ROOT / "tests" / "LoginAuthorizationTestServer.c"),
+        ], check=False, capture_output=True, text=True)
+        self.assertEqual(compile_server.returncode, 0, compile_server.stderr)
+        return host, server
+
+    def _sign(self, binary, identifier):
+        identity = os.environ.get(
+            "AUTH_SIGNING_IDENTITY", "Developer ID Application: shaokui gu (62RNP54C47)")
+        sign = subprocess.run([
+            "/usr/bin/codesign", "--force", "--options", "runtime",
+            "--timestamp=none", "--sign", identity,
+            "--identifier", identifier, str(binary),
+        ], check=False, capture_output=True, text=True)
+        self.assertEqual(sign.returncode, 0, sign.stderr)
+
+    def _run_against_server(self, directory, identifier, expectation):
+        host, server = self._build(directory)
+        self._sign(server, identifier)
+        running = subprocess.Popen(
+            [str(server)], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+
+        def cleanup_server():
+            if running.poll() is None:
+                running.kill()
+            running.wait(timeout=5)
+            running.stdout.close()
+            running.stderr.close()
+
+        self.addCleanup(cleanup_server)
+        self.assertEqual(running.stdout.readline().strip(), "READY")
+        result = subprocess.run(
+            [str(host), str(BUNDLE / "Contents" / "MacOS" /
+                            "WorkBuddyCUAAuthorizationPlugin"), expectation],
+            check=False, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return result, running
+
     def test_signed_server_allows_one_authorization(self):
+        """protocol 3 round trip: identity matches, daemon answers Allow."""
         with tempfile.TemporaryDirectory() as directory:
-            host = Path(directory) / "PluginHost"
-            server = Path(directory) / "LoginAuthorizationTestServer"
-            common = ["/usr/bin/xcrun", "--sdk", "macosx", "clang"]
-            compile_host = subprocess.run(common + [
-                "-framework", "Security", "-o", str(host),
-                str(ROOT / "tests" / "PluginHost.c"),
-            ], check=False, capture_output=True, text=True)
-            self.assertEqual(compile_host.returncode, 0, compile_host.stderr)
-            compile_server = subprocess.run(common + [
-                "-o", str(server),
-                str(ROOT / "tests" / "LoginAuthorizationTestServer.c"),
-            ], check=False, capture_output=True, text=True)
-            self.assertEqual(compile_server.returncode, 0, compile_server.stderr)
+            result, running = self._run_against_server(
+                directory, "com.workbuddy.cua.helper", "allow")
+            self.assertIn("PASS: trusted server allowed", result.stdout)
+            self.assertIn("ALLOWED session=", running.stdout.readline())
 
-            identity = os.environ.get(
-                "AUTH_SIGNING_IDENTITY", "Developer ID Application: shaokui gu (62RNP54C47)")
-            sign = subprocess.run([
-                "/usr/bin/codesign", "--force", "--options", "runtime",
-                "--timestamp=none", "--sign", identity,
-                "--identifier", "com.workbuddy.cua.helper", str(server),
-            ], check=False, capture_output=True, text=True)
-            self.assertEqual(sign.returncode, 0, sign.stderr)
-            running = subprocess.Popen(
-                [str(server)], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-
-            def cleanup_server():
-                if running.poll() is None:
-                    running.kill()
-                running.wait(timeout=5)
-                running.stdout.close()
-                running.stderr.close()
-
-            self.addCleanup(cleanup_server)
-            self.assertEqual(running.stdout.readline().strip(), "READY")
-            result = subprocess.run(
-                [str(host), str(BUNDLE / "Contents" / "MacOS" /
-                                "WorkBuddyCUAAuthorizationPlugin"), "allow"],
-                check=False, capture_output=True, text=True)
-            self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertIn("trusted server allowed", result.stdout)
+    def test_server_with_foreign_identifier_is_denied(self):
+        """Same team, wrong identifier: the identity comparison must reject it."""
+        with tempfile.TemporaryDirectory() as directory:
+            result, running = self._run_against_server(
+                directory, "com.workbuddy.cua.impostor", "deny")
+            self.assertIn("PASS: bundle failed closed", result.stdout)
+            self.assertIn("PEER CLOSED", running.stdout.readline())
 
 
 if __name__ == "__main__":

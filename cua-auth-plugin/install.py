@@ -23,7 +23,10 @@ STATE_FILE = STATE_DIRECTORY / "installation.plist"
 ORIGINAL_RIGHT_FILE = STATE_DIRECTORY / "system.login.screensaver.original.plist"
 PLUGIN_IDENTIFIER = "com.workbuddy.cua.AuthorizationPlugin"
 TEAM_IDENTIFIER = "62RNP54C47"
-PLUGIN_MECHANISM = "WorkBuddyCUAAuthorizationPlugin:allow,privileged"
+PLUGIN_MECHANISM = "WorkBuddyCUAAuthorizationPlugin:allow"
+# Historical value from the privileged-host experiment. Kept only so the state
+# ledger and rollback tooling can recognise an installation made with it.
+LEGACY_PRIVILEGED_MECHANISM = "WorkBuddyCUAAuthorizationPlugin:allow,privileged"
 RIGHT = "system.login.screensaver"
 
 
