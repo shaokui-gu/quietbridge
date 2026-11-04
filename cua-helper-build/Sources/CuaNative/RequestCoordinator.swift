@@ -192,7 +192,7 @@ import Darwin
         } else if request.method == "preview" {
             result = try await previewControl(params)
         } else if request.method == "powerGuard" {
-            result = try powerControl(params)
+            result = try await powerControl(params)
         } else {
             var installed: InstalledApplication?
             if request.method == "getApp" {
@@ -311,8 +311,30 @@ import Darwin
 
     /// 防睡眠和隐私覆盖层只随任务租约存在。覆盖层不保存或输入系统密码；
     /// 系统实际锁定后，GUI 操作仍被拒绝，等待本人完成系统认证。
-    private func powerControl(_ params: RequestParameters) throws -> JSONValue {
-        switch try params.string("action") {
+    private func powerControl(_ params: RequestParameters) async throws -> JSONValue {
+        let action = try params.string("action")
+        switch action {
+        case "unlock", "unlockInspect":
+            // AX traversal blocks for up to the messaging timeout per element;
+            // never run it on the main actor that also drives the shield.
+            let inspectOnly = action == "unlockInspect"
+            let outcome = try await Task.detached(priority: .userInitiated) { () throws -> JSONValue in
+                if inspectOnly { return try LockScreenUnlocker.shared.inspect() }
+                return try LockScreenUnlocker.shared.unlock()
+            }.value
+            return .object([
+                "action": .string(action),
+                "result": outcome,
+                "privacy": TaskPrivacyController.shared.status(),
+            ])
+        case "lockSynthetic":
+            // Diagnostic: lock the session with a synthetic shortcut so the
+            // guardian's hardware-input takeover stays out of the picture.
+            return .object([
+                "action": .string("lockSynthetic"),
+                "route": .string(try TaskPrivacySyntheticLock.request()),
+                "privacy": TaskPrivacyController.shared.status(),
+            ])
         case "hold":
             let seconds = params.contains("durationSeconds")
                 ? try params.number("durationSeconds") : PowerGuard.defaultSeconds

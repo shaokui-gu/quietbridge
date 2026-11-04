@@ -184,29 +184,46 @@ final class LockedUseAuthorizationServer: @unchecked Sendable {
     private var lastPeerSession: UInt32?
     private var clientCount = 0
 
-    var isAvailable: Bool {
+    var isAvailable: Bool { availabilityReason() == "ok" }
+
+    /// Same checks as `isAvailable`, but reports the first failing one so a
+    /// denied unlock can be attributed instead of guessed at.
+    func availabilityReason() -> String {
         var record = stat()
-        guard lstat(lockedUseConfigurationPath, &record) == 0,
-              (record.st_mode & S_IFMT) == S_IFREG, record.st_uid == 0,
-              record.st_mode & 0o022 == 0,
-              FileManager.default.fileExists(atPath: lockedUsePluginPath),
-              let data = FileManager.default.contents(atPath: lockedUseConfigurationPath),
+        guard lstat(lockedUseConfigurationPath, &record) == 0 else {
+            return "config-missing(errno \(errno))"
+        }
+        guard (record.st_mode & S_IFMT) == S_IFREG else { return "config-not-file" }
+        guard record.st_uid == 0 else { return "config-owner=\(record.st_uid)" }
+        guard record.st_mode & 0o022 == 0 else { return "config-mode=\(String(record.st_mode & 0o777, radix: 8))" }
+        guard FileManager.default.fileExists(atPath: lockedUsePluginPath) else { return "plugin-missing" }
+        guard let data = FileManager.default.contents(atPath: lockedUseConfigurationPath),
               let values = try? PropertyListSerialization.propertyList(
                 from: data, options: [], format: nil) as? [String: Any] else {
-            return false
+            return "config-unreadable"
         }
         var bundle: SecStaticCode?
         var requirement: SecRequirement?
         let expression = "anchor apple generic and identifier \"\(lockedUsePluginIdentifier)\" and certificate leaf[subject.OU] = \"\(lockedUseTeamIdentifier)\""
-        guard SecStaticCodeCreateWithPath(URL(fileURLWithPath: lockedUsePluginPath) as CFURL, [], &bundle) == errSecSuccess,
-              let bundle,
-              SecRequirementCreateWithString(expression as CFString, [], &requirement) == errSecSuccess,
-              let requirement, SecStaticCodeCheckValidity(bundle, [], requirement) == errSecSuccess else { return false }
-        return values["protocolVersion"] as? Int == 3 &&
-            values["experimentalOptIn"] as? Bool == true &&
-            values["enabled"] as? Bool == true &&
-            values["bundleIdentifier"] as? String == lockedUsePluginIdentifier &&
-            values["teamIdentifier"] as? String == lockedUseTeamIdentifier
+        let created = SecStaticCodeCreateWithPath(URL(fileURLWithPath: lockedUsePluginPath) as CFURL, [], &bundle)
+        guard created == errSecSuccess, let bundle else { return "code-create=\(created)" }
+        let requirementStatus = SecRequirementCreateWithString(expression as CFString, [], &requirement)
+        guard requirementStatus == errSecSuccess, let requirement else {
+            return "requirement=\(requirementStatus)"
+        }
+        let validity = SecStaticCodeCheckValidity(bundle, [], requirement)
+        guard validity == errSecSuccess else { return "signature=\(validity)" }
+        let protocolVersion = values["protocolVersion"] as? Int
+        let optIn = values["experimentalOptIn"] as? Bool
+        let enabled = values["enabled"] as? Bool
+        let bundleID = values["bundleIdentifier"] as? String
+        let team = values["teamIdentifier"] as? String
+        guard protocolVersion == 3 else { return "protocol=\(protocolVersion.map(String.init) ?? "nil")" }
+        guard optIn == true else { return "optIn=\(optIn.map(String.init) ?? "nil")" }
+        guard enabled == true else { return "enabled=\(enabled.map(String.init) ?? "nil")" }
+        guard bundleID == lockedUsePluginIdentifier else { return "bundleID=\(bundleID ?? "nil")" }
+        guard team == lockedUseTeamIdentifier else { return "team=\(team ?? "nil")" }
+        return "ok"
     }
 
     func start() {
@@ -414,15 +431,22 @@ final class LockedUseAuthorizationServer: @unchecked Sendable {
             // Arm only after all caller/console checks and an actual locked
             // session observation; the state still enforces one grant per episode.
             var allowed = false
-            if isAvailable && NativePlatform.sessionLocked() == true {
-                _ = state.armExternalLock(seconds: 12, sessionID: targetSession)
+            let availability = availabilityReason()
+            let lockedNow = NativePlatform.sessionLocked()
+            var armed = false
+            if availability == "ok", lockedNow == true {
+                armed = state.armExternalLock(seconds: 12, sessionID: targetSession)
                 allowed = state.consumeGrant(sessionID: targetSession)
             }
             let reply = (allowed ? "ALLOW 3 " : "DENY 3 ") + nonce + "\n"
+            Trace.log("authz session=\(targetSession) available=\(availability)"
+                      + " locked=\(String(describing: lockedNow)) armed=\(armed)"
+                      + " allowed=\(allowed) state=\(state.status)")
             _ = reply.withCString { Darwin.write(descriptor, $0, strlen($0)) }
 
         } catch {
             lifecycleLock.withLock { lastClientError = String(describing: error) }
+            Trace.log("authz rejected: \(error)")
             fputs("[locked-use] rejected authorization client: \(error)\n", stderr)
             _ = "DENY\n".withCString { Darwin.write(descriptor, $0, strlen($0)) }
         }

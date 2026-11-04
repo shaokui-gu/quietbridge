@@ -37,10 +37,12 @@ struct RequestParameters: Sendable {
                 guard Set(values.keys).isSubset(of: ["action", "durationSeconds"]) else {
                     throw Self.invalid("hold 仅接受可选的 durationSeconds")
                 }
-            case "release", "status":
-                guard Set(values.keys) == ["action"] else { throw Self.invalid("release/status 仅接受 action") }
+            case "release", "status", "unlock", "unlockInspect", "lockSynthetic":
+                guard Set(values.keys) == ["action"] else {
+                    throw Self.invalid("\(values["action"]?.string ?? "action") 仅接受 action")
+                }
             default:
-                throw Self.invalid("powerGuard action 必须为 hold、release 或 status")
+                throw Self.invalid("powerGuard action 必须为 hold、release、status、unlock、unlockInspect 或 lockSynthetic")
             }
         }
         if request.method == "browserSession" {

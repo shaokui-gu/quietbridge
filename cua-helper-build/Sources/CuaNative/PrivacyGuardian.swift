@@ -5,6 +5,11 @@ import CoreGraphics
 import Darwin
 import Foundation
 
+/// Must match `TaskPrivacySyntheticEvents.marker`. Kept as a file-scope constant
+/// because a C event-tap callback cannot capture context, and referencing the
+/// other type's static from inside the callback crashes the Swift optimiser.
+private let guardianSyntheticMarker: Int64 = 0x57424355414c4f43
+
 @MainActor
 final class PrivacyGuardianClient {
     private var process: Process?
@@ -209,9 +214,14 @@ final class PrivacyGuardianProcess {
                 if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
                     guardian.failed = true
                     guardian.report("ERROR input listener disabled")
-                    guardian.takeover()
+                    guardian.takeover("tap-disabled type=\(type.rawValue)")
+                } else if event.getIntegerValueField(.eventSourceUserData) == guardianSyntheticMarker {
+                    // The helper's own unlock keystroke is not a human takeover.
+                    // No trace call here: a nonisolated static call inside this
+                    // MainActor closure crashes the Swift optimiser.
+                    _ = type
                 } else if event.getIntegerValueField(.eventSourceUnixProcessID) == 0 {
-                    guardian.takeover()
+                    guardian.takeover("hid-input type=\(type.rawValue)")
                 }
             }
             return Unmanaged.passUnretained(event)
@@ -230,7 +240,7 @@ final class PrivacyGuardianProcess {
     private func receive(_ data: Data) {
         guard !data.isEmpty, inputBuffer.count + data.count <= 4096 else {
             failed = true
-            takeover()
+            takeover("command-stream-error")
             return
         }
         inputBuffer.append(data)
@@ -261,20 +271,27 @@ final class PrivacyGuardianProcess {
                 exit(0)
             default:
                 failed = true
-                takeover()
+                takeover("unknown-command \(line.prefix(24))")
             }
         }
     }
 
-    private func takeover() {
+    private func takeover(_ reason: String = "unspecified") {
         guard takeoverRequestedAt == nil else { return }
         takeoverRequestedAt = ProcessInfo.processInfo.systemUptime
+        Self.trace("TAKEOVER reason=\(reason) locked=\(String(describing: NativePlatform.sessionLocked()))")
         report("TAKEOVER")
+    }
+
+    /// Forensic channel: stderr is inherited by the helper, so the driver sees it.
+    nonisolated static func trace(_ message: String) {
+        Trace.log("guardian \(message)")
+        FileHandle.standardError.write(Data("[guardian] \(message)\n".utf8))
     }
 
     private func tick() {
         let now = ProcessInfo.processInfo.systemUptime
-        if now - lastHeartbeat > 1.5 { failed = true; takeover() }
+        if now - lastHeartbeat > 1.5 { failed = true; takeover("heartbeat-timeout") }
         guard let requested = takeoverRequestedAt else { return }
         // ACK revokes immediately. On helper failure, its protection lease
         // expires after one second, before this fallback lock request.
@@ -292,6 +309,7 @@ final class PrivacyGuardianProcess {
         }
         if now >= nextLockAttempt {
             nextLockAttempt = now + 1
+            Self.trace("requesting system lock (guardian fallback)")
             do { _ = try TaskPrivacySystemLock.request() }
             catch { report("ERROR system lock request failed") }
         }

@@ -156,6 +156,7 @@ final class TaskPrivacyController {
     func hold(seconds: TimeInterval) {
         if pausedByUser { return }                  // 已交给用户，不再重新覆盖
         let clamped = min(max(seconds, Self.minimumSeconds), Self.maximumSeconds)
+        Self.trace("hold \(Int(clamped))s active=\(active) paused=\(pausedByUser) locked=\(String(describing: sessionState()))")
         expiresAtUptime = ProcessInfo.processInfo.systemUptime + clamped
         if !active {
             active = true
@@ -184,6 +185,7 @@ final class TaskPrivacyController {
     }
 
     func release() {
+        Self.trace("release active=\(active)")
         guard active else { hideShield(); pausedByUser = false; return }
         active = false
         pausedByUser = false
@@ -294,11 +296,16 @@ final class TaskPrivacyController {
             for panel in panels { panel.orderFrontRegardless() }
             if authenticationLockRequested { sawSystemLock = true }
             if authenticationLockRequested {
+                Self.trace("locked while authRequested → suppress lease")
                 LockedUseAuthorizationServer.shared.suppressForManualAuthentication()
             } else if !externalUnlockTriggered {
+                Self.trace("locked externally → arm external unlock")
                 if LockedUseAuthorizationServer.shared.armExternalLock() {
                     externalUnlockTriggered = true
+                    Self.trace("external lock armed → AX unlock")
                     triggerLockedUseUnlock()
+                } else {
+                    Self.trace("armExternalLock refused")
                 }
             }
             if authenticationLockRequested, lastTransition != "system-locked" {
@@ -310,6 +317,7 @@ final class TaskPrivacyController {
             LockedUseAuthorizationServer.shared.noteSessionUnlocked()
             externalUnlockTriggered = false
             if authenticationLockRequested, sawSystemLock {
+                Self.trace("unlocked after system lock → hand back to user")
                 // 用户已经在系统界面完成认证：把控制权交回去。
                 // 旧逻辑在这里 showShield() + requestAuthenticationScreen() 立刻回锁，
                 // 造成「解锁后按任意键又被锁上」的死循环。
@@ -335,6 +343,7 @@ final class TaskPrivacyController {
     /// 之后 `hold()` 直接返回，避免下一次动作又把屏幕盖上。
     private func pauseForUserTakeover() {
         guard active else { return }
+        Self.trace("pause for user takeover")
         active = false
         pausedByUser = true
         expiresAtUptime = nil
@@ -349,6 +358,7 @@ final class TaskPrivacyController {
 
     private func guardianTakeover() {
         guard active else { return }
+        Self.trace("guardian takeover received")
         requestAuthenticationScreen()
         authenticationLockRequested = true
         if sessionState() == true { sawSystemLock = true }
@@ -363,6 +373,7 @@ final class TaskPrivacyController {
         lockRequestedAt = ProcessInfo.processInfo.systemUptime
         do {
             lastLockRoute = try requestSystemLock()
+            Self.trace("system lock requested route=\(lastLockRoute ?? "?")")
             lastError = nil
         } catch let failure as NativeFailure {
             lastError = failure.message
@@ -378,22 +389,35 @@ final class TaskPrivacyController {
         refresh()
     }
 
-    /// Best-effort wake request only. A modifier event has not been shown to
-    /// start loginwindow's authorization evaluation: the 2026-11-03 no-input
-    /// diagnostic saw no plug-in request before the grant expired. An Allow
-    /// decision is separate from asking loginwindow to unlock the session.
+    /// Ask loginwindow to evaluate the screensaver right by driving its own
+    /// credential UI through the accessibility API. A synthetic key event is
+    /// not an option: loginwindow swallows it while the session is locked, and
+    /// the guardian reads it as hardware input and revokes the grant.
     private func triggerLockedUseUnlock() {
-        DispatchQueue.global(qos: .userInitiated).async {
-            guard let source = CGEventSource(stateID: .hidSystemState),
-                  let down = CGEvent(keyboardEventSource: source, virtualKey: 56, keyDown: true),
-                  let up = CGEvent(keyboardEventSource: source, virtualKey: 56, keyDown: false) else {
-                return
+        Task.detached(priority: .userInitiated) {
+            var tries = 0
+            // loginwindow builds its credential UI a moment after the lock, so
+            // poll for it instead of spending the submission budget on an empty
+            // tree. The unlocker still caps real submissions at three.
+            while tries < 20 {
+                tries += 1
+                guard NativePlatform.sessionLocked() == true else { return }
+                do {
+                    let result = try LockScreenUnlocker.shared.unlock()
+                    TaskPrivacyController.trace("AX unlock try \(tries): \(result)")
+                } catch {
+                    TaskPrivacyController.trace("AX unlock try \(tries) failed: \(error)")
+                }
+                if NativePlatform.sessionLocked() == false { return }
+                usleep(600_000)
             }
-            down.setIntegerValueField(.eventSourceUserData, value: TaskPrivacySyntheticEvents.marker)
-            up.setIntegerValueField(.eventSourceUserData, value: TaskPrivacySyntheticEvents.marker)
-            down.post(tap: .cghidEventTap)
-            up.post(tap: .cghidEventTap)
         }
+    }
+
+    /// Forensic channel: stderr is inherited by the driver that launched us.
+    nonisolated static func trace(_ message: String) {
+        Trace.log("privacy \(message)")
+        FileHandle.standardError.write(Data("[privacy] \(message)\n".utf8))
     }
 
     private func transition(_ value: String) {
