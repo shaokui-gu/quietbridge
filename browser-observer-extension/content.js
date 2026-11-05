@@ -44,6 +44,8 @@
   const refs = new Map();
   const ids = new WeakMap();
   let refSeq = 0;
+  let snapshotSeq = 0;
+  let snapshotId = null;
   const SELECTOR = 'a[href],button,input,select,textarea,[role],[contenteditable="true"]';
   function refFor(node) {
     let id = ids.get(node);
@@ -89,7 +91,9 @@
     if (!binding || !config || config.bindingId !== binding.bindingId ||
         config.navigationEpoch !== binding.navigationEpoch ||
         location.origin !== binding.authorizedOrigin) return null;
-    return { url: `${location.origin}${location.pathname}`, readyState: document.readyState,
+    refs.clear();
+    snapshotId = `${binding.bindingId}:${binding.navigationEpoch}:${++snapshotSeq}`;
+    return { snapshotId, url: `${location.origin}${location.pathname}`, readyState: document.readyState,
       elementCount: Math.min(document.getElementsByTagName('*').length, 10000),
       elements: snapshot(300) };
   };
@@ -103,83 +107,67 @@
   function writable(node) {
     return node instanceof HTMLInputElement || node instanceof HTMLTextAreaElement;
   }
-  function setValue(node, value) {
-    if (writable(node)) {
-      const proto = node instanceof HTMLTextAreaElement
-        ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
-      const setter = Object.getOwnPropertyDescriptor(proto, 'value').set;
-      setter.call(node, value);
-      return node.value === value;
-    }
-    if (node.isContentEditable) {
-      node.textContent = value;
-      return (node.textContent || '') === value;
-    }
-    return false;
+  function targetFor(config, action) {
+    if (!bound(config) || config.snapshotId !== snapshotId) return null;
+    return action.ref === undefined ? document.scrollingElement : refs.get(action.ref);
   }
-  globalThis.__cuaAct = (config, action) => {
-    if (!bound(config) || !action || typeof action !== 'object') return null;
-    const operation = action.operation;
-    const target = operation === 'scroll' && action.ref === undefined
-      ? document.scrollingElement : refs.get(action.ref);
-    if (!target || (target !== document.scrollingElement && !target.isConnected)) {
-      return fail('stale_ref');
+  globalThis.__cuaPrepare = (config, action) => {
+    const target = targetFor(config, action);
+    if (!target?.isConnected) return { ok: false, reason: 'stale_ref' };
+    if (!visible(target) || target.disabled || target.getAttribute('aria-disabled') === 'true') {
+      return { ok: false, reason: 'not_interactable' };
     }
-    if (target !== document.scrollingElement && !visible(target)) return fail('not_visible');
-    try {
-      if (operation === 'click') {
-        target.focus?.();
-        target.click();
-        return { performed: true, verified: false,
-          observed: { tag: target.tagName.toLowerCase().slice(0, 32) } };
-      }
-      if (operation === 'fill') {
-        if (typeof action.value !== 'string' || action.value.length > 1000) return fail('bad_value');
-        target.focus?.();
-        const applied = setValue(target, action.value);
-        target.dispatchEvent(new Event('input', { bubbles: true }));
-        target.dispatchEvent(new Event('change', { bubbles: true }));
-        // 必须在事件之后读回：受控组件会在事件里改写值。
-        const actual = writable(target) || target.isContentEditable ? target.value ?? target.textContent : '';
-        return { performed: applied, verified: (actual || '') === action.value,
-          observed: { length: String(actual || '').length } };
-      }
-      if (operation === 'select') {
-        if (!(target instanceof HTMLSelectElement)) return fail('not_a_select');
-        if (typeof action.value !== 'string') return fail('bad_value');
-        target.value = action.value;
-        target.dispatchEvent(new Event('input', { bubbles: true }));
-        target.dispatchEvent(new Event('change', { bubbles: true }));
-        const ok = target.value === action.value;
-        return { performed: ok, verified: ok, observed: { length: target.value.length } };
-      }
-      if (operation === 'scroll') {
-        if (!Number.isInteger(action.deltaY) || Math.abs(action.deltaY) > 10) return fail('bad_delta');
-        const root = document.scrollingElement || document.documentElement;
-        const isRoot = target === document.scrollingElement || target === document.documentElement;
-        const read = () => isRoot ? Math.round(window.scrollY || root.scrollTop)
-          : Math.round(target.scrollTop);
-        const before = read();
-        // 与 cua_scroll 一致：deltaY > 0 表示显示上方内容，即 scrollTop 减小。
-        const next = before - action.deltaY * 40;
-        if (isRoot) {
-          root.scrollTop = next;
-          window.scrollTo(0, next);
-        } else {
-          target.scrollTop = next;
-        }
-        const after = read();
-        return { performed: true, verified: after !== before,
-          observed: { before, after,
-            viewport: Math.round(window.innerHeight || 0),
-            scrollHeight: Math.round(root.scrollHeight || 0),
-            clientHeight: Math.round(root.clientHeight || 0),
-            target: isRoot ? 'root' : target.tagName.toLowerCase().slice(0, 16) } };
-      }
-      return fail('unknown_operation');
-    } catch (error) {
-      return fail(error && error.message ? error.message : 'act_failed');
+    target.scrollIntoView({ block: 'nearest', inline: 'nearest', behavior: 'instant' });
+    const r = target.getBoundingClientRect();
+    const left = Math.max(0, r.left), top = Math.max(0, r.top);
+    const right = Math.min(innerWidth, r.right), bottom = Math.min(innerHeight, r.bottom);
+    if (right <= left || bottom <= top) return { ok: false, reason: 'outside_viewport' };
+    const x = (left + right) / 2, y = (top + bottom) / 2;
+    const hit = document.elementFromPoint(x, y);
+    if (hit !== target && !target.contains(hit)) return { ok: false, reason: 'obscured' };
+    return { ok: true, x, y };
+  };
+  globalThis.__cuaFocusInput = (config, action) => {
+    const target = targetFor(config, action);
+    if (!target?.isConnected || (!writable(target) && !target.isContentEditable) ||
+        target.disabled || target.readOnly) return false;
+    // This is DOM focus inside the bound document, never application activation.
+    target.focus({ preventScroll: true });
+    if (document.activeElement !== target) return false;
+    if (writable(target)) {
+      try { target.setSelectionRange(0, target.value.length); } catch { return false; }
+    } else {
+      const range = document.createRange();
+      range.selectNodeContents(target);
+      const selection = getSelection();
+      selection.removeAllRanges(); selection.addRange(range);
     }
+    return true;
+  };
+  globalThis.__cuaInputReady = (config, action) => {
+    const target = targetFor(config, action);
+    return !!target?.isConnected && document.activeElement === target && !target.disabled && !target.readOnly;
+  };
+  globalThis.__cuaPointMatches = (config, action, point) => {
+    const target = targetFor(config, action);
+    if (!target?.isConnected || !visible(target) || target.disabled) return false;
+    const r = target.getBoundingClientRect();
+    if (point.x < r.left || point.x >= r.right || point.y < r.top || point.y >= r.bottom) return false;
+    const hit = document.elementFromPoint(point.x, point.y);
+    return hit === target || target.contains(hit);
+  };
+  globalThis.__cuaVerifyFill = (config, action) => {
+    const target = targetFor(config, action);
+    return !!target?.isConnected && (target.value ?? target.textContent) === (action.value ?? '');
+  };
+  globalThis.__cuaSelect = (config, action) => {
+    const target = targetFor(config, action);
+    if (!(target instanceof HTMLSelectElement) || target.disabled) return fail('not_a_select');
+    target.value = action.value ?? '';
+    target.dispatchEvent(new Event('input', { bubbles: true }));
+    target.dispatchEvent(new Event('change', { bubbles: true }));
+    return { performed: true, verified: target.value === (action.value ?? ''),
+      observed: { route: 'dom', length: target.value.length } };
   };
   const errors = [];
   function recordError(value) {
@@ -209,7 +197,7 @@
     removeEventListener('unhandledrejection', onRejection);
     delete globalThis.__cuaObserver;
     delete globalThis.__cuaSnapshot;
-    delete globalThis.__cuaAct;
+    for (const key of ['__cuaPrepare', '__cuaFocusInput', '__cuaInputReady', '__cuaPointMatches', '__cuaVerifyFill', '__cuaSelect']) delete globalThis[key];
     delete globalThis.__cuaDiagnostics;
     delete globalThis.__cuaObserverStop;
   };

@@ -97,8 +97,67 @@ class TaskWindowTests(unittest.TestCase):
         return json.loads(self.text(result))
 
     def bind(self):
-        task = self.payload(action="begin")
+        task = self.payload(action="begin", interactionMode="desktop")
         return self.payload(action="bind", taskId=task["taskId"], appHandle="a", windowId=7, confirm=True)
+
+    def test_background_is_default_and_all_native_input_routes_stop_before_dispatch(self):
+        task = self.payload(action="begin")
+        self.assertEqual(task['interactionMode'], 'background_browser')
+        self.payload(action="bind", taskId=task['taskId'], appHandle="a", windowId=7, confirm=True)
+        self.fake.request.reset_mock()
+        for name in ('cua_click', 'cua_hover', 'cua_scroll', 'cua_drag', 'cua_type_text',
+                     'cua_paste', 'cua_key', 'cua_set_value'):
+            with self.subTest(name=name):
+                self.error('BACKGROUND_ONLY', name, appHandle='a', windowId=7)
+        self.error('BACKGROUND_ONLY', 'cua_windows', action='activate', appHandle='a', windowId=7)
+        self.fake.request.assert_not_called()
+
+    def test_background_mode_cannot_be_downgraded_by_bind(self):
+        task = self.payload(action='begin')
+        self.error('INVALID_ARGUMENT', action='bind', taskId=task['taskId'],
+                   appHandle='a', windowId=7, confirm=True, interactionMode='desktop')
+        self.assertEqual(json.loads(self.path.read_text())['tasks'][task['taskId']]['interactionMode'],
+                         'background_browser')
+
+    def test_background_browser_input_survives_unavailable_native_preview(self):
+        task = self.payload(action='begin')
+        self.payload(action='bind', taskId=task['taskId'], appHandle='a', windowId=7, confirm=True)
+        with mock.patch.object(server, 'ensure_background_preview', side_effect=server.HelperError('CAPTURE_BUSY', 'busy')), \
+                mock.patch.object(server, 'native_preview_matches', return_value=True), \
+                mock.patch.object(server, '_events_handler', return_value='{"status":"queued"}') as handler:
+            self.fake.request.reset_mock()
+            result = self.rpc('cua_browser_events', action='command', taskId=task['taskId'],
+                              operation='click', ref=1, snapshotId='snap')
+            self.assertFalse(result.get('isError'), result)
+            handler.assert_called_once()
+            self.assertFalse(any(c.args[0] in ('click', 'activate', 'pressKey', 'typeText')
+                                 for c in self.fake.request.call_args_list))
+
+    def test_background_preview_does_not_display_an_unverified_native_window(self):
+        task = self.payload(action='begin')
+        self.payload(action='bind', taskId=task['taskId'], appHandle='a', windowId=7, confirm=True)
+        with mock.patch.object(server, 'native_preview_matches', return_value=False), \
+                mock.patch.object(server, 'ensure_background_preview') as preview, \
+                mock.patch.object(server, '_events_handler', return_value='{"status":"queued"}'):
+            result = self.rpc('cua_browser_events', action='command', taskId=task['taskId'],
+                              operation='click', ref=1, snapshotId='snap')
+            self.assertFalse(result.get('isError'), result)
+            preview.assert_not_called()
+            self.error('BROWSER_MAPPING_REQUIRED', 'cua_windows', action='share', appHandle='a', windowId=7)
+
+    def test_background_preview_does_not_wait_for_a_video_frame(self):
+        original = self.request
+        def pending_frame(method, params=None, **kwargs):
+            result = original(method, params, **kwargs)
+            if method == 'preview':
+                result['preview']['streamReady'] = False
+            return result
+        self.fake.request.side_effect = pending_frame
+        with mock.patch.object(server, 'TASK_DISPATCH', None):
+            self.assertEqual(server.ensure_background_preview('a', 7), server.current_connection())
+        params = self.fake.request.call_args.args[1]
+        self.assertIs(params['waitForFrame'], False)
+        self.assertEqual(params['source'], 'window')
 
     def error(self, code, name="cua_task", **args):
         result = self.rpc(name, **args)
@@ -111,15 +170,15 @@ class TaskWindowTests(unittest.TestCase):
         self.assertEqual(RESOLVED_TASK_FILE.name, browser_events.TASK_FILE.name)
 
     def test_window_listing_stays_available_while_awaiting_bind(self):
-        self.payload(action="begin")
+        self.payload(action="begin", interactionMode="desktop")
         result = self.rpc(name="cua_windows", action="list", appHandle="a")
         self.assertFalse(result.get("isError"), self.text(result))
         # 只读枚举放行，输入仍必须被任务守卫拒绝。
         self.error("TASK_NOT_BOUND", "cua_click", appHandle="a", windowId=7, x=10, y=10)
 
     def test_begin_persists_uuid_and_waits_without_helper(self):
-        first = self.payload(action="begin")
-        second = self.payload(action="begin")
+        first = self.payload(action="begin", interactionMode="desktop")
+        second = self.payload(action="begin", interactionMode="desktop")
         self.assertNotEqual(first["taskId"], second["taskId"])
         self.assertEqual(first["state"], "awaiting_window")
         self.fake.request.assert_not_called()
@@ -140,7 +199,7 @@ class TaskWindowTests(unittest.TestCase):
             "action": "attach", "pid": 88, "windowId": 7, "confirm": True})])
         record = json.loads(self.path.read_text())["tasks"][bound["taskId"]]
         self.assertEqual(set(record), {"taskId", "state", "mode", "newWindowCreated", "pid",
-                                       "processIdentity", "windowId", "sessionId"})
+                                       "processIdentity", "windowId", "sessionId", "interactionMode"})
         self.assertNotIn("appHandle", record)
         self.assertEqual(self.path.stat().st_mode & 0o777, 0o600)
 
@@ -170,7 +229,7 @@ class TaskWindowTests(unittest.TestCase):
     def test_begin_replaces_a_bound_task_without_leaving_its_shield(self):
         self.bind()
         self.fake.request.reset_mock()
-        replacement = self.payload(action="begin")
+        replacement = self.payload(action="begin", interactionMode="desktop")
         self.assertEqual(replacement["state"], "awaiting_window")
         self.assertFalse(server.POWER_GUARD["active"])
         self.assertIn(("preview", {"action": "release"}),
@@ -277,7 +336,7 @@ class TaskWindowTests(unittest.TestCase):
         self.assertFalse(any(c.args[0] == "getState" for c in self.fake.request.call_args_list))
 
     def test_atomic_replace_failure_preserves_original_and_cleans_temporary(self):
-        self.payload(action="begin")
+        self.payload(action="begin", interactionMode="desktop")
         original = self.path.read_bytes()
         with mock.patch.object(server.os, "replace", side_effect=OSError("模拟落盘失败")):
             self.error("TASK_STORE_ERROR", action="begin")
@@ -430,7 +489,7 @@ class TaskWindowTests(unittest.TestCase):
         self.assertEqual(server.resolve_window('a'), 8)
 
     def test_create_target_reports_missing_share_target_without_handler(self):
-        awaiting = self.payload(action="begin")
+        awaiting = self.payload(action="begin", interactionMode="desktop")
         with mock.patch.object(server, "_events_handler") as handler:
             result = self.rpc(server._events_tool["name"], action="create_target", taskId=awaiting["taskId"])
             self.assertEqual(result["structuredContent"]["errorCode"], "TARGET_REQUIRED")
@@ -568,7 +627,7 @@ class TaskWindowTests(unittest.TestCase):
         self.assertFalse(any(c.args[0] == "preview" for c in self.fake.request.call_args_list))
 
     def test_share_requires_a_bound_task(self):
-        self.payload(action="begin")
+        self.payload(action="begin", interactionMode="desktop")
         self.error("TASK_NOT_BOUND", "cua_windows", action="share", appHandle="a", windowId=7)
 
     def test_end_releases_the_share_lease_after_the_task(self):
@@ -610,7 +669,7 @@ class TaskWindowTests(unittest.TestCase):
                 mock.patch.object(server, '_events_handler', return_value='{"status":"queued"}'), \
                 mock.patch.object(server, 'share_new_window') as shared, \
                 mock.patch.object(server, 'task_store', mock.MagicMock(return_value=mock.MagicMock(
-                    __enter__=lambda s: {'tasks': {'t': {'windowId': None}}, 'activeTaskId': 't'},
+                    __enter__=lambda s: {'tasks': {'t': {'windowId': None, 'interactionMode': 'desktop'}}, 'activeTaskId': 't'},
                     __exit__=lambda *args: None))):
             self.assertEqual(server._events_dispatch({'action': 'create_target', 'taskId': 't'}), '{"status":"queued"}')
             shared.assert_called_once_with('a', {1, 2})
@@ -620,11 +679,22 @@ class TaskWindowTests(unittest.TestCase):
                 mock.patch.object(server, '_events_handler', return_value='{"status":"queued"}'), \
                 mock.patch.object(server, 'share_new_window', side_effect=server.HelperError('PREVIEW_NOT_READY', 'no window')), \
                 mock.patch.object(server, 'task_store', mock.MagicMock(return_value=mock.MagicMock(
-                    __enter__=lambda s: {'tasks': {'t': {'windowId': None}}, 'activeTaskId': 't'},
+                    __enter__=lambda s: {'tasks': {'t': {'windowId': None, 'interactionMode': 'desktop'}}, 'activeTaskId': 't'},
                     __exit__=lambda *args: None))):
             output = server._events_dispatch({'action': 'create_target', 'taskId': 't'})
             self.assertIn('共享待补', output)
             self.assertIn('PREVIEW_NOT_READY', output)
+
+    def test_background_create_waits_for_mapping_without_guessing_native_window(self):
+        task = self.payload(action='begin')
+        with mock.patch.object(server, 'browser_window_snapshot') as windows, \
+                mock.patch.object(server, 'share_new_window') as share, \
+                mock.patch.object(server, '_events_handler', return_value='{"status":"queued"}'):
+            output = json.loads(server._events_dispatch({'action': 'create_target', 'taskId': task['taskId']}))
+            self.assertEqual(output['status'], 'queued')
+            self.assertEqual(output['sharePending'], 'browser_mapping_required')
+            windows.assert_not_called()
+            share.assert_not_called()
 
     def test_lost_persistent_record_never_disables_guard(self):
         self.bind()
@@ -729,7 +799,7 @@ class TaskWindowTests(unittest.TestCase):
         self.assertEqual(sum(c.args[0] == "getState" for c in self.fake.request.call_args_list), 1)
 
     def test_bind_confirmation_readonly_and_incomplete_native_response(self):
-        self.payload(action="begin")
+        self.payload(action="begin", interactionMode="desktop")
         self.error("INVALID_ARGUMENT", action="bind", appHandle="a", windowId=7, confirm=1)
         with mock.patch.object(server, "READ_ONLY", True):
             self.error("READ_ONLY", action="bind", appHandle="a", windowId=7, confirm=True)

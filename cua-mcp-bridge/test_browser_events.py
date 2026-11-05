@@ -221,7 +221,7 @@ class BrowserEventsTests(unittest.TestCase):
         self.assertIn('多余 [unexpected]', str(caught.exception))
         self.assertNotIn('content-must-not-be-reported', str(caught.exception))
 
-    SNAPSHOT = {'url': 'https://example.org/path', 'readyState': 'complete', 'elementCount': 12,
+    SNAPSHOT = {'snapshotId': 'snap-1', 'url': 'https://example.org/path', 'readyState': 'complete', 'elementCount': 12,
                 'elements': [{'ref': 1, 'tag': 'a', 'role': 'link', 'name': 'Docs',
                               'disabled': False, 'x': 0, 'y': 0, 'width': 10, 'height': 10}]}
 
@@ -230,7 +230,7 @@ class BrowserEventsTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             events.internal_action({'action': 'command', 'taskId': 'task', 'operation': 'snapshot'},
                                    **self.paths)
-        self.prepare_assignment()
+        self.prepare_command()
         queued = events.internal_action({'action': 'command', 'taskId': 'task', 'operation': 'snapshot'},
                                         **self.paths)
         self.assertEqual(queued['status'], 'queued')
@@ -243,7 +243,7 @@ class BrowserEventsTests(unittest.TestCase):
                                    **self.paths)
 
     def test_command_result_is_polled_once_and_not_replayed(self):
-        self.prepare_assignment()
+        self.prepare_command()
         queued = events.internal_action({'action': 'command', 'taskId': 'task', 'operation': 'snapshot'},
                                         **self.paths)
         poll = {'action': 'result', 'taskId': 'task', 'commandId': queued['commandId']}
@@ -257,7 +257,7 @@ class BrowserEventsTests(unittest.TestCase):
                          'unknown')
 
     def test_command_error_result_stays_an_error(self):
-        self.prepare_assignment()
+        self.prepare_command()
         queued = events.internal_action({'action': 'command', 'taskId': 'task', 'operation': 'snapshot'},
                                         **self.paths)
         self.sync(commandResult={'requestId': queued['commandId'], 'status': 'error',
@@ -271,7 +271,7 @@ class BrowserEventsTests(unittest.TestCase):
         self.sync()
         with self.assertRaises(ValueError):
             self.sync(commandResult={'requestId': 'a' * 32, 'status': 'error', 'error': 'x'})
-        self.prepare_assignment()
+        self.prepare_command()
         queued = events.internal_action({'action': 'command', 'taskId': 'task', 'operation': 'snapshot'},
                                         **self.paths)
         broken = self.SNAPSHOT | {'elements': [self.SNAPSHOT['elements'][0] | {'ref': 0}]}
@@ -283,9 +283,9 @@ class BrowserEventsTests(unittest.TestCase):
         self.assertEqual(self.sync()['command']['requestId'], queued['commandId'])
 
     def test_action_commands_validate_their_own_parameters(self):
-        self.prepare_assignment()
+        self.prepare_command()
         submit = lambda **extra: events.internal_action(  # noqa: E731
-            dict({'action': 'command', 'taskId': 'task'}, **extra), **self.paths)
+            dict({'action': 'command', 'taskId': 'task', 'snapshotId': 'snap-1'}, **extra), **self.paths)
         with self.assertRaises(ValueError):
             submit(operation='fill', value='a')
         with self.assertRaises(ValueError):
@@ -298,12 +298,12 @@ class BrowserEventsTests(unittest.TestCase):
             submit(operation='select', ref=1, value='x' * 1001)
         queued = submit(operation='fill', ref=1, value='hello')
         self.assertEqual(queued['status'], 'queued')
-        self.assertTrue(self.sync()['command']['params'] == {'ref': 1, 'value': 'hello'})
+        self.assertTrue(self.sync()['command']['params'] == {'ref': 1, 'value': 'hello', 'snapshotId': 'snap-1'})
 
     def test_action_result_reports_performed_and_verified_separately(self):
-        self.prepare_assignment()
+        self.prepare_command()
         queued = events.internal_action({'action': 'command', 'taskId': 'task',
-                                         'operation': 'click', 'ref': 3}, **self.paths)
+                                         'operation': 'click', 'snapshotId': 'snap-1', 'ref': 3}, **self.paths)
         self.assertTrue(self.sync()['command']['operation'] == 'click')
         self.sync(commandResult={'requestId': queued['commandId'], 'status': 'ok',
                                  'result': {'performed': True, 'verified': False,
@@ -316,9 +316,9 @@ class BrowserEventsTests(unittest.TestCase):
         self.assertFalse(reply['result']['verified'])
 
     def test_malformed_action_result_is_rejected(self):
-        self.prepare_assignment()
+        self.prepare_command()
         queued = events.internal_action({'action': 'command', 'taskId': 'task',
-                                         'operation': 'scroll', 'deltaY': -3}, **self.paths)
+                                         'operation': 'scroll', 'snapshotId': 'snap-1', 'deltaY': -3}, **self.paths)
         with self.assertRaises(ValueError):
             self.sync(commandResult={'requestId': queued['commandId'], 'status': 'ok',
                                      'result': {'performed': True, 'verified': True,
@@ -329,30 +329,30 @@ class BrowserEventsTests(unittest.TestCase):
                                      'result': {'performed': 'yes', 'verified': True, 'observed': {}}})
 
     def test_performed_action_requires_a_snapshot_before_the_next_action(self):
-        self.prepare_assignment()
+        self.prepare_command()
         poll = lambda cid: events.internal_action(  # noqa: E731
             {'action': 'result', 'taskId': 'task', 'commandId': cid}, **self.paths)
         click = events.internal_action({'action': 'command', 'taskId': 'task',
-                                        'operation': 'click', 'ref': 3}, **self.paths)
+                                        'operation': 'click', 'snapshotId': 'snap-1', 'ref': 3}, **self.paths)
         self.sync(commandResult={'requestId': click['commandId'], 'status': 'ok',
                                  'result': {'performed': True, 'verified': False,
                                             'observed': {'tag': 'a'}}})
         self.assertEqual(poll(click['commandId'])['nextAction'], 'snapshot')
         with self.assertRaises(ValueError):
             events.internal_action({'action': 'command', 'taskId': 'task',
-                                    'operation': 'click', 'ref': 3}, **self.paths)
+                                    'operation': 'click', 'snapshotId': 'snap-1', 'ref': 3}, **self.paths)
         shot = events.internal_action({'action': 'command', 'taskId': 'task',
                                        'operation': 'snapshot'}, **self.paths)
         self.sync(commandResult={'requestId': shot['commandId'], 'status': 'ok',
                                  'result': self.SNAPSHOT})
         self.assertEqual(poll(shot['commandId'])['nextAction'], 'observe')
         events.internal_action({'action': 'command', 'taskId': 'task',
-                                'operation': 'click', 'ref': 3}, **self.paths)
+                                'operation': 'click', 'snapshotId': 'snap-1', 'ref': 3}, **self.paths)
 
     def test_failed_action_does_not_demand_verification(self):
-        self.prepare_assignment()
+        self.prepare_command()
         click = events.internal_action({'action': 'command', 'taskId': 'task',
-                                        'operation': 'click', 'ref': 99}, **self.paths)
+                                        'operation': 'click', 'snapshotId': 'snap-1', 'ref': 99}, **self.paths)
         self.sync(commandResult={'requestId': click['commandId'], 'status': 'ok',
                                  'result': {'performed': False, 'verified': False,
                                             'observed': {'reason': 'stale_ref'}}})
@@ -360,10 +360,10 @@ class BrowserEventsTests(unittest.TestCase):
                                         'commandId': click['commandId']}, **self.paths)
         self.assertEqual(reply['nextAction'], 'done')
         events.internal_action({'action': 'command', 'taskId': 'task',
-                                'operation': 'click', 'ref': 3}, **self.paths)
+                                'operation': 'click', 'snapshotId': 'snap-1', 'ref': 3}, **self.paths)
 
     def test_error_result_tells_the_agent_to_stop(self):
-        self.prepare_assignment()
+        self.prepare_command()
         shot = events.internal_action({'action': 'command', 'taskId': 'task',
                                        'operation': 'snapshot'}, **self.paths)
         self.sync(commandResult={'requestId': shot['commandId'], 'status': 'error',
@@ -374,7 +374,7 @@ class BrowserEventsTests(unittest.TestCase):
         self.assertEqual(reply['nextAction'], 'stop')
 
     def test_navigate_requires_a_plain_http_url(self):
-        self.prepare_assignment()
+        self.prepare_command()
         submit = lambda **extra: events.internal_action(  # noqa: E731
             dict({'action': 'command', 'taskId': 'task', 'operation': 'navigate'}, **extra), **self.paths)
         with self.assertRaises(ValueError):
@@ -390,9 +390,9 @@ class BrowserEventsTests(unittest.TestCase):
         self.assertTrue(queued['commandId'])
 
     def test_cancel_before_delivery_reports_it_may_not_have_executed(self):
-        self.prepare_assignment()
+        self.prepare_command()
         queued = events.internal_action({'action': 'command', 'taskId': 'task',
-                                         'operation': 'click', 'ref': 3}, **self.paths)
+                                         'operation': 'click', 'snapshotId': 'snap-1', 'ref': 3}, **self.paths)
         cancel = {'action': 'cancel', 'taskId': 'task', 'commandId': queued['commandId']}
         reply = events.internal_action(cancel, **self.paths)
         self.assertEqual(reply['status'], 'canceled')
@@ -404,9 +404,9 @@ class BrowserEventsTests(unittest.TestCase):
         self.assertEqual(events.internal_action(cancel, **self.paths)['status'], 'canceled')
 
     def test_delivered_command_cancel_is_honest_about_side_effects(self):
-        self.prepare_assignment()
+        self.prepare_command()
         queued = events.internal_action({'action': 'command', 'taskId': 'task',
-                                         'operation': 'click', 'ref': 3}, **self.paths)
+                                         'operation': 'click', 'snapshotId': 'snap-1', 'ref': 3}, **self.paths)
         self.assertEqual(self.sync()['command']['requestId'], queued['commandId'])
         reply = events.internal_action({'action': 'cancel', 'taskId': 'task',
                                         'commandId': queued['commandId']}, **self.paths)
@@ -421,10 +421,10 @@ class BrowserEventsTests(unittest.TestCase):
         self.assertNotIn('result', poll)
 
     def test_status_exposes_recovery_state_for_commands(self):
-        self.prepare_assignment()
+        self.prepare_command()
         self.assertFalse(self.request({'action': 'status', 'taskId': 'task'})['status']['commandState']['verificationRequired'])
         click = events.internal_action({'action': 'command', 'taskId': 'task',
-                                        'operation': 'click', 'ref': 3}, **self.paths)
+                                        'operation': 'click', 'snapshotId': 'snap-1', 'ref': 3}, **self.paths)
         state = self.request({'action': 'status', 'taskId': 'task'})['status']['commandState']
         self.assertEqual(state['pendingOperation'], 'click')
         self.assertFalse(state['verificationRequired'])
@@ -442,7 +442,7 @@ class BrowserEventsTests(unittest.TestCase):
                    'scroll': {'x': 0, 'y': 240}}
 
     def test_diagnostics_uses_the_verification_path(self):
-        self.prepare_assignment()
+        self.prepare_command()
         queued = events.internal_action({'action': 'command', 'taskId': 'task',
                                          'operation': 'diagnostics'}, **self.paths)
         self.sync(commandResult={'requestId': queued['commandId'], 'status': 'ok',
@@ -478,7 +478,7 @@ class BrowserEventsTests(unittest.TestCase):
             add(note='x' * 201)
 
     def test_cancel_on_finished_command_reports_completed(self):
-        self.prepare_assignment()
+        self.prepare_command()
         queued = events.internal_action({'action': 'command', 'taskId': 'task',
                                          'operation': 'snapshot'}, **self.paths)
         self.sync(commandResult={'requestId': queued['commandId'], 'status': 'ok',
@@ -493,7 +493,7 @@ class BrowserEventsTests(unittest.TestCase):
         self.assertEqual(still['status'], 'ok')
 
     def test_results_are_retained_for_recent_commands_and_evictions_are_explicit(self):
-        self.prepare_assignment()
+        self.prepare_command()
         ids = []
         for _ in range(events.MAX_RESULTS + 2):
             queued = events.internal_action({'action': 'command', 'taskId': 'task',
@@ -520,7 +520,7 @@ class BrowserEventsTests(unittest.TestCase):
                          'ping 不得写入观察存储')
 
     def test_disable_drops_queued_command_and_never_replays_after_enable(self):
-        self.prepare_assignment()
+        self.prepare_command()
         queued = events.internal_action({'action': 'command', 'taskId': 'task',
                                          'operation': 'snapshot'}, **self.paths)
         self.assertEqual(self.sync()['command']['requestId'], queued['commandId'])
@@ -570,7 +570,7 @@ class BrowserEventsTests(unittest.TestCase):
         self.assertEqual(queued['status'], 'queued')
 
     def test_mismatched_mapping_blocks_commands_and_shows_in_status(self):
-        self.prepare_assignment()
+        self.prepare_command()
         self.sync(assignmentTitle='Example Domain')
         events.internal_action({'action': 'verify_mapping', 'taskId': 'task',
                                 'windows': [{'windowId': 900, 'title': 'Example Domain'}]}, **self.paths)
@@ -954,7 +954,74 @@ class BrowserEventsTests(unittest.TestCase):
             self.assign()
 
     def sync(self, **extra):
-        return self.request({'action': 'sync', 'enabled': True, 'permission': True} | extra)
+        return self.request({'action': 'sync', 'enabled': True, 'permission': True,
+                             'capabilities': ['cdp_input', 'document_binding', 'background_popups']} | extra)
+
+    def prepare_command(self):
+        self.prepare_assignment()
+        assignment = self.sync()['assignment']
+        self.request({'action': 'event', 'taskId': 'task', 'token': assignment['token'], 'event': self.event()})
+        queued = events.internal_action({'action': 'command', 'taskId': 'task', 'operation': 'snapshot'}, **self.paths)
+        self.sync(commandResult={'requestId': queued['commandId'], 'status': 'ok', 'result': self.SNAPSHOT})
+
+    def test_command_ack_loss_accepts_the_same_reply_without_overwriting_or_replaying(self):
+        self.prepare_command()
+        queued = events.internal_action({'action': 'command', 'taskId': 'task', 'operation': 'snapshot'}, **self.paths)
+        reply = {'requestId': queued['commandId'], 'status': 'ok', 'result': self.SNAPSHOT}
+        self.sync(commandResult=reply)
+        self.assertIsNone(self.sync(commandResult=reply)['command'])
+        results = events.read_file(self.store)['peer']['commandResults']
+        self.assertEqual(sum(r['requestId'] == queued['commandId'] for r in results), 1)
+
+    def test_old_extension_waits_instead_of_receiving_background_commands(self):
+        self.prepare_command()
+        self.sync(clientVersion='0.3.0')
+        self.request({'action': 'sync', 'enabled': True, 'permission': True, 'clientVersion': '0.2.4'})
+        with self.assertRaisesRegex(ValueError, 'BACKGROUND_WAITING'):
+            events.internal_action({'action': 'command', 'taskId': 'task', 'operation': 'snapshot'}, **self.paths)
+
+    def test_reference_commands_require_the_current_document_snapshot(self):
+        self.prepare_command()
+        command = {'action': 'command', 'taskId': 'task', 'operation': 'click', 'ref': 1}
+        for extra in ({}, {'snapshotId': 'older-snapshot'}):
+            with self.assertRaisesRegex(ValueError, 'STALE_SNAPSHOT'):
+                events.internal_action(command | extra, **self.paths)
+        with events.event_store(self.store) as data:
+            data['tasks']['task']['event']['documentId'] = 'replacement-document'
+        with self.assertRaisesRegex(ValueError, 'STALE_SNAPSHOT'):
+            events.internal_action(command | {'snapshotId': 'snap-1'}, **self.paths)
+
+    def test_children_are_owned_and_selecting_them_changes_only_the_logical_target(self):
+        self.prepare_command()
+        queued = events.internal_action({'action': 'command', 'taskId': 'task', 'operation': 'click',
+                                         'ref': 1, 'snapshotId': 'snap-1'}, **self.paths)
+        self.sync(commandResult={'requestId': queued['commandId'], 'status': 'ok',
+                                 'result': {'performed': True, 'verified': False, 'observed': {'route': 'cdp'},
+                                            'children': [{'tabId': 9, 'browserWindowId': 2, 'url': 'https://example.org/child'}]}})
+        tabs = events.internal_action({'action': 'tabs', 'taskId': 'task'}, **self.paths)
+        self.assertEqual(tabs['logicalActiveTabId'], 7)
+        self.assertEqual([t['tabId'] for t in tabs['tabs']], [7, 9])
+        with self.assertRaisesRegex(ValueError, '只能选择'):
+            events.internal_action({'action': 'select_tab', 'taskId': 'task', 'tabId': 123}, **self.paths)
+        selected = events.internal_action({'action': 'select_tab', 'taskId': 'task', 'tabId': 9}, **self.paths)
+        self.assertTrue(selected['background'])
+        assignment = self.sync()['assignment']
+        self.assertEqual(assignment['rootTabId'], 7)
+        self.assertEqual(assignment['browserWindowId'], 2)
+        self.assertIsNone(assignment['event'])
+        with self.assertRaisesRegex(ValueError, '等待原标签文档'):
+            events.internal_action({'action': 'command', 'taskId': 'task', 'operation': 'snapshot'}, **self.paths)
+
+    def test_diagnostics_cannot_clear_an_unverified_action(self):
+        self.prepare_command()
+        click = events.internal_action({'action': 'command', 'taskId': 'task', 'operation': 'click',
+                                        'ref': 1, 'snapshotId': 'snap-1'}, **self.paths)
+        self.sync(commandResult={'requestId': click['commandId'], 'status': 'ok',
+                                 'result': {'performed': True, 'verified': False, 'observed': {}}})
+        diagnostic = events.internal_action({'action': 'command', 'taskId': 'task', 'operation': 'diagnostics'}, **self.paths)
+        self.sync(commandResult={'requestId': diagnostic['commandId'], 'status': 'ok', 'result': self.DIAGNOSTICS})
+        with self.assertRaisesRegex(ValueError, '尚未用 snapshot'):
+            events.internal_action({'action': 'command', 'taskId': 'task', 'operation': 'keypress', 'key': 'Enter'}, **self.paths)
 
     def prepare_assignment(self):
         data = events.read_file(self.tasks)
@@ -1005,12 +1072,14 @@ class BrowserEventsTests(unittest.TestCase):
         original = events.internal_action
         with mock.patch.object(server, 'TASK_FILE', str(self.tasks)), \
                 mock.patch.object(server, 'task_status', side_effect=lambda record: dict(record)), \
+                mock.patch.object(server, 'call_helper', return_value={}) as helper, \
                 mock.patch.object(events, 'internal_action', wraps=events.internal_action) as dispatch:
             # 隔离 event store，但经过实际注册工具和 server 原生任务核验回调。
             dispatch.side_effect = lambda a, task_file: original(a, task_file, self.store)
             response = server.call_tool('cua_browser_events', args)
             self.assertFalse(response.get('isError'), response)
             self.assertTrue(json.loads(response['content'][0]['text'])['assigned'])
+            helper.assert_called_once_with('preview', {'action': 'release'})
         with mock.patch.object(server, 'TASK_FILE', str(self.tasks)), \
                 mock.patch.object(server, 'task_status', return_value={'state': 'requires_revalidation'}), \
                 mock.patch.object(events, 'internal_action') as dispatch:
@@ -1182,7 +1251,8 @@ class BrowserEventsTests(unittest.TestCase):
             self.assertFalse(result.get('isError'), result)
             payload = json.loads(result['content'][0]['text'])
             self.assertFalse(payload['mappingVerified'])
-            self.assertTrue(payload['observationOnly'])
+            self.assertFalse(payload['observationOnly'])
+            self.assertFalse(payload['executionPolicy']['fallbackAllowed'])
             self.assertIsNone(payload['event']['contentReady'])
             self.assertIsNone(payload['event']['conditionMatched'])
             helper.request.assert_not_called()

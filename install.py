@@ -146,7 +146,7 @@ def install(root, home, apply=False, verify_signature=True, with_extension=False
     env = dict(old.get('env', {}))
     env['CUA_HELPER_PATH'] = str(helper)
     entry.update(command=sys.executable, args=['-B', str(destination / 'bridge/server.py')],
-                 env=env, description='workbuddy-cua：macOS 原生界面观察与操作（AX/坐标/键盘），网页内容走其浏览器扩展观察通道；需已授权辅助功能与屏幕录制')
+                 env=env, description='workbuddy-cua：macOS 原生界面观察与操作（AX/坐标/键盘），网页任务默认严格后台，通过扩展 CDP 操作固定标签，断连等待且不回退桌面输入；需已授权辅助功能与屏幕录制')
     servers[key] = entry
     rendered = (json.dumps(data, ensure_ascii=False, indent=2) + '\n').encode()
     plan = {'mode': 'install' if apply else 'preview', 'release': str(destination),

@@ -91,8 +91,8 @@ def diagnostic_fields(params):
     if not isinstance(params, dict):
         return {}
     numbers = {"windowId", "elementIndex", "x", "y", "fromX", "fromY", "toX", "toY", "clickCount", "holdMs", "deltaLinesX", "deltaLinesY", "durationMs", "steps"}
-    identifiers = {"appHandle", "snapshotId", "mouseButton", "action", "source", "taskId", "operation", "commandId"}
-    numbers.update({"browserWindowId", "tabId"})
+    identifiers = {"appHandle", "snapshotId", "mouseButton", "action", "source", "taskId", "operation", "commandId", "documentId", "interactionMode"}
+    numbers.update({"browserWindowId", "tabId", "navigationEpoch"})
     return {key: value[:256] if isinstance(value, str) else value for key, value in (params or {}).items()
             if (key in numbers and diagnostic_number(value)) or
                (key in identifiers and isinstance(value, str))}
@@ -419,9 +419,11 @@ def input_window(app, window=None, snapshot=None, allow_unique=False):
     raise HelperError("TARGET_REQUIRED", "目标不明确：显式指定 windowId 或先观察确切窗口；不会选择第一窗口")
 
 
-def request_share(app, window, source, duration=600):
+def request_share(app, window, source, duration=600, require_frame=True):
     params = {"action": "hold", "appHandle": app, "windowId": window,
               "source": source, "durationSeconds": duration}
+    if not require_frame:
+        params["waitForFrame"] = False
     if TASK_DISPATCH is not None:
         assert_task_connection(TASK_DISPATCH)
         validate_task_target("preview", params, TASK_DISPATCH)
@@ -442,7 +444,7 @@ def request_share(app, window, source, duration=600):
                                               else "仅共享目标应用。" if source == "application" else "仅共享目标窗口。")})
     if current_connection() != connection or not HELPER._alive():
         raise HelperError("REQUIRES_REVALIDATION", "共享期间连接改变，输入未派发")
-    if (preview.get("streamReady") is not True or preview.get("mode") != source or
+    if ((require_frame and preview.get("streamReady") is not True) or preview.get("mode") != source or
             preview.get("trackingWindowId") != window):
         raise HelperError("PREVIEW_NOT_READY", "目标%s尚无已确认视频首帧，输入未派发" %
                           {"desktop": "桌面", "application": "应用", "window": "窗口"}[source])
@@ -450,6 +452,24 @@ def request_share(app, window, source, duration=600):
         assert_task_connection(TASK_DISPATCH)
         validate_task_target("preview", params, TASK_DISPATCH)
     return connection, preview
+
+
+def native_preview_matches(task_id):
+    """A browser tab lease alone does not prove a WindowServer capture target."""
+    from browser_events import status
+    try:
+        state = status(task_id, task_file=TASK_FILE)
+    except (ValueError, OSError):
+        return False
+    return state.get('mappingVerified') is True and state.get('crossCheck', {}).get('consistent') is True
+
+
+def ensure_background_preview(app, window):
+    """Keep the task window preview leased; CDP never waits for a video frame."""
+    connection, preview = request_share(app, window, "window", require_frame=False)
+    if preview.get('streamReady') is not True:
+        operation_log("browser.preview_waiting", windowId=window, reason="frame_pending")
+    return connection
 
 
 def ensure_share(app, window, source=None, duration=600):
@@ -709,13 +729,16 @@ def release_power_guard():
 
 def tool_task(args):
     global SHARE_SELECTION
-    if not isinstance(args, dict) or set(args) - {"action", "taskId", "appHandle", "windowId", "confirm"}:
-        raise HelperError("INVALID_ARGUMENT", "仅接受 action、taskId、appHandle、windowId、confirm")
+    if not isinstance(args, dict) or set(args) - {"action", "taskId", "appHandle", "windowId", "confirm", "interactionMode"}:
+        raise HelperError("INVALID_ARGUMENT", "仅接受 action、taskId、appHandle、windowId、confirm、interactionMode")
     action = args.get("action")
     if action not in ("begin", "bind", "status", "end"):
         raise HelperError("INVALID_ARGUMENT", "action 必须为 begin、bind、status、end")
-    if action == "begin" and set(args) != {"action"}:
-        raise HelperError("INVALID_ARGUMENT", "begin 仅接受 action，taskId 由 UUID 生成")
+    if action == "begin" and (set(args) - {"action", "interactionMode"} or
+            args.get("interactionMode", "background_browser") not in ("background_browser", "desktop")):
+        raise HelperError("INVALID_ARGUMENT", "begin 的 interactionMode 仅允许 background_browser（默认）或 desktop")
+    if action != "begin" and "interactionMode" in args:
+        raise HelperError("INVALID_ARGUMENT", "任务执行模式不能中途降级；只能在 begin 时指定")
     if action == "status" and set(args) - {"action", "taskId"}:
         raise HelperError("INVALID_ARGUMENT", "status 仅接受 action 和 taskId")
     if action == "end" and (set(args) - {"action", "taskId", "confirm"} or args.get("confirm") is not True):
@@ -734,7 +757,8 @@ def tool_task(args):
                 release_power_guard()
             task_id = str(uuid.uuid4())
             record = {"taskId": task_id, "state": "awaiting_window", "mode": None,
-                      "newWindowCreated": False}
+                      "newWindowCreated": False,
+                      "interactionMode": args.get("interactionMode", "background_browser")}
             data["tasks"][task_id] = record
             data["activeTaskId"] = task_id
             return json.dumps(record, ensure_ascii=False)
@@ -793,7 +817,7 @@ def tool_task(args):
         STATE.update(app=app, snapshot=None, snapshot_app=None, snapshot_window=None)
         # 绑定成功即进入任务运行期：按住防睡眠断言，锁屏后任务仍能继续。
         return json.dumps(dict(record, limitation="仅绑定已有窗口，共享 Chrome 数据；未实现新建专用窗口或数据隔离",
-                               powerGuard=hold_power_guard()), ensure_ascii=False)
+                               powerGuard=hold_power_guard() if record.get("interactionMode") == "desktop" else {"active": False}), ensure_ascii=False)
 
 
 TASK_TARGET_TOOLS = {"cua_situation", "cua_state", "cua_visual_state", "cua_screenshot", "cua_wait_ready",
@@ -821,6 +845,15 @@ def task_guard(name, args):
             raise HelperError("TASK_SCOPE_REQUIRED", "任务期间仅允许通过 cua_task bind 登记已有窗口，不允许启动或另行绑定")
         if name == "cua_apps" and args.get("action") == "launch":
             raise HelperError("TASK_SCOPE_REQUIRED", "任务期间不允许启动应用")
+        if record.get("interactionMode", "background_browser") == "background_browser":
+            native_input = name in {"cua_click", "cua_hover", "cua_scroll", "cua_drag", "cua_type_text",
+                                    "cua_paste", "cua_key", "cua_set_value"}
+            native_window_write = name == "cua_windows" and args.get("action", "list") not in ("list", "share", "unshare")
+            if native_input or native_window_write:
+                operation_log("browser.foreground_fallback_blocked", taskId=record["taskId"], tool=name)
+                raise HelperError("BACKGROUND_ONLY", "后台浏览器任务仅允许固定标签页扩展输入；通道不可用时等待恢复，不回落 AX、桌面键鼠或激活窗口")
+            if name == "cua_windows" and args.get("action") == "share" and not native_preview_matches(record['taskId']):
+                raise HelperError("BROWSER_MAPPING_REQUIRED", "先通过扩展 assign、verify_mapping 核验浏览器与系统窗口的对应关系；核验前可用扩展截图，不展示未确认的窗口")
         if not protected:
             return args, None
         binding = TASK_BINDINGS.get(record["taskId"])
@@ -833,7 +866,8 @@ def task_guard(name, args):
         raise HelperError("REQUIRES_REVALIDATION" if status["state"] == "requires_revalidation" else "TASK_NOT_BOUND",
                           "%s：任务没有有效目标；不回退焦点或最新窗口" % status["state"])
     # 每个受保护动作顺带续租（节流），长任务不会被租约上限打断。
-    hold_power_guard()
+    if record.get("interactionMode") == "desktop":
+        hold_power_guard()
     context = dict(binding, windowId=record["windowId"])
     if name in ("cua_type_text", "cua_paste", "cua_key") or (
             name == "cua_windows" and args.get("action", "list") not in ("list", "share", "unshare")):
@@ -1879,12 +1913,8 @@ TOOLS = [
      "annotations": {"readOnlyHint": True, "destructiveHint": False}},
     {
         "name": "cua_task",
-        "description": "持久任务绑定：begin 生成 UUID，保持 awaiting_window，不创建或启动浏览器。bind 必须显式 appHandle、windowId、confirm=true，仅 attach 已有窗口，mode=attached_existing，不等于新建或数据隔离。status 只读核验进程代际和窗口；跨连接 requires_revalidation，需重新显式确认，绝不按 PID 自动接管。任务期间观察和输入严格限制目标，应用级键盘接口拒绝。"
-                       "bind 成功后按住防睡眠断言并等待用户首次系统锁屏，此时不显示浮层。"
-                       "安装并签名 Authorization Plug-in 后，首次锁屏可使用单次短时票据自动解锁并显示全屏隐私浮层。"
-                       "浮层中的新按键或点击会撤销自动授权、暂停当前任务，确认 macOS 真正锁定后撤掉浮层，由本人认证。"
-                       "不读取或输入真实密码；手动解锁不自动恢复当前任务，需 end(confirm=true) 后 begin 并显式 bind。"
-                       "动作时续租；若已接管锁屏，end 先交回系统锁屏再释放覆盖层与断言。",
+        "description": "持久任务绑定：begin 默认 interactionMode=background_browser，执行层禁止所有原生输入和窗口激活；扩展未就绪必须等待。只有明确的普通桌面应用任务才在 begin 指定 desktop，模式不能中途更改。begin 生成 UUID，保持 awaiting_window，不创建或启动浏览器。bind 必须显式 appHandle、windowId、confirm=true，仅 attach 已有窗口，mode=attached_existing，不等于新建或数据隔离。status 只读核验进程代际和窗口；跨连接 requires_revalidation，需重新显式确认，绝不按 PID 自动接管。任务期间观察和输入严格限制目标，应用级键盘接口拒绝。"
+                       "后台模式不启动桌面接管；共享预览独立维持原目标和宿主位置。结束任务释放绑定和预览租约。",
         "inputSchema": {
             "type": "object", "additionalProperties": False,
             "properties": {
@@ -1892,16 +1922,17 @@ TOOLS = [
                 "taskId": {"type": "string", "minLength": 1},
                 "appHandle": APP_HANDLE_PROP, "windowId": WINDOW_PROP,
                 "confirm": {"type": "boolean", "const": True},
+                "interactionMode": {"type": "string", "enum": ["background_browser", "desktop"], "default": "background_browser"},
             },
             "required": ["action"],
             "oneOf": [
                 {"properties": {"action": {"const": "begin"}},
                  "not": {"anyOf": [{"required": [k]} for k in ("taskId", "appHandle", "windowId", "confirm")]}},
-                {"properties": {"action": {"const": "bind"}}, "required": ["appHandle", "windowId", "confirm"]},
+                {"properties": {"action": {"const": "bind"}}, "required": ["appHandle", "windowId", "confirm"], "not": {"required": ["interactionMode"]}},
                 {"properties": {"action": {"const": "status"}},
-                 "not": {"anyOf": [{"required": [k]} for k in ("appHandle", "windowId", "confirm")]}},
+                 "not": {"anyOf": [{"required": [k]} for k in ("appHandle", "windowId", "confirm", "interactionMode")]}},
                 {"properties": {"action": {"const": "end"}}, "required": ["confirm"],
-                 "not": {"anyOf": [{"required": [k]} for k in ("appHandle", "windowId")]}},
+                 "not": {"anyOf": [{"required": [k]} for k in ("appHandle", "windowId", "interactionMode")]}},
             ],
         },
         "handler": tool_task, "readOnly": True,
@@ -2201,7 +2232,7 @@ def _events_dispatch(args):
     global TASK_DISPATCH
     page_input = (isinstance(args, dict) and (args.get('action') == 'create_target' or
                   (args.get('action') == 'command' and
-                   args.get('operation') in ('click', 'fill', 'select', 'scroll', 'navigate'))))
+                   args.get('operation') in ('click', 'fill', 'select', 'scroll', 'navigate', 'keypress'))))
     unbound_create = False
     if page_input:
         task_id = args.get('taskId')
@@ -2214,7 +2245,10 @@ def _events_dispatch(args):
                     raise HelperError('TARGET_ALREADY_BOUND', '任务已有固定窗口；复用既有标签页并查询 status/assign，不另开窗口。新建窗口需要新的显式任务。')
         if unbound_create:
             # 没有已绑定窗口：先确认浏览器身份与既有窗口集合，创建后只对唯一新窗口补共享。
-            handle, before = browser_window_snapshot()
+            if record and record.get('interactionMode', 'background_browser') == 'background_browser':
+                handle, before = None, None
+            else:
+                handle, before = browser_window_snapshot()
         else:
             binding = TASK_BINDINGS.get(task_id)
             if binding is None:
@@ -2224,11 +2258,19 @@ def _events_dispatch(args):
                 if record is None or data.get('activeTaskId') != task_id:
                     raise HelperError('TASK_NOT_BOUND', '页面输入需要活动任务')
                 window = record.get('windowId')
-            _, context = task_guard('cua_click', {'appHandle': binding['appHandle'], 'windowId': window})
+            validate_browser_assignment(task_id)
+            context = dict(binding, windowId=window)
             TASK_DISPATCH = context
-            ensure_share(binding['appHandle'], window)
             assert_task_connection(context)
-            validate_task_target('click', {'appHandle': binding['appHandle'], 'windowId': window}, context)
+            # Preview is observational. An unavailable capture must not turn a
+            # working background browser channel into foreground input.
+            try:
+                if record.get('interactionMode', 'background_browser') == 'desktop' or native_preview_matches(task_id):
+                    ensure_background_preview(binding['appHandle'], window)
+                else:
+                    operation_log("browser.preview_waiting", taskId=task_id, reason="browser_mapping_required")
+            except HelperError as exc:
+                operation_log("browser.preview_waiting", taskId=task_id, reason=exc.code)
     if isinstance(args, dict) and args.get('action') == 'verify_mapping':
         args = dict(args, windows=_bound_windows(args.get('taskId')))
     if page_input and not unbound_create and CALL_RECORDS is not None:
@@ -2241,6 +2283,8 @@ def _events_dispatch(args):
         if isinstance(payload, dict) and payload.get('reused'):
             operation_log("browser.target_reused", taskId=args.get('taskId'), requestId=payload.get('requestId'))
             return output
+        if handle is None:
+            return json.dumps(dict(payload, sharePending="browser_mapping_required"), ensure_ascii=False)
         try:
             share_new_window(handle, before)
         except HelperError as exc:
@@ -2249,12 +2293,34 @@ def _events_dispatch(args):
             else:
                 output = str(output) + '\n共享待补: %s: %s' % (exc.code, exc.message)
         return output
-    return _events_handler(args)
+    output = _events_handler(args)
+    if isinstance(args, dict) and args.get('action') == 'assign':
+        # Assignment invalidates native mapping evidence. Never leave a previous
+        # capture showing a different window while the new association is unknown.
+        try:
+            call_helper('preview', {'action': 'release'})
+        except HelperError:
+            pass
+    if isinstance(args, dict) and args.get('action') in ('command', 'select_tab'):
+        payload = json.loads(output) if isinstance(output, str) else output
+        operation_log("browser.command_queued" if args['action'] == 'command' else "browser.logical_tab_selected",
+                      taskId=args.get('taskId'), operation=args.get('operation'),
+                      commandId=payload.get('commandId'), tabId=payload.get('tabId'),
+                      target=diagnostic_fields(payload.get("target", {})), route="background_browser")
+    if isinstance(args, dict) and args.get('action') == 'result':
+        payload = json.loads(output) if isinstance(output, str) else output
+        result = payload.get('result', {}) if isinstance(payload, dict) else {}
+        if result.get('mimeType') == 'image/jpeg' and result.get('data'):
+            metadata = dict(payload, result={k: v for k, v in result.items() if k != 'data'})
+            return {"content": [{"type": "image", "mimeType": "image/jpeg", "data": result['data']},
+                                {"type": "text", "text": json.dumps(metadata, ensure_ascii=False)}]}
+    return output
 
 
 TOOLS.append(dict(_events_tool, handler=_events_dispatch))
 TOOL_MAP = dict((t["name"], t) for t in TOOLS)
 HINTS = {
+    "BACKGROUND_ONLY": "继续使用 cua_browser_events 的原任务、原标签；先检查 status，不能改用前台输入或新建窗口。",
     "TARGET_LOST": "原窗口不可用时保留任务状态，显式重新选择；不自动新建 Chrome 窗口。",
     "PERMISSION_DENIED": "给 \"workbuddy-cua\" 授予辅助功能/屏幕录制后再试。",
     "FOREGROUND_REQUIRED": "先观察确切目标与焦点；仅在明确需要且允许时请求激活，不自动切换窗口。",
@@ -2375,6 +2441,13 @@ def _call_tool(name, args):
         if hint:
             text += "\n建议: " + hint
         return {"content": [{"type": "text", "text": text}], "isError": True, "errorCode": exc.code}
+    except ValueError as exc:
+        if name != "cua_browser_events":
+            return {"content": [{"type": "text", "text": "INVALID_ARGUMENT: %s" % exc}], "isError": True, "errorCode": "INVALID_ARGUMENT"}
+        message = str(exc)
+        code = next((c for c in ("BACKGROUND_WAITING", "STALE_SNAPSHOT") if message.startswith(c)), "BROWSER_TARGET_WAITING")
+        return {"content": [{"type": "text", "text": message + "\n保持原任务与标签；等待扩展恢复或重新观察，禁止回落桌面输入。"}],
+                "isError": True, "errorCode": code}
     except Exception as exc:  # noqa: BLE001 - surface anything as a tool error
         log("tool %s crashed: %s\n%s" % (name, exc, traceback.format_exc()))
         return {"content": [{"type": "text", "text": "BRIDGE_ERROR: %s: %s" % (type(exc).__name__, exc)}], "isError": True}

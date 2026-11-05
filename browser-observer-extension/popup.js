@@ -13,7 +13,7 @@ async function refresh() {
   hasPermission = r.globalPermission === 'granted';
   $('permission').textContent = `${r.globalPermission ?? '未知'} / ${r.enabled ? '已启用' : '已停用'}`;
   $('connection').textContent = `${connection.status} / 最后握手：${connection.lastHeartbeatAt ? new Date(connection.lastHeartbeatAt).toLocaleString() : '尚无'}`;
-  const error = connection.lastError || '';
+  const error = connection.lastError || connection.lastActionError || '';
   // Chrome 的 forbidden 只在注册 origin 与当前扩展 ID 不一致时出现，直接点明。
   $('error').textContent = /forbidden/i.test(error)
     ? `${error}（注册的 allowed_origins 不含当前扩展 ID ${chrome.runtime.id}）` : error;

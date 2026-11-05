@@ -187,3 +187,20 @@ TCC 授权跟着 helper 的**责任进程**走。实测两种形态：
 - 由桥接层直接拉起（无宿主）：责任进程解析为 **`workbuddy-cua` 自己**，授权就记在这个 app 上。
 
 `cua_permissions` 返回的 `launchApplication` 就是当前承载授权的那个 app；显示 `false` 时用 `action=open_settings` 打开面板给它授予辅助功能与屏幕录制。移动 `.app` 位置仍可能导致授权失效。
+
+
+## 严格后台浏览器模式（扩展 0.3.0）
+
+`cua_task begin` 默认 `interactionMode=background_browser`。原生点击、悬停、滚动、拖动、键盘、粘贴、设值和窗口激活均被桥接层拒绝；扩展断开或版本能力不足时等待原通道恢复。普通桌面应用操作可在新任务 begin 时明确指定 `interactionMode=desktop`，不能在已开始的任务内改模式。旧任务缺少模式字段时按后台模式处理。
+
+浏览器仍需先绑定确切原生窗口，再通过 `cua_browser_events candidates/assign` 分配真实 Chrome 标签 ID。原生窗口预览还需 `verify_mapping` 确认系统窗口与浏览器窗口对应；映射未确认时只使用扩展快照和截图，不猜测新窗口并开始共享。任务归属以固定标签和文档为准，用户焦点变化不会改绑；Chrome 标签被移到其他窗口时会暂停，需移回原任务窗口或重新明确建立任务。浏览器窗口 ID 与系统窗口 ID 不可互换。
+
+执行流程：`command(operation=snapshot)` → `result(commandId)` 取得 `snapshotId` → `command(operation=click/fill/select/scroll, snapshotId=..., ref=...)` → 查询结果 → 新 snapshot 复核。每个命令携带任务分配、tab、documentId、导航 epoch 和过期时间。旧文档、旧快照、过期命令不投递。`performed` 仅代表已分派，不能据此声称业务完成。超时、取消或错误的已投递动作可能已发生；不重放，先观察。
+
+点击、输入和滚动通过指定标签的 CDP 通道执行，使用页面视口坐标；select 保留文档内 DOM 操作。`keypress(key=Enter/Tab/Escape/ArrowDown/...)` 仅接受有限页面按键，不接受系统或地址栏快捷键。`screenshot` 用该标签的 `Page.captureScreenshot`，不使用桌面截图，不会复核业务动作。DOM 引用目前覆盖顶层文档；跨域 iframe、浏览器工具栏和原生系统对话框需要另外的交互流程，不能回落桌面点击。
+
+受控的 `window.open` 和新窗口链接被约束到原任务窗口，以 `active=false` 创建子标签，结果中回传 `children`。新窗口和子标签先创建为空白页，安装弹窗约束后再导航；创建中途失败时清理本次已创建的子标签，避免遗留未登记目标。`tabs` 查看归属，`select_tab(tabId=...)` 显式切换任务的逻辑目标，保留根标签与任务窗口，不激活实际标签；切换后先等待新文档并取 snapshot。新窗口 POST 表单、依赖 WindowProxy 返回值的弹窗和部分异步导航弹窗不支持自动转送；不得把动作分派当作成功。任务清理时尝试恢复扩展安装的弹窗钩子并释放调试连接；站点权限已撤销时，页面钩子可能要重载页面才清除。此约束不构成对任意网站脚本或浏览器原生界面的全局焦点保证。
+
+预览面板与捕获源分别绑定：捕获源保持任务窗口，预览面板跟随 WorkBuddy 的窗口、显示器和 Space。原生预览不可用会记录 `browser.preview_waiting`，后台输入不等待原生视频首帧。原生面板展示窗口视频；如果人在该窗口选了其他标签，视频会显示那个标签，不能用它证明后台逻辑标签的页面状态。确认任务页面使用扩展的 `snapshot/screenshot`。日志记录命令、标签、文档、导航版本、选路和延迟，不记录输入文本、截图数据或网页正文。
+
+升级需重新加载扩展 0.3.0，并在 Chrome 提示时由本人确认新增的 debugger 权限。该权限用于固定标签的浏览器调试协议；缺权限时不尝试其他输入通道。重新连接 WorkBuddy MCP 后开始新任务。当前测试为隔离的自动化回归；实际 Chrome 焦点、不同 macOS Space 和特殊站点弹窗仍须实机验证。

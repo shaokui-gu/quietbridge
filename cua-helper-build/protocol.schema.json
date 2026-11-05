@@ -260,6 +260,7 @@
               "exclusiveMinimum": 0,
               "maximum": 4294967295
             },
+            "waitForFrame": {"type": "boolean"},
             "durationSeconds": {
               "type": "number",
               "minimum": 60,

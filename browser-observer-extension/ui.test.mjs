@@ -66,13 +66,46 @@ test('content 动作在未绑定、绑定不符或引用失效时明确失败', 
   vm.createContext(context);
   vm.runInContext(await readFile(new URL('./content.js', import.meta.url), 'utf8'), context);
   const config = { navigationEpoch: 1, bindingId: 'a'.repeat(32), authorizedOrigin: 'https://example.org' };
-  assert.equal(context.__cuaAct(config, { operation: 'click', ref: 1 }), null, '未绑定不得执行');
+  assert.equal(context.__cuaAct, undefined, 'DOM 脚本不提供直接点击入口');
+  assert.equal(context.__cuaPrepare(config, { ref: 1 }).ok, false, '未绑定不得准备输入');
   context.__cuaObserver({ ...config, selector: '' });
-  assert.equal(context.__cuaAct({ ...config, bindingId: 'b'.repeat(32) }, { operation: 'click', ref: 1 }),
-    null, '绑定不符不得执行');
-  assert.deepEqual(JSON.parse(JSON.stringify(context.__cuaAct(config, { operation: 'click', ref: 999 }))),
-    { performed: false, verified: false, observed: { reason: 'stale_ref' } });
-  assert.equal(context.__cuaAct(config, { operation: 'fill', ref: 999, value: 'x' }).verified, false);
+  assert.equal(context.__cuaPrepare({ ...config, bindingId: 'b'.repeat(32) }, { ref: 1 }).ok,
+    false, '绑定不符不得执行');
+  assert.equal(context.__cuaPrepare(config, { ref: 999 }).reason, 'stale_ref');
+  assert.equal(context.__cuaVerifyFill(config, { ref: 999, value: 'x' }), false);
+
+});
+
+test('content uses viewport geometry, rechecks moved targets and drops references absent from the latest snapshot', async () => {
+  let rect = { left: 10, top: 20, right: 110, bottom: 60, width: 100, height: 40 };
+  let included = true, scrolled = false;
+  const node = { tagName: 'BUTTON', textContent: 'Open', isConnected: true,
+    getClientRects: () => [{}], getBoundingClientRect: () => rect, getAttribute: () => null,
+    contains: hit => hit === node, scrollIntoView() { scrolled = true; } };
+  const context = {
+    location: { protocol: 'https:', origin: 'https://example.org', pathname: '/latest' },
+    document: { body: node, readyState: 'complete', getElementsByTagName: () => ({ length: 1 }),
+      querySelectorAll: () => included ? [node] : [], elementFromPoint: () => node },
+    innerWidth: 1280, innerHeight: 800,
+    getComputedStyle: () => ({ display: 'block', visibility: 'visible', opacity: '1' }),
+    chrome: { runtime: { sendMessage: async () => {} } },
+    addEventListener() {}, removeEventListener() {}, setTimeout() { return 1; }, clearTimeout() {},
+    MutationObserver: class { observe() {} disconnect() {} }
+  };
+  vm.createContext(context);
+  vm.runInContext(await readFile(new URL('./content.js', import.meta.url), 'utf8'), context);
+  const config = { navigationEpoch: 1, bindingId: 'a'.repeat(32), authorizedOrigin: 'https://example.org', selector: '' };
+  context.__cuaObserver(config);
+  const first = context.__cuaSnapshot(config), action = { ref: first.elements[0].ref };
+  const bound = { ...config, snapshotId: first.snapshotId };
+  const point = context.__cuaPrepare(bound, action);
+  assert.equal(point.x, 60); assert.equal(point.y, 40); assert.equal(scrolled, true);
+  rect = { ...rect, left: 200, right: 300 };
+  assert.equal(context.__cuaPointMatches(bound, action, point), false);
+  included = false;
+  const second = context.__cuaSnapshot(config);
+  assert.equal(context.__cuaPrepare({ ...config, snapshotId: second.snapshotId }, action).ok, false);
+  assert.equal(context.__cuaPrepare(bound, action).ok, false);
 });
 
 test('content 采集页面错误与视口，且在未绑定时拒绝诊断', async () => {
@@ -175,7 +208,7 @@ test('MV3 无静态站点授权、网页通信入口和自动内容注入', asyn
   assert.equal(m.manifest_version, 3);
   assert.deepEqual(m.optional_host_permissions, ['http://*/*', 'https://*/*']);
   for (const key of ['host_permissions', 'externally_connectable', 'content_scripts']) assert.equal(key in m, false);
-  assert.deepEqual(m.permissions, ['webNavigation', 'storage', 'scripting', 'nativeMessaging', 'alarms']);
+  assert.deepEqual(m.permissions, ['webNavigation', 'storage', 'scripting', 'nativeMessaging', 'alarms', 'debugger']);
   // key 固定扩展 ID，复制/移动目录重新加载都不会改变 ID 与原生注册。
   assert.equal(typeof m.key, 'string');
   assert.ok(m.key.length > 100, 'manifest 必须携带稳定 ID 的公钥');

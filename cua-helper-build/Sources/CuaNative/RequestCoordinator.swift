@@ -279,7 +279,11 @@ import Darwin
             }
             SpacePreview.shared.track(pid: target.pid, windowID: target.windowID, source: source)
             let granted = SpacePreview.shared.hold(seconds: seconds)
-            try await SpacePreview.shared.waitUntilReady { try cancellation.check() }
+            // Browser CDP input is independent of native video availability.
+            // Keep its preview lease without waiting for or requiring a frame.
+            if try params.optionalBoolean("waitForFrame") ?? true {
+                try await SpacePreview.shared.waitUntilReady { try cancellation.check() }
+            }
             return .object(["action": .string("hold"),
                             "windowId": .number(Double(target.windowID)),
                             "pid": .number(Double(target.pid)),

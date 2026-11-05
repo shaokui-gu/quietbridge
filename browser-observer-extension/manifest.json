@@ -1,16 +1,17 @@
 {
   "manifest_version": 3,
   "name": "WorkbuddyExtension",
-  "version": "0.2.4",
+  "version": "0.3.0",
   "minimum_chrome_version": "106",
-  "description": "一次授权普通 HTTP/HTTPS，由可信原生端内部分配任务标签的只读状态桥。",
+  "description": "固定任务标签的后台浏览器控制：CDP 输入、文档绑定与后台弹窗；不回退桌面键鼠。",
   "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA0rG5vV6zEOx2kWcca+PRe6JLYnmRTKkD8mx+1WHuKv9XWG1ZRF9YakOFu5HJ8JokkBsLFfGsKWfSF76hc2HUJw9WQZuuHNvqo93IAXZktjrwX0ZwLLbvuhRkkYPNXWbhPOrVg7svE6MSWOY4qJHr7cZSPuRaJKpe4cfdMtcSTmSHkVxweCndYwX/n9jx9jLAP51Sh7N0YhuyP4Y79gjcbiDrjUkVLxGzhjqAQ80O3vM1PWwaDEeJHStTrwI4HwZs+LzmtOf95QYDKukfT+Jsw45USIrRprs0w+lXL54f5Tww9OBavvj4BpOLI1JRz8hbYHmHQqr+FFgAYvdnPbNIswIDAQAB",
   "permissions": [
     "webNavigation",
     "storage",
     "scripting",
     "nativeMessaging",
-    "alarms"
+    "alarms",
+    "debugger"
   ],
   "optional_host_permissions": [
     "http://*/*",

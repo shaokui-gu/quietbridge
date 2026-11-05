@@ -1,4 +1,5 @@
 import { initialState, reduce, safeUrl, originOf, pause } from './state.mjs';
+import { BackgroundBrowser } from './background-browser.mjs';
 
 const HOST = 'com.cua.browser_observer';
 const ORIGINS = ['http://*/*', 'https://*/*'];
@@ -83,41 +84,19 @@ async function runCommand(command, state) {
   lastCommandId = command.requestId;
   await chrome.storage.session.set({ lastCommand: { requestId: command.requestId, at: Date.now() } });
   try {
-    if (command.operation === 'navigate') {
-      if (!state || !Number.isInteger(state.tabId)) throw new Error('缺少已核验的浏览器标签');
-      const url = command.params && command.params.url;
-      if (typeof url !== 'string' || !/^https?:\/\//.test(url)) throw new Error('导航地址不合法');
-      const tab = await chrome.tabs.update(state.tabId, { url });
-      commandReport = { requestId: command.requestId, status: 'ok',
-        result: { performed: true, verified: false,
-          observed: { tabId: state.tabId, changed: !tab || tab.url !== url } } };
-      return;
-    }
-    if (command.operation !== 'snapshot' && command.operation !== 'diagnostics' &&
-        !['click', 'fill', 'select', 'scroll'].includes(command.operation)) throw new Error('不支持的命令');
-    if (!state || state.paused || !state.documentId) throw new Error('缺少已核验的文档身份');
-    const target = { tabId: state.tabId, documentIds: [state.documentId] };
-    const config = { bindingId: state.bindingId, navigationEpoch: state.navigationEpoch };
-    let result;
-    if (command.operation === 'snapshot') {
-      const [injection] = await chrome.scripting.executeScript({ target,
-        func: c => globalThis.__cuaSnapshot?.(c) ?? null, args: [config] });
-      result = injection && injection.result;
-    } else if (command.operation === 'diagnostics') {
-      const [injection] = await chrome.scripting.executeScript({ target,
-        func: c => globalThis.__cuaDiagnostics?.(c) ?? null, args: [config] });
-      result = injection && injection.result;
-    } else {
-      const action = { operation: command.operation, ...(command.params || {}) };
-      const [injection] = await chrome.scripting.executeScript({ target,
-        func: (c, a) => globalThis.__cuaAct?.(c, a) ?? null, args: [config, action] });
-      result = injection && injection.result;
+    const result = await background.run(command, state);
+    if (result?.children?.length) {
+      const { managedTabs = [] } = await chrome.storage.session.get('managedTabs');
+      await chrome.storage.session.set({ managedTabs: [...new Set([...managedTabs, ...result.children.map(t => t.tabId)])],
+        managedTaskId: state.taskId });
     }
     if (!result) throw new Error('页面未返回结果');
     commandReport = { requestId: command.requestId, status: 'ok', result };
+    connection = { ...connection, backgroundStatus: 'ready', lastActionError: null };
   } catch (error) {
     commandReport = { requestId: command.requestId, status: 'error',
       error: String(error?.message || '命令执行失败').slice(0, 200) };
+    connection = { ...connection, backgroundStatus: 'waiting', lastActionError: commandReport.error };
   }
 }
 const serial = fn => {
@@ -129,6 +108,11 @@ const read = async () => (await chrome.storage.session.get('observer')).observer
 const save = observer => chrome.storage.session.set({ observer });
 const permitted = async () => !permissionRevoked && await chrome.permissions.contains({ origins: ORIGINS });
 const enabled = async () => (await chrome.storage.local.get('enabled')).enabled === true;
+const background = new BackgroundBrowser(chrome, async s => {
+  const current = await read();
+  return await enabled() && await permitted() && current?.bindingId === s?.bindingId &&
+    current?.documentId === s?.documentId;
+});
 async function native(message) {
   let timeout;
   try {
@@ -164,11 +148,18 @@ async function stop(s) {
       tabId: s.tabId, documentIds: [s.documentId] }, func: () => globalThis.__cuaObserverStop?.() });
   } catch {}
 }
-async function clearObservation() {
+async function clearObservation(keepTask = false) {
   const s = await read();
   assignmentTitle = null;
   await save(null);
   await stop(s);
+  if (!keepTask) {
+    const { managedTabs = [], managedTaskId } = await chrome.storage.session.get(['managedTabs', 'managedTaskId']);
+    for (const tabId of new Set([...managedTabs, ...background.attached.keys(), ...background.guards.keys()])) {
+      await background.release(tabId, managedTaskId || s?.taskId);
+    }
+    await chrome.storage.session.set({ managedTabs: [], managedTaskId: null });
+  }
 }
 async function suspend(s) {
   await stop(s);
@@ -195,6 +186,7 @@ async function navigation(type, d) {
     if (!frame || frame.documentId !== d.documentId || safeUrl(frame.url) !== safeUrl(d.url)) return;
   }
   const next = reduce(old, { ...d, type });
+  if (next !== old) next.documentUrl = d.url;
   if (next === old) return;
   if (next.paused) await stop(old);
   await publish(next);
@@ -210,8 +202,12 @@ async function acceptAssignment(a) {
   }
   const old = await read();
   if (old && old.taskId === a.taskId && old.bindingId === a.bindingId &&
-      old.assignmentVersion === a.assignmentVersion && old.token === a.token) return;
-  await clearObservation();
+      old.assignmentVersion === a.assignmentVersion && old.token === a.token) {
+    old.ownedTabCount = (a.ownedTabs || []).length || old.ownedTabCount || 1;
+    await save(old);
+    return;
+  }
+  await clearObservation(old?.taskId === a.taskId);
   const tab = await chrome.tabs.get(a.tabId);
   if (tab.windowId !== a.browserWindowId || !safeUrl(tab.url)) {
     assignmentStatus = 'needs_target_selection';
@@ -220,7 +216,8 @@ async function acceptAssignment(a) {
   if (a.paused) { assignmentStatus = 'paused'; return; }
   const s = initialState({ taskId: a.taskId, token: a.token, bindingId: a.bindingId,
     assignmentVersion: a.assignmentVersion, globalOrigins: true,
-    authorizedOrigin: originOf(tab.url), selector: '', tabId: a.tabId, browserWindowId: a.browserWindowId });
+    authorizedOrigin: originOf(tab.url), selector: '', tabId: a.tabId, browserWindowId: a.browserWindowId,
+    ownedTabCount: (a.ownedTabs || []).length || 1 });
   assignmentTitle = typeof tab.title === 'string' ? tab.title.slice(0, 200) : null;
   // 重启保留 host 已接受的序号与 epoch，但重新核验当前文档。
   if (a.event) {
@@ -228,6 +225,9 @@ async function acceptAssignment(a) {
     s.navigationEpoch = a.event.navigationEpoch;
   }
   await save(s);
+  await background.reset(s);
+  await chrome.storage.session.set({ managedTabs: (a.ownedTabs || [{ tabId: a.tabId }]).map(t => t.tabId),
+    managedTaskId: a.taskId });
   await chrome.storage.local.set({ boundTarget: { taskId: a.taskId, token: a.token, tabId: a.tabId } });
   const frame = await chrome.webNavigation.getFrame({ tabId: a.tabId, frameId: 0 });
   if (frame?.documentId) await navigation('committed', { ...frame, frameId: 0,
@@ -238,6 +238,16 @@ function schedule() {
   clearTimeout(timer);
   timer = setTimeout(() => { serial(sync); }, 5000);
 }
+async function finishCreatedTarget(request, result) {
+  const { lastCreatedTarget, managedTabs = [] } = await chrome.storage.session.get(['lastCreatedTarget', 'managedTabs']);
+  if (!request.url || lastCreatedTarget?.navigationIssued) return;
+  await chrome.storage.session.set({ managedTabs: [...new Set([...managedTabs, result.tabId])], managedTaskId: request.taskId });
+  await background.protectCreatedTab(result.tabId, result.browserWindowId, request.taskId);
+  if (!await enabled() || !await permitted()) throw new Error('授权已撤销，新窗口保持空白');
+  // An unknown navigation result must never be replayed after worker restart.
+  await chrome.storage.session.set({ lastCreatedTarget: { ...lastCreatedTarget, navigationIssued: true } });
+  await chrome.tabs.update(result.tabId, { url: request.url });
+}
 async function createWindow(request) {
   if (!request || typeof request.requestId !== 'string' || !request.requestId ||
       lastCreateRequestId === request.requestId) return false;
@@ -246,6 +256,7 @@ async function createWindow(request) {
   if (lastCreatedTarget?.requestId === request.requestId) {
     if (lastCreatedTarget.result) {
       createdReport = lastCreatedTarget.result;
+      await finishCreatedTarget(request, lastCreatedTarget.result);
       return true;
     }
     throw new Error('窗口创建已下发但结果未知，未重复建窗');
@@ -254,8 +265,7 @@ async function createWindow(request) {
   await chrome.storage.session.set({ lastCreatedTarget: {
     requestId: request.requestId, at: Date.now()
   } });
-  const options = { focused: false };
-  if (typeof request.url === 'string' && request.url) options.url = request.url;
+  const options = { focused: false, url: 'about:blank' };
   const win = await chrome.windows.create(options);
   const tab = win && Array.isArray(win.tabs) ? win.tabs[0] : null;
   if (!win || !Number.isInteger(win.id) || !tab || !Number.isInteger(tab.id)) {
@@ -265,7 +275,10 @@ async function createWindow(request) {
   await chrome.storage.session.set({ lastCreatedTarget: {
     requestId: request.requestId, at: Date.now(), result
   } });
+  // Record the created identity before any further await. Failures must never
+  // create another window. Only navigate after early popup protection is ready.
   createdReport = result;
+  await finishCreatedTarget(request, result);
   return true;
 }
 async function sync() {
@@ -281,7 +294,7 @@ async function sync() {
       return { permission, on, revision: enableRevision };
     });
     keepAlive(on && permission);
-    const payload = { action: 'sync', enabled: on, permission, clientVersion: '0.2.3' };
+    const payload = { action: 'sync', enabled: on, permission, clientVersion: '0.3.0', capabilities: ['cdp_input', 'document_binding', 'background_popups'] };
     if (assignmentTitle) payload.assignmentTitle = assignmentTitle;
     if (createdReport) payload.created = createdReport;
     if (commandReport) payload.commandResult = commandReport;
@@ -291,7 +304,8 @@ async function sync() {
     if (payload.commandResult) commandReport = null;
     if (revision !== enableRevision) return;
     if (r.protocolVersion !== 2 || !Number.isFinite(r.heartbeatAt)) throw new Error('host 协议不兼容');
-    connection = { status: 'connected', lastHeartbeatAt: r.heartbeatAt * 1000 };
+    connection = { ...connection, status: 'connected', lastHeartbeatAt: r.heartbeatAt * 1000 };
+    delete connection.lastError;
     if (r.requestCandidates && on && permission) {
       // 仅原生可信端请求时返回候选元数据，不观察候选页面内容，不按焦点筛选。
       const tabs = await chrome.tabs.query({});
@@ -303,7 +317,8 @@ async function sync() {
     if (revision !== enableRevision) return;
     assignmentStatus = r.taskAssignment;
     if (on && permission && await enabled() && await permitted() && r.assignment) await acceptAssignment(r.assignment);
-    else await clearObservation();
+    else await clearObservation(on && permission && r.activeTaskId != null &&
+      [...background.guards.values()].some(g => g.taskId === r.activeTaskId));
     if (r.createRequest && on && permission) {
       try {
         if (await createWindow(r.createRequest)) serial(sync);
@@ -340,14 +355,11 @@ chrome.permissions.onRemoved.addListener(() => {
   });
 });
 chrome.permissions.onAdded.addListener(() => { control(resumeEnable); });
-// 装好或重载扩展时，若还没授予站点权限，就把授权页顶到前台。
-// chrome.permissions.request 必须由扩展页面内的用户手势触发，网页无法代劳；
-// 唯一能自动化的就是「把该页面送到用户眼前」，剩下的点击仍归用户。
-// 已授权时不打扰，只在确实缺权限时开一次。
+// 缺权限时只开后台说明页；授权由用户主动打开扩展面板完成。
 chrome.runtime.onInstalled.addListener(() => {
   control(async () => {
     if (await chrome.permissions.contains({ origins: ORIGINS })) return;
-    await chrome.tabs.create({ url: chrome.runtime.getURL('popup.html'), active: true });
+    await chrome.tabs.create({ url: chrome.runtime.getURL('popup.html'), active: false });
   });
 });
 // 权限事件可能早于 popup 的持久写入完成，补查写入后的真实授权。
@@ -413,7 +425,7 @@ chrome.runtime.onMessage.addListener((message, sender, respond) => {
       await clearObservation();
     }
     const s = await read();
-    const visible = s ? Object.fromEntries(Object.entries(s).filter(([k]) => !['token', 'bindingId'].includes(k))) : null;
+    const visible = s ? Object.fromEntries(Object.entries(s).filter(([k]) => !['token', 'bindingId', 'documentUrl'].includes(k))) : null;
     return { globalPermission: await permitted() ? 'granted' : 'permission_missing',
       enabled: await enabled(), nativeConnection: { ...connection },
       taskAssignment: assignmentStatus, state: visible };

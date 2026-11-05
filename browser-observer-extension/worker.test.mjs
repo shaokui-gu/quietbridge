@@ -3,9 +3,10 @@ import assert from 'node:assert/strict';
 import vm from 'node:vm';
 import { readFile } from 'node:fs/promises';
 import { initialState, reduce, safeUrl, originOf, pause } from './state.mjs';
+import { BackgroundBrowser } from './background-browser.mjs';
 
 const listener = () => ({ addListener(fn) { this.fn = fn; } });
-const code = (await readFile(new URL('./service-worker.js', import.meta.url), 'utf8')).replace(/^import .*;\n/, '');
+const code = (await readFile(new URL('./service-worker.js', import.meta.url), 'utf8')).replace(/^import .*;\n/gm, '');
 test('真实 worker 入口：握手、默认无任务、内部派发、隔离、跨站、撤权、重连与重启', async () => {
   let stored = null;
   let on = false;
@@ -17,6 +18,7 @@ test('真实 worker 入口：握手、默认无任务、内部派发、隔离、
   let blockSync = null;
   let frame = { documentId: 'doc-1', url: 'https://example.org/latest?secret=x' };
   const calls = [], scripts = [], timers = new Map();
+  const extraSession = {};
   let timerId = 0;
   let context;
   let chrome;
@@ -26,8 +28,9 @@ test('真实 worker 入口：握手、默认无任务、内部派发、隔离、
     chrome = {
       storage: {
         onChanged: listener(),
-        session: { async get() { return { observer: structuredClone(stored) }; },
-          async set({ observer }) { stored = structuredClone(observer); } },
+        session: { async get() { return { ...extraSession, observer: structuredClone(stored) }; },
+          async set(values) { if ('observer' in values) stored = structuredClone(values.observer);
+            for (const [key, value] of Object.entries(values)) if (key !== 'observer') extraSession[key] = value; } },
         local: { async get() { return { ...local, enabled: on }; }, async set(v) {
           Object.assign(local, structuredClone(v));
           if ('enabled' in v) on = v.enabled;
@@ -65,7 +68,7 @@ test('真实 worker 入口：握手、默认无任务、内部派发、隔离、
           { id: 7, windowId: 2, url: frame.url }, { id: 8, windowId: 3, url: 'chrome://settings' }]; } },
       scripting: { async executeScript(o) { scripts.push(o); } }
     };
-    context = vm.createContext({ chrome, initialState, reduce, safeUrl, originOf, pause, URL, Date,
+    context = vm.createContext({ chrome, BackgroundBrowser, initialState, reduce, safeUrl, originOf, pause, URL, Date,
       setTimeout(fn, ms) { const id = ++timerId; timers.set(id, { fn, ms }); return id; },
       clearTimeout(id) { timers.delete(id); }, setInterval() { return -1; }, clearInterval() {} });
     vm.runInContext(code, context);
@@ -174,7 +177,7 @@ test('真实 worker 入口：握手、默认无任务、内部派发、隔离、
   chrome.runtime.onInstalled.fn({ reason: 'install' });
   await vm.runInContext('controls', context);
   assert.deepEqual(chrome.tabs.opened.map(o => o.url), ['chrome-extension://extension/popup.html']);
-  assert.equal(chrome.tabs.opened[0].active, true);
+  assert.equal(chrome.tabs.opened[0].active, false);
   // 已授权时不得打扰日常重载。
   chrome.tabs.opened.length = 0;
   permission = true;
@@ -223,19 +226,30 @@ async function lifecycleHarness() {
         return { postMessage() {}, disconnect() {},
           onMessage: listener(), onDisconnect: listener() };
       },
-      async sendNativeMessage(host, message) { calls.push(structuredClone(message)); return nativeHandler(message); } },
+      async sendNativeMessage(host, message) {
+        calls.push(structuredClone(message));
+        const reply = await nativeHandler(message);
+        if (reply.command && reply.assignment) {
+          const a = reply.assignment;
+          reply.command = { bindingId: a.bindingId, assignmentVersion: a.assignmentVersion,
+            tabId: a.tabId, browserWindowId: a.browserWindowId, documentId: 'doc-1',
+            navigationEpoch: state?.navigationEpoch ?? 1, expiresAt: Date.now() / 1000 + 30, ...reply.command };
+        }
+        return reply;
+      } },
     webNavigation: { ...nav, async getFrame() {
       return { documentId: 'doc-1', frameId: 0, url: 'https://example.org/path' };
     } },
     tabs: { onRemoved: listener(),
       async get(id) { return { id, windowId: 2, url: 'https://example.org/path' }; },
       async update(id, props) { return { id, windowId: 2, url: props.url }; } },
+    debugger: { onDetach: listener(), async attach() {}, async detach() {}, async sendCommand() { return { identifier: 'script-1' }; } },
     scripting: { async executeScript() {} },
     alarms: { create() {}, onAlarm: listener() }
   };
   let context;
   const boot = () => {
-    context = vm.createContext({ chrome, initialState, reduce, safeUrl, originOf, pause, URL, Date,
+    context = vm.createContext({ chrome, BackgroundBrowser, initialState, reduce, safeUrl, originOf, pause, URL, Date,
       setTimeout() { return 1; }, clearTimeout() {}, setInterval() { return 2; }, clearInterval() {} });
     vm.runInContext(code, context);
   };
@@ -374,7 +388,10 @@ test('native 阻塞不阻塞 UI 启用状态，失败仍 enabled 且展示 lastE
 test('内部创建请求只执行一次，创建证据只回传一次', async () => {
   const h = await lifecycleHarness();
   h.permission = true;
-  const created = [];
+  const created = [], navigated = [], protection = [];
+  h.chrome.tabs.get = async id => ({ id, windowId: 41, url: 'about:blank' });
+  h.chrome.tabs.update = async (id, options) => { navigated.push({ id, options }); return { id, windowId: 41, ...options }; };
+  h.chrome.debugger.sendCommand = async (target, method) => { protection.push({ target, method }); return { identifier: 'script-1' }; };
   h.chrome.windows = { async create(options) {
     created.push(structuredClone(options));
     return { id: 41, tabs: [{ id: 42, windowId: 41 }] };
@@ -393,7 +410,10 @@ test('内部创建请求只执行一次，创建证据只回传一次', async ()
   await h.send({ action: 'enable' });
   await h.flush();
   assert.equal(created.length, 1);
-  assert.equal(created[0].url, 'https://example.org/');
+  assert.equal(created[0].url, 'about:blank');
+  assert.equal(navigated[0].id, 42);
+  assert.equal(navigated[0].options.url, 'https://example.org/');
+  assert.equal(protection[0].method, 'Page.addScriptToEvaluateOnNewDocument');
   assert.equal(created[0].focused, false, '创建专用窗口不得抢占前台');
   const reports = syncs.filter(m => m.created);
   assert.equal(reports.length, 1);
@@ -532,41 +552,33 @@ test('缺少已核验文档时命令返回错误而不是伪装成功', async ()
   assert.equal('result' in reports[0].commandResult, false);
 });
 
-test('动作命令把参数送到已核验文档，performed 与 verified 原样回传', async () => {
+test('动作命令通过 CDP 发给固定标签，DOM 不再直接 click', async () => {
   const h = await lifecycleHarness();
   h.permission = true;
-  const outcome = { performed: true, verified: false, observed: { tag: 'a' } };
-  const injections = [];
-  h.chrome.scripting.executeScript = async options => {
-    if (typeof options.func === 'function' && options.func.toString().includes('__cuaAct')) {
-      injections.push(options);
-      return [{ result: outcome }];
-    }
-    return [{ result: null }];
+  const inputs = [];
+  h.chrome.debugger.sendCommand = async (target, method, params) => {
+    inputs.push({ target, method, params }); return { identifier: 'script-1' };
   };
-  const commandId = 'a1'.repeat(16);
+  h.chrome.scripting.executeScript = async o => {
+    if (o.func?.toString().includes('__cuaPrepare')) return [{ result: { ok: true, x: 10, y: 20 } }];
+    return [{ result: o.args?.[1] === 'drain' ? [] : true }];
+  };
   const assignment = { taskId: 'task', token: 'b'.repeat(64), bindingId: 'c'.repeat(32),
-    assignmentVersion: 1, globalOrigins: true, selector: '', tabId: 7, browserWindowId: 2,
-    mappingVerified: false };
+    assignmentVersion: 1, globalOrigins: true, selector: '', tabId: 7, browserWindowId: 2, mappingVerified: false };
   const syncs = [];
   h.native = async message => {
     syncs.push(structuredClone(message));
     if (message.action !== 'sync') return { ok: true };
-    if (message.commandResult) {
-      return { ok: true, protocolVersion: 2, heartbeatAt: 3, taskAssignment: 'assigned', assignment };
-    }
     return { ok: true, protocolVersion: 2, heartbeatAt: 2, taskAssignment: 'assigned', assignment,
-      command: { requestId: commandId, taskId: 'task', operation: 'click', params: { ref: 3 } } };
+      ...message.commandResult ? {} : { command: { requestId: 'e'.repeat(32), taskId: 'task', operation: 'click',
+        params: { ref: 3, snapshotId: 'snapshot-1' } } } };
   };
-  await h.send({ action: 'enable' });
-  await h.flush();
-  assert.equal(injections.length, 1);
-  assert.equal(injections[0].args[1].operation, 'click');
-  assert.equal(injections[0].args[1].ref, 3);
-  const reports = syncs.filter(m => m.commandResult);
-  assert.equal(reports.length, 1);
-  assert.equal(reports[0].commandResult.result.performed, true);
-  assert.equal(reports[0].commandResult.result.verified, false, '不得把分派当成成功');
+  await h.send({ action: 'enable' }); await h.flush();
+  const pointer = inputs.filter(i => i.method === 'Input.dispatchMouseEvent');
+  assert.deepEqual(pointer.map(i => i.params.type), ['mouseMoved', 'mousePressed', 'mouseReleased']);
+  assert.ok(pointer.every(i => i.target.tabId === 7 && i.params.x === 10 && i.params.y === 20));
+  const report = syncs.find(m => m.commandResult).commandResult;
+  assert.equal(report.status, 'ok'); assert.equal(report.result.verified, false);
 });
 
 test('导航命令走 tabs.update，且不声称已验证', async () => {
@@ -574,7 +586,7 @@ test('导航命令走 tabs.update，且不声称已验证', async () => {
   h.permission = true;
   const updates = [];
   h.chrome.tabs.update = async (id, props) => { updates.push({ id, props }); return { id, url: props.url }; };
-  h.chrome.scripting.executeScript = async () => [{ result: null }];
+  h.chrome.scripting.executeScript = async o => [{ result: o.args?.[1] === 'drain' ? [] : true }];
   const commandId = 'f1'.repeat(16);
   const assignment = { taskId: 'task', token: 'b'.repeat(64), bindingId: 'c'.repeat(32),
     assignmentVersion: 1, globalOrigins: true, selector: '', tabId: 7, browserWindowId: 2,
