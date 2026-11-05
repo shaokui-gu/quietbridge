@@ -164,6 +164,7 @@ final class TaskPrivacyController {
         Self.trace("hold \(Int(clamped))s active=\(active) paused=\(pausedByUser) locked=\(String(describing: sessionState()))")
         expiresAtUptime = ProcessInfo.processInfo.systemUptime + clamped
         if handoff.beginTask() {
+            PrivacyWallpaper.shared.prepare()
             authenticationLockRequested = false
             sawSystemLock = false
             lockRequestInFlight = false
@@ -208,6 +209,7 @@ final class TaskPrivacyController {
         if completedHandoff { guardian.completeHandoff() }
         else { guardian.stop() }
         destroyPanels()
+        PrivacyWallpaper.shared.clear()
     }
 
     func status() -> JSONValue {
@@ -551,6 +553,9 @@ final class PrivacyShieldView: NSView {
     private let screenIndex: Int
     private let interaction: () -> Void
     private var inputPolicy = PrivacyGuardianInputPolicy()
+    private var wallpaperImage: NSImage?
+    private var wallpaperVideo: PrivacyWallpaperVideo?
+    private var visibilityObservation: NSKeyValueObservation?
 
     init(screenIndex: Int, interaction: @escaping () -> Void) {
         self.screenIndex = screenIndex
@@ -559,6 +564,36 @@ final class PrivacyShieldView: NSView {
         setAccessibilityElement(true)
         setAccessibilityRole(.window)
         setAccessibilityLabel("workbuddy 正在使用你的 Mac。按任意键或点击，进入系统登录锁屏。")
+    }
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        guard let screen = window?.screen else { return }
+        if let url = PrivacyWallpaper.shared.fileURL(for: screen),
+           ["mov", "mp4", "m4v"].contains(url.pathExtension.lowercased()) {
+            guard wallpaperVideo == nil else { return }
+            wallpaperVideo = PrivacyWallpaperVideo(url: url)
+            let videoView = NSView(frame: bounds)
+            videoView.wantsLayer = true
+            videoView.layer = wallpaperVideo?.layer
+            videoView.autoresizingMask = [.width, .height]
+            addSubview(videoView)
+            let artwork = PrivacyWallpaperArtwork(frame: bounds)
+            artwork.autoresizingMask = [.width, .height]
+            addSubview(artwork)
+            visibilityObservation = window?.observe(\.isVisible, options: [.initial, .new]) { [weak self] _, change in
+                let visible = change.newValue ?? false
+                Task { @MainActor [weak self] in self?.wallpaperVideo?.setVisible(visible) }
+            }
+        } else {
+            wallpaperImage = PrivacyWallpaper.shared.snapshot(for: screen)
+                ?? PrivacyWallpaper.shared.fileURL(for: screen).flatMap { NSImage(contentsOf: $0) }
+        }
+        needsDisplay = true
+    }
+
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        bounds.contains(point) ? self : nil
     }
 
     required init?(coder: NSCoder) { nil }
@@ -590,10 +625,25 @@ final class PrivacyShieldView: NSView {
 
     override func draw(_ dirtyRect: NSRect) {
         guard let context = NSGraphicsContext.current?.cgContext else { return }
-        Self.drawArtwork(in: bounds, context: context, screenIndex: screenIndex)
+        if wallpaperVideo == nil {
+            Self.drawArtwork(in: bounds, context: context, screenIndex: screenIndex, wallpaperImage: wallpaperImage)
+        } else {
+            NSColor.black.setFill()
+            context.fill(bounds)
+        }
     }
 
-    static func drawArtwork(in bounds: CGRect, context: CGContext, screenIndex: Int) {
+    static func drawArtwork(in bounds: CGRect, context: CGContext, screenIndex: Int,
+                            wallpaperImage: NSImage? = nil, drawBackdrop: Bool = true) {
+        if drawBackdrop, let wallpaperImage {
+            let size = wallpaperImage.size
+            if size.width > 0, size.height > 0 {
+                let scale = max(bounds.width / size.width, bounds.height / size.height)
+                wallpaperImage.draw(in: CGRect(x: bounds.midX - size.width * scale / 2,
+                                               y: bounds.midY - size.height * scale / 2,
+                                               width: size.width * scale, height: size.height * scale))
+            }
+        } else if drawBackdrop {
         let sky = NSColor(srgbRed: 0.45, green: 0.66, blue: 0.37, alpha: 1)
         let earth = NSColor(srgbRed: 0.24, green: 0.47, blue: 0.21, alpha: 1)
         if let gradient = CGGradient(
@@ -623,9 +673,15 @@ final class PrivacyShieldView: NSView {
         drawMap(in: CGPoint(x: bounds.width * 0.24, y: bounds.height * 0.29),
                 radius: min(bounds.width, bounds.height) * 0.15,
                 pixel: max(5, bounds.height / 126), context: context)
+        }
+        if wallpaperImage != nil || !drawBackdrop {
+            context.setFillColor(NSColor.black.withAlphaComponent(0.18).cgColor)
+            context.fill(bounds)
+        }
 
         let center = CGPoint(x: bounds.midX, y: bounds.midY + bounds.height * 0.035)
-        drawMark(at: center, scale: max(0.82, min(1.12, bounds.height / 900)), context: context)
+        let markScale = max(0.82, min(1.12, bounds.height / 900))
+        drawMark(at: center, scale: markScale, context: context)
 
         let title = NSMutableAttributedString(
             string: "workbuddy is using your Mac",
@@ -653,13 +709,20 @@ final class PrivacyShieldView: NSView {
                               range: NSRange(location: 0, length: subtitle.length))
         instruction.addAttribute(.paragraphStyle, value: paragraph,
                                  range: NSRange(location: 0, length: instruction.length))
-        let titleY = center.y - max(56, bounds.height * 0.09)
-        title.draw(in: CGRect(x: bounds.midX - bounds.width * 0.4, y: titleY,
-                              width: bounds.width * 0.8, height: bounds.height * 0.05))
-        subtitle.draw(in: CGRect(x: bounds.midX - bounds.width * 0.4, y: titleY - bounds.height * 0.038,
-                                 width: bounds.width * 0.8, height: bounds.height * 0.035))
-        instruction.draw(in: CGRect(x: bounds.midX - bounds.width * 0.4, y: titleY - bounds.height * 0.075,
-                                    width: bounds.width * 0.8, height: bounds.height * 0.035))
+        // Anchor text below the actual logo bounds. Percentage-based text boxes
+        // grew upward into the minimum-size logo on shorter displays.
+        let textWidth = bounds.width * 0.8
+        var textTop = center.y - 38 * markScale - max(24, bounds.height * 0.028)
+        for (text, gap) in [(title, CGFloat(12)), (subtitle, CGFloat(14)),
+                            (instruction, CGFloat(0))] {
+            let measured = text.boundingRect(
+                with: CGSize(width: textWidth, height: .greatestFiniteMagnitude),
+                options: [.usesLineFragmentOrigin, .usesFontLeading])
+            let height = ceil(measured.height) + 2
+            text.draw(in: CGRect(x: bounds.midX - textWidth / 2, y: textTop - height,
+                                 width: textWidth, height: height))
+            textTop -= height + gap
+        }
     }
 
     private static func drawDiagonalGrid(
@@ -740,5 +803,12 @@ final class PrivacyShieldView: NSView {
             ])
         let size = text.size()
         text.draw(at: CGPoint(x: center.x - size.width / 2, y: center.y - size.height / 2 + 1))
+    }
+}
+
+private final class PrivacyWallpaperArtwork: NSView {
+    override func draw(_ dirtyRect: NSRect) {
+        guard let context = NSGraphicsContext.current?.cgContext else { return }
+        PrivacyShieldView.drawArtwork(in: bounds, context: context, screenIndex: 0, drawBackdrop: false)
     }
 }

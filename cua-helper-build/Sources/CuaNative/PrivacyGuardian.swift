@@ -108,6 +108,9 @@ final class PrivacyGuardianClient {
         let input = Pipe(), output = Pipe()
         child.executableURL = Bundle.main.executableURL ?? URL(fileURLWithPath: CommandLine.arguments[0])
         child.arguments = ["--privacy-guardian"]
+        if let directory = PrivacyWallpaper.shared.directory {
+            child.arguments?.append(contentsOf: ["--wallpaper-snapshots", directory.path])
+        }
         child.standardInput = input
         child.standardOutput = output
         child.standardError = FileHandle.standardError

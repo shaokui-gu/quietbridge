@@ -10,6 +10,9 @@ import Darwin
             let arguments = Array(CommandLine.arguments.dropFirst())
             if arguments.first == "--privacy-guardian" {
                 _ = NSApplication.shared
+                if arguments.count == 3, arguments[1] == "--wallpaper-snapshots" {
+                    PrivacyWallpaper.shared.useSnapshots(from: URL(fileURLWithPath: arguments[2]))
+                }
                 PrivacyGuardianProcess().run()
                 return
             }
