@@ -20,9 +20,12 @@ final class LockedUseAuthorizationState: @unchecked Sendable {
     private let lock = NSLock()
     private var taskSessionID: UInt32?
     private var taskActive = false
+    // Completing manual authentication does not resume the interrupted task.
+    // Explicit task release clears the pause independently of authentication.
+    private var taskPausedByUser = false
     private var protectionUntil: TimeInterval = 0
     private var grantUntil: TimeInterval = 0
-    private var automaticUnlockPending = false
+    private var pendingAutomaticUnlock = false
     private var manualLockObserved = false
     private var suppressUntilManualUnlock = false
     private var currentLockHandled = false
@@ -34,6 +37,7 @@ final class LockedUseAuthorizationState: @unchecked Sendable {
         lock.withLock {
             taskSessionID = sessionID
             taskActive = sessionID != nil
+            taskPausedByUser = false
             protectionUntil = 0
             currentLockHandled = false
             grantUntil = 0
@@ -42,14 +46,25 @@ final class LockedUseAuthorizationState: @unchecked Sendable {
     }
 
     func endTask() {
+        lock.withLock { endTaskLocked() }
+    }
+
+    /// Explicit user release also permits selecting a new task after manual
+    /// authentication. It never recalls an Allow or bypasses authentication.
+    func releaseTask() {
         lock.withLock {
-            taskActive = false
-            taskSessionID = nil
-            protectionUntil = 0
-            currentLockHandled = false
-            grantUntil = 0
-            lastGrantReason = nil
+            endTaskLocked()
+            taskPausedByUser = false
         }
+    }
+
+    private func endTaskLocked() {
+        taskActive = false
+        taskSessionID = nil
+        protectionUntil = 0
+        currentLockHandled = false
+        grantUntil = 0
+        lastGrantReason = nil
     }
 
     func renewProtection(ready: Bool, validUntil: TimeInterval? = nil) {
@@ -65,6 +80,7 @@ final class LockedUseAuthorizationState: @unchecked Sendable {
     func suppressForManualAuthentication() {
         lock.withLock {
             if !suppressUntilManualUnlock { manualLockObserved = false }
+            taskPausedByUser = true
             suppressUntilManualUnlock = true
             currentLockHandled = true
             grantUntil = 0
@@ -77,7 +93,7 @@ final class LockedUseAuthorizationState: @unchecked Sendable {
     func armExternalLock(seconds: TimeInterval, sessionID: UInt32) -> Bool {
         lock.withLock {
             guard taskActive, taskSessionID == sessionID, sessionID != 0, protectionUntil > ProcessInfo.processInfo.systemUptime, seconds.isFinite, seconds > 0,
-                  !suppressUntilManualUnlock, !currentLockHandled else { return false }
+                  !taskPausedByUser, !suppressUntilManualUnlock, !currentLockHandled else { return false }
             currentLockHandled = true
             grantUntil = ProcessInfo.processInfo.systemUptime + min(seconds, 12)
             lastGrantReason = "active interface task"
@@ -86,6 +102,32 @@ final class LockedUseAuthorizationState: @unchecked Sendable {
     }
 
     var manualAuthenticationRequired: Bool { lock.withLock { suppressUntilManualUnlock } }
+    var automationPaused: Bool { lock.withLock { taskPausedByUser } }
+    var automaticUnlockPending: Bool { lock.withLock { pendingAutomaticUnlock } }
+    // An observed lock is insufficient while authd still holds an Allow that
+    // may unlock it. The caller must also confirm the session is currently locked.
+    var canCompleteManualHandoff: Bool {
+        lock.withLock { suppressUntilManualUnlock && manualLockObserved && !pendingAutomaticUnlock }
+    }
+
+    func requireAutomationAllowed() throws {
+        guard lock.withLock({ !taskPausedByUser && !suppressUntilManualUnlock }) else {
+            throw NativeFailure(code: "MANUAL_AUTHENTICATION_REQUIRED",
+                                message: "用户已接管；当前任务的自动输入已暂停")
+        }
+    }
+
+    func requireAutomaticUnlockAllowed() throws {
+        let allowed = lock.withLock {
+            let now = ProcessInfo.processInfo.systemUptime
+            return taskActive && !taskPausedByUser && !suppressUntilManualUnlock
+                && protectionUntil > now && grantUntil > now
+        }
+        guard allowed else {
+            throw NativeFailure(code: "AUTOMATIC_UNLOCK_NOT_ALLOWED",
+                                message: "自动解锁授权已撤销、过期或任务已暂停")
+        }
+    }
 
     func noteSessionLocked() {
         lock.withLock { if suppressUntilManualUnlock { manualLockObserved = true } }
@@ -93,15 +135,15 @@ final class LockedUseAuthorizationState: @unchecked Sendable {
 
     func noteSessionUnlocked() {
         lock.withLock {
-            if suppressUntilManualUnlock && automaticUnlockPending {
+            if suppressUntilManualUnlock && pendingAutomaticUnlock {
                 // An already-consumed Allow cannot be recalled from authd.
                 // Its unlock is not evidence of manual authentication.
-                automaticUnlockPending = false
+                pendingAutomaticUnlock = false
                 manualLockObserved = false
                 return
             }
             guard !suppressUntilManualUnlock || manualLockObserved else { return }
-            automaticUnlockPending = false
+            pendingAutomaticUnlock = false
             manualLockObserved = false
             currentLockHandled = false
             grantUntil = 0
@@ -113,13 +155,13 @@ final class LockedUseAuthorizationState: @unchecked Sendable {
     func consumeGrant(sessionID: UInt32) -> Bool {
         lock.withLock {
             let now = ProcessInfo.processInfo.systemUptime
-            guard taskActive, taskSessionID == sessionID, sessionID != 0, protectionUntil > now, !suppressUntilManualUnlock, grantUntil > now else {
+            guard taskActive, taskSessionID == sessionID, sessionID != 0, protectionUntil > now, !taskPausedByUser, !suppressUntilManualUnlock, grantUntil > now else {
                 rejectedCount += 1
                 grantUntil = 0
                 return false
             }
             grantUntil = 0
-            automaticUnlockPending = true
+            pendingAutomaticUnlock = true
             consumedCount += 1
             return true
         }
@@ -131,6 +173,8 @@ final class LockedUseAuthorizationState: @unchecked Sendable {
                 "boundSessionID": taskSessionID.map { Int($0) } as Any,
                 "protectionReady": protectionUntil > ProcessInfo.processInfo.systemUptime,
                 "taskActive": taskActive,
+                "automationPaused": taskPausedByUser,
+                "automaticUnlockPending": pendingAutomaticUnlock,
                 "manualSuppression": suppressUntilManualUnlock,
                 "currentLockHandled": currentLockHandled,
                 "grantRemainingMilliseconds": max(
@@ -258,16 +302,16 @@ final class LockedUseAuthorizationServer: @unchecked Sendable {
     }
     func beginTask() { state.beginTask(sessionID: verifiedSessionID()) }
     func endTask() { state.endTask() }
+    func releaseTask() { state.releaseTask() }
     func suppressForManualAuthentication() { state.suppressForManualAuthentication() }
     func noteSessionLocked() { state.noteSessionLocked() }
     func noteSessionUnlocked() { state.noteSessionUnlocked() }
     var manualAuthenticationRequired: Bool { state.manualAuthenticationRequired }
-    func requireAutomationAllowed() throws {
-        guard !state.manualAuthenticationRequired else {
-            throw NativeFailure(code: "MANUAL_AUTHENTICATION_REQUIRED",
-                                message: "用户已接管；请在系统锁屏中手动认证后重新读取状态")
-        }
-    }
+    var automationPaused: Bool { state.automationPaused }
+    var automaticUnlockPending: Bool { state.automaticUnlockPending }
+    var canCompleteManualHandoff: Bool { state.canCompleteManualHandoff }
+    func requireAutomationAllowed() throws { try state.requireAutomationAllowed() }
+    func requireAutomaticUnlockAllowed() throws { try state.requireAutomaticUnlockAllowed() }
 
     @discardableResult
     func armExternalLock(seconds: TimeInterval = 12) -> Bool {

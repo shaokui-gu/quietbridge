@@ -11,6 +11,15 @@ SPEC.loader.exec_module(installer)
 
 
 class InstallationGateTests(unittest.TestCase):
+    def test_deny_only_rejects_normal_bundle_before_policy_access(self):
+        with patch.object(installer, "require_root"), \
+             patch.object(installer, "verify_bundle", return_value=""), \
+             patch.object(Path, "read_bytes", return_value=plistlib.dumps({})), \
+             patch.object(installer, "authorization_read") as read:
+            with self.assertRaisesRegex(RuntimeError, "CUADenyOnly"):
+                installer.install(experimental=True, deny_only=True)
+            read.assert_not_called()
+
     def test_install_stops_before_any_system_access(self):
         with patch.object(installer, "require_root") as root, \
              patch.object(installer, "authorization_read") as read, \

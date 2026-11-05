@@ -126,7 +126,9 @@ final class TaskPrivacyController {
     private let requestSystemLock: @MainActor () throws -> String
     private let displayGuard = PrivacyDisplayGuard()
     private let guardian = PrivacyGuardianClient()
-    private var active = false
+    private var handoff = TaskPrivacyHandoffState()
+    private var active: Bool { handoff.active }
+    private var pausedByUser: Bool { handoff.pausedByUser }
     private var expiresAtUptime: TimeInterval?
     private var ticker: Timer?
     private var screenObserver: NSObjectProtocol?
@@ -141,9 +143,11 @@ final class TaskPrivacyController {
     private var lastError: String?
     private var lastTransition = "inactive"
     private var transitionCount = 0
-    private var externalUnlockTriggered = false
-    /// 用户通过系统界面亲自解锁后置位：交出控制权，不再重新覆盖，也不因后续按键反复回锁。
-    private var pausedByUser = false
+    private var preparingSince: TimeInterval?
+    private var unlockToken: UUID?
+    private var unlockAttempt: TaskPrivacyUnlockAttempt?
+    private var unlockTask: Task<Void, Never>?
+    private var releaseAfterHandoff = false
 
     nonisolated init(
         sessionState: @escaping @MainActor () -> Bool? = NativePlatform.sessionLocked,
@@ -153,63 +157,65 @@ final class TaskPrivacyController {
         self.requestSystemLock = requestSystemLock
     }
 
-    func hold(seconds: TimeInterval) {
-        if pausedByUser { return }                  // 已交给用户，不再重新覆盖
+    @discardableResult
+    func hold(seconds: TimeInterval) -> Bool {
+        guard !pausedByUser else { return false }
         let clamped = min(max(seconds, Self.minimumSeconds), Self.maximumSeconds)
         Self.trace("hold \(Int(clamped))s active=\(active) paused=\(pausedByUser) locked=\(String(describing: sessionState()))")
         expiresAtUptime = ProcessInfo.processInfo.systemUptime + clamped
-        if !active {
-            active = true
+        if handoff.beginTask() {
             authenticationLockRequested = false
             sawSystemLock = false
             lockRequestInFlight = false
             lastError = nil
-            externalUnlockTriggered = false
+            releaseAfterHandoff = false
             LockedUseAuthorizationServer.shared.start()
             LockedUseAuthorizationServer.shared.beginTask()
-            guardian.onTakeover = { [weak self] in self?.guardianTakeover() }
-            guardian.start()
-            expireLockRequestIfUnverified(now: ProcessInfo.processInfo.systemUptime)
             startTicker()
             observeScreenChanges()
-            transition("task-active")
-        }
-        do {
-            try displayGuard.hold()
-        } catch let failure as NativeFailure {
-            lastError = failure.message
-        } catch {
-            lastError = error.localizedDescription
+            transition("waiting-for-system-lock")
         }
         refresh()
+        return !pausedByUser
     }
 
     func release() {
         Self.trace("release active=\(active)")
-        guard active else { hideShield(); pausedByUser = false; return }
-        active = false
-        pausedByUser = false
+        // Once we have replaced the user's lock screen, finishing the task
+        // must restore the real lock before removing the last desktop cover.
+        if handoff.coverRequired {
+            releaseAfterHandoff = true
+            requestAuthenticationScreen()
+            return
+        }
+        cancelAutomaticUnlock()
+        handoff.release()
+        stopProtection(completedHandoff: false)
+        LockedUseAuthorizationServer.shared.releaseTask()
+        transition("inactive")
+    }
+
+    private func stopProtection(completedHandoff: Bool) {
         expiresAtUptime = nil
-        authenticationLockRequested = false
-        sawSystemLock = false
         lockRequestInFlight = false
-        lockRequestedAt = nil
         ticker?.invalidate()
         ticker = nil
         if let screenObserver { NotificationCenter.default.removeObserver(screenObserver) }
         screenObserver = nil
         displayGuard.release()
+        PowerGuard.shared.release(reason: "privacy-handoff")
         LockedUseAuthorizationServer.shared.endTask()
-        guardian.stop()
+        if completedHandoff { guardian.completeHandoff() }
+        else { guardian.stop() }
         destroyPanels()
-        lastTransition = "inactive"
-        transitionCount += 1
     }
 
     func status() -> JSONValue {
         .object([
             "active": .bool(active),
             "pausedByUser": .bool(pausedByUser),
+            "phase": .string(handoff.phase.rawValue),
+            "automaticUnlockAttempted": .bool(handoff.automaticUnlockAttempted),
             "guardianReady": .bool(guardian.ready),
             "guardianError": guardian.lastError.map(JSONValue.string) ?? .null,
             "shieldVisible": .bool(shieldVisible),
@@ -255,9 +261,9 @@ final class TaskPrivacyController {
             queue: .main
         ) { [weak self] _ in
             Task { @MainActor [weak self] in
-                guard let self, self.active, self.shieldVisible else { return }
-                self.destroyPanels()
-                self.showShield()
+                guard let self, self.handoff.coverRequired else { return }
+                self.createPanels()
+                self.orderShield(activate: self.sessionState() == false)
             }
         }
     }
@@ -270,147 +276,191 @@ final class TaskPrivacyController {
             release()
             return
         }
-        guardian.pulse()
-        expireLockRequestIfUnverified(now: now)
+        if handoff.coverRequired { guardian.pulse() }
         refresh()
     }
 
-    private func expireLockRequestIfUnverified(now: TimeInterval) {
-        guard authenticationLockRequested, !sawSystemLock, !lockRequestInFlight,
-              let requested = lockRequestedAt, now - requested >= 2.5 else { return }
-        lockRequestedAt = now
-        lastError = "系统尚未确认锁屏；保护层继续覆盖，新的输入会重试"
-        transition("lock-unconfirmed")
-    }
-
     private func refresh() {
-        guard active, !pausedByUser else { hideShield(); return }
+        guard active else { return }
         let locked = sessionState()
         observedLocked = locked
-        if locked == true {
-            LockedUseAuthorizationServer.shared.noteSessionLocked()
-            // Leave the desktop's cover ordered in before any authorization
-            // grant. loginwindow remains the system-owned screen above it.
-            // This reduces the polling gap, but is not an independent guardian.
-            if panels.isEmpty { createPanels() }
-            for panel in panels { panel.orderFrontRegardless() }
-            if authenticationLockRequested { sawSystemLock = true }
-            if authenticationLockRequested {
-                Self.trace("locked while authRequested → suppress lease")
-                LockedUseAuthorizationServer.shared.suppressForManualAuthentication()
-            } else if !externalUnlockTriggered {
-                Self.trace("locked externally → arm external unlock")
-                if LockedUseAuthorizationServer.shared.armExternalLock() {
-                    externalUnlockTriggered = true
-                    Self.trace("external lock armed → AX unlock")
-                    triggerLockedUseUnlock()
-                } else {
-                    Self.trace("armExternalLock refused")
-                }
-            }
-            if authenticationLockRequested, lastTransition != "system-locked" {
-                transition("system-locked")
-            }
-            return
-        }
-        if locked == false {
-            LockedUseAuthorizationServer.shared.noteSessionUnlocked()
-            externalUnlockTriggered = false
-            if authenticationLockRequested, sawSystemLock {
-                Self.trace("unlocked after system lock → hand back to user")
-                // 用户已经在系统界面完成认证：把控制权交回去。
-                // 旧逻辑在这里 showShield() + requestAuthenticationScreen() 立刻回锁，
-                // 造成「解锁后按任意键又被锁上」的死循环。
-                authenticationLockRequested = false
-                sawSystemLock = false
-                lockRequestedAt = nil
-                lastError = nil
-                guardian.manualUnlockConfirmed()
-                pauseForUserTakeover()
+        let authorization = LockedUseAuthorizationServer.shared
+        if locked == true { authorization.noteSessionLocked() }
+        if locked == false { authorization.noteSessionUnlocked() }
+
+        switch handoff.phase {
+        case .watching:
+            guard locked == true, handoff.observeExternalLock() else { return }
+            preparingSince = ProcessInfo.processInfo.systemUptime
+            createPanels()
+            orderShield(activate: false)
+            do { try displayGuard.hold() }
+            catch { lastError = error.localizedDescription }
+            guardian.onTakeover = { [weak self] in self?.guardianTakeover() }
+            guardian.start()
+            guard handoff.phase == .preparingUnlock else { return }
+            transition("preparing-locked-use")
+        case .preparingUnlock:
+            if let start = preparingSince, ProcessInfo.processInfo.systemUptime - start >= 4 {
+                lastError = "自动解锁未就绪，保留系统锁屏：\(guardian.lastError ?? authorization.availabilityReason())"
+                requestAuthenticationScreen()
                 return
             }
-            showShield()
-            return
+            guard locked == true else {
+                if locked == false { requestAuthenticationScreen() }
+                return
+            }
+            if guardian.ready, authorization.armExternalLock(),
+               let token = handoff.beginAutomaticUnlock() {
+                transition("automatic-unlock")
+                triggerLockedUseUnlock(token: token)
+            }
+        case .unlocking:
+            if locked == false, let token = unlockToken, handoff.automaticUnlockCompleted(token) {
+                cancelAutomaticUnlock()
+                guardian.armTakeover()
+                guard handoff.phase == .shielded else { return }
+                armShieldTakeover()
+                orderShield(activate: true)
+                transition("shield-visible")
+            }
+        case .shielded:
+            if locked == true {
+                // A task gets one automatic unlock. A subsequent lock belongs
+                // to the user, including another press of the system shortcut.
+                requestAuthenticationScreen()
+            } else if locked == false {
+                orderShield(activate: false)
+            }
+        case .handingBack:
+            if locked == true { authorization.noteSessionLocked() }
+            if handoff.completeHandoff(sessionLocked: locked,
+                                       authorizationReady: authorization.canCompleteManualHandoff) {
+                sawSystemLock = true
+                lastError = nil
+                stopProtection(completedHandoff: true)
+                transition("system-lock-handed-back")
+                if releaseAfterHandoff {
+                    handoff.release()
+                    authorization.releaseTask()
+                }
+            } else {
+                // A consumed ALLOW may still unlock the old lock. Keep both
+                // covers until it has landed and a new real lock is observed.
+                if locked == false { orderShield(activate: true) }
+                requestLockIfNeeded(locked: locked)
+            }
+        case .inactive, .paused:
+            break
         }
-        // Unknown does not prove that the desktop is exposed. Keep the existing
-        // shield in place rather than removing the only input boundary.
-        if shieldVisible { return }
-        hideShield()
-        lastError = "无法验证当前 macOS 会话状态；保护层等待会话恢复"
-    }
-
-    /// 交出控制权：撤掉覆盖层、释放电源断言、结束票据分支，并保持暂停直到任务真正结束。
-    /// 之后 `hold()` 直接返回，避免下一次动作又把屏幕盖上。
-    private func pauseForUserTakeover() {
-        guard active else { return }
-        Self.trace("pause for user takeover")
-        active = false
-        pausedByUser = true
-        expiresAtUptime = nil
-        ticker?.invalidate()
-        ticker = nil
-        displayGuard.release()
-        destroyPanels()
-        guardian.stop()
-        LockedUseAuthorizationServer.shared.endTask()
-        transition("user-took-over")
     }
 
     private func guardianTakeover() {
         guard active else { return }
         Self.trace("guardian takeover received")
         requestAuthenticationScreen()
-        authenticationLockRequested = true
-        if sessionState() == true { sawSystemLock = true }
-        lockRequestedAt = ProcessInfo.processInfo.systemUptime
     }
 
     private func requestAuthenticationScreen() {
-        guard active, shieldVisible, !lockRequestInFlight, !sawSystemLock else { return }
+        guard handoff.coverRequired else { return }
+        if handoff.requestTakeover() {
+            let authorization = LockedUseAuthorizationServer.shared
+            authorization.suppressForManualAuthentication()
+            authorization.renewProtection(ready: false)
+            authorization.endTask()
+            cancelAutomaticUnlock()
+            authenticationLockRequested = true
+            expiresAtUptime = nil
+            lockRequestedAt = nil
+            transition("handing-back-to-system")
+        }
+        refresh()
+    }
+
+    private func requestLockIfNeeded(locked: Bool?) {
+        guard locked != true, !lockRequestInFlight else { return }
+        let now = ProcessInfo.processInfo.systemUptime
+        if let requested = lockRequestedAt, now - requested < 1.5 { return }
         lockRequestInFlight = true
-        authenticationLockRequested = true
-        LockedUseAuthorizationServer.shared.suppressForManualAuthentication()
-        lockRequestedAt = ProcessInfo.processInfo.systemUptime
+        defer { lockRequestInFlight = false }
+        lockRequestedAt = now
         do {
             lastLockRoute = try requestSystemLock()
             Self.trace("system lock requested route=\(lastLockRoute ?? "?")")
-            lastError = nil
+            lastError = "等待 macOS 确认系统锁屏，浮层继续覆盖"
         } catch let failure as NativeFailure {
             lastError = failure.message
-            authenticationLockRequested = false
-            lockRequestedAt = nil
         } catch {
             lastError = error.localizedDescription
-            authenticationLockRequested = false
-            lockRequestedAt = nil
         }
-        lockRequestInFlight = false
-        transition("authentication-requested")
-        refresh()
     }
 
     /// Ask loginwindow to evaluate the screensaver right by driving its own
     /// credential UI through the accessibility API. A synthetic key event is
     /// not an option: loginwindow swallows it while the session is locked, and
     /// the guardian reads it as hardware input and revokes the grant.
-    private func triggerLockedUseUnlock() {
-        Task.detached(priority: .userInitiated) {
-            var tries = 0
-            // loginwindow builds its credential UI a moment after the lock, so
-            // poll for it instead of spending the submission budget on an empty
-            // tree. The unlocker still caps real submissions at three.
-            while tries < 20 {
-                tries += 1
-                guard NativePlatform.sessionLocked() == true else { return }
-                do {
-                    let result = try LockScreenUnlocker.shared.unlock()
-                    TaskPrivacyController.trace("AX unlock try \(tries): \(result)")
-                } catch {
-                    TaskPrivacyController.trace("AX unlock try \(tries) failed: \(error)")
+    private func triggerLockedUseUnlock(token: UUID) {
+        let attempt = TaskPrivacyUnlockAttempt()
+        unlockToken = token
+        unlockAttempt = attempt
+        unlockTask = Task.detached(priority: .userInitiated) { [weak self] in
+            var failure: String?
+            do {
+                // Wait for lazy loginwindow UI, but submit credentials at most
+                // once. The token and authorization lease guard every AX write.
+                for _ in 0..<20 {
+                    try attempt.check()
+                    guard NativePlatform.sessionLocked() == true else { break }
+                    let result = try LockScreenUnlocker.shared.unlock(attempt: attempt)
+                    TaskPrivacyController.trace("AX unlock: \(result)")
+                    if result["verdict"] != .string("no-credential-field") { break }
+                    try await Task.sleep(for: .milliseconds(350))
                 }
-                if NativePlatform.sessionLocked() == false { return }
-                usleep(600_000)
+                // ALLOW delivery and loginwindow's actual transition are
+                // asynchronous. Never send a second submission while waiting.
+                for _ in 0..<40 {
+                    try attempt.check()
+                    if NativePlatform.sessionLocked() == false { break }
+                    try await Task.sleep(for: .milliseconds(250))
+                }
+                try attempt.check()
+                if NativePlatform.sessionLocked() != false { failure = "自动解锁未完成，交还系统锁屏" }
+            } catch {
+                failure = String(describing: error)
             }
+            await self?.automaticUnlockFinished(token: token, failure: failure)
+        }
+    }
+
+    private func automaticUnlockFinished(token: UUID, failure: String?) {
+        guard handoff.permitsAutomaticUnlock(token) else { return }
+        if sessionState() == false { refresh() }
+        else {
+            lastError = failure ?? "自动解锁未完成，交还系统锁屏"
+            requestAuthenticationScreen()
+        }
+    }
+
+    private func cancelAutomaticUnlock() {
+        unlockAttempt?.cancel()
+        unlockTask?.cancel()
+        unlockTask = nil
+        unlockAttempt = nil
+        unlockToken = nil
+    }
+
+    /// Diagnostic requests share the controller's current episode and cannot
+    /// create a second submission or outlive a user takeover.
+    func currentUnlockAttempt() throws -> TaskPrivacyUnlockAttempt {
+        guard let token = unlockToken, handoff.permitsAutomaticUnlock(token), let attempt = unlockAttempt else {
+            throw NativeFailure(code: "AUTOMATIC_UNLOCK_NOT_ALLOWED", message: "当前没有可用的自动解锁任务")
+        }
+        return attempt
+    }
+
+    private func armShieldTakeover() {
+        for panel in panels {
+            (panel.contentView as? PrivacyShieldView)?.armTakeover()
         }
     }
 
@@ -425,26 +475,27 @@ final class TaskPrivacyController {
         transitionCount += 1
     }
 
-    private func showShield() {
-        guard active, sessionState() == false else { hideShield(); return }
+    private func orderShield(activate: Bool) {
+        guard handoff.coverRequired else { return }
         if shieldVisible {
             for panel in panels {
                 guard let screen = panel.privacyScreen else { continue }
                 if panel.frame != screen.frame { panel.setFrame(screen.frame, display: true) }
             }
-            return
+        } else {
+            if NSApp.activationPolicy() != .accessory { NSApp.setActivationPolicy(.accessory) }
+            if panels.isEmpty { createPanels() }
+            for panel in panels {
+                panel.setFrame(panel.privacyScreen?.frame ?? panel.frame, display: true)
+                panel.orderFrontRegardless()
+                panel.makeFirstResponder(panel.contentView)
+            }
         }
-        if NSApp.activationPolicy() != .accessory { NSApp.setActivationPolicy(.accessory) }
-        if panels.isEmpty { createPanels() }
-        for panel in panels {
-            panel.setFrame(panel.privacyScreen?.frame ?? panel.frame, display: true)
-            panel.orderFrontRegardless()
-            panel.makeFirstResponder(panel.contentView)
+        if activate, sessionState() == false {
+            panels.first?.makeKeyAndOrderFront(nil)
+            NSApp.activate(ignoringOtherApps: true)
         }
-        panels.first?.makeKeyAndOrderFront(nil)
-        NSApp.activate(ignoringOtherApps: true)
         shieldVisible = true
-        if lastTransition != "shield-visible" { transition("shield-visible") }
     }
 
     private func hideShield() {
@@ -459,8 +510,8 @@ final class TaskPrivacyController {
     }
 
     private func createPanels() {
-        panels.forEach { $0.orderOut(nil) }
-        panels.removeAll()
+        let previous = panels
+        panels = []
         for (index, screen) in NSScreen.screens.enumerated() {
             let panel = PrivacyShieldPanel(
                 contentRect: screen.frame,
@@ -479,8 +530,11 @@ final class TaskPrivacyController {
             panel.contentView = PrivacyShieldView(screenIndex: index) { [weak self] in
                 self?.requestAuthenticationScreen()
             }
+            if handoff.phase == .shielded { (panel.contentView as? PrivacyShieldView)?.armTakeover() }
+            panel.orderFrontRegardless()
             panels.append(panel)
         }
+        previous.forEach { $0.orderOut(nil) }
     }
 }
 
@@ -496,6 +550,7 @@ final class PrivacyShieldView: NSView {
 
     private let screenIndex: Int
     private let interaction: () -> Void
+    private var inputPolicy = PrivacyGuardianInputPolicy()
 
     init(screenIndex: Int, interaction: @escaping () -> Void) {
         self.screenIndex = screenIndex
@@ -512,8 +567,15 @@ final class PrivacyShieldView: NSView {
     override var acceptsFirstResponder: Bool { true }
     override func becomeFirstResponder() -> Bool { true }
 
+    func armTakeover() {
+        inputPolicy.arm(flags: CGEventSource.flagsState(.combinedSessionState))
+    }
+
     private func interact(with event: NSEvent) {
-        guard event.cgEvent?.getIntegerValueField(.eventSourceUserData) != TaskPrivacySyntheticEvents.marker else { return }
+        guard let input = event.cgEvent,
+              inputPolicy.accepts(flagsChanged: event.type == .flagsChanged, flags: input.flags,
+                                  sourcePID: input.getIntegerValueField(.eventSourceUnixProcessID),
+                                  userData: input.getIntegerValueField(.eventSourceUserData)) else { return }
         interaction()
     }
 

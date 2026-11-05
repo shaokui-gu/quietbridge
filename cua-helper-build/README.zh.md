@@ -27,7 +27,13 @@ kind: "package-reference"
 
 共享服务在 `/tmp/dsh-cua-<uid>` 下使用仅所有者可访问的 Unix socket，以可执行文件的 SHA-256 区分实例。版本锁选出一个进程，另一个真实可执行路径锁排除同一路径的不同构建。首帧为协议版本 1 的 `hello`，包含运行时标识以及该连接的字节、AX、操作、截图、事件间隔和清理限制。`ready` 返回已核实的运行时标识、PID 和实例 ID。每条连接拥有独立的 AXWorker。stdin/stdout 入口是该服务的诊断代理。
 
-界面任务绑定时，helper 同时建立防睡眠和隐私保护租约：`PreventUserIdleDisplaySleep` 阻止显示器空闲睡眠引发的自动锁屏，自有 `screenSaver+1` 级窗口覆盖全部显示器和 Space。保护层接收到任意用户输入后请求 macOS 真实登录锁屏；它不读取、保存或输入系统登录密码。合盖、触控 ID、系统故障等不可被普通应用拦截的锁定路径仍可立即生效，用户完成系统认证后保护层恢复。`getCapabilities.sessionPrivacy` 与 `powerGuard.privacy` 暴露覆盖层、显示器断言和最近失败，不返回敏感内容。
+界面任务 `bind` / `powerGuard hold` 时，helper 建立任务与防睡眠租约，隐私状态进入 `watching`；此时不盖屏，也不启动 guardian。`PreventUserIdleSystemSleep` 阻止系统空闲睡眠，显示器仍可空闲休眠，用户仍可触发真正的系统锁屏；显示器防睡眠断言在准备覆盖层时才建立。
+
+首次观察到系统锁屏后，helper 才准备自有覆盖层和独立 guardian 的第二层覆盖，等覆盖与监听就绪后，通过可选 Authorization Plug-in 签发最长 12 秒、只消费一次的解锁票据。AX 可轮询读取登录界面，但每次自动解锁流程只提交一次非机密探针串，不读取、保存或输入真实系统密码。确认自动解锁后，自有浮层显示在桌面上并接受用户接管；首次锁屏快捷键的修饰键松开不算新的输入。未安装插件或保护条件不满足时，不签发自动解锁票据。插件通信仍使用协议 3。
+
+浮层显示后，任何新按键、鼠标点击或滚轮输入都会撤票、取消后续 AX 动作并暂停当前任务，再请求真实系统锁屏。只有确认系统已锁定，且没有已消费但尚未落地的 ALLOW，才撤掉主进程和 guardian 两层覆盖；已发出的 ALLOW 若随后解锁，必须再次锁屏才能完成交接。用户手动解锁后不会恢复同一任务的自动输入或浮层，任务暂停保持到显式 `powerGuard release`。显式释放解除任务暂停并撤销任务授权，但手动认证要求和未落地 ALLOW 独立保留；手动认证完成后才可恢复普通窗口选择并显式 `bind` 新任务。任务结束或租约到期时，已经覆盖桌面的流程同样先交还系统锁屏；`watching` 阶段可直接结束。
+
+`getCapabilities.sessionPrivacy` 与 `powerGuard.privacy` 暴露阶段、覆盖层、显示器断言及最近失败；授权状态还包含 `automationPaused` 和 `automaticUnlockPending`。自有浮层不替代 macOS 的安全边界。2026-11-05 的这次变更只涉及代码与离线测试，未执行新版安装或真实锁屏/解锁验证；不能据此保证遮罩连续覆盖或系统级原子交接。
 
 AppKit 在主事件循环上运行。阻塞式 socket 接收与握手使用后台队列，服务回调明确声明 `@MainActor @Sendable` 隔离，并弱引用服务对象。关闭时会释放已接收的连接，包括尚未完成握手的连接。阻塞式 AX 和输入使用每条连接的串行 actor，所有连接共享用于完整桌面操作的 FIFO。socket 写出不占用操作槽位。请求取消会等待原生工作停止，不取消连接的生命期控制器。截图超时只结束该请求。未完成的系统捕获保留唯一捕获槽位，直至真实回调到达；期间新截图返回 CAPTURE_BUSY，AX 和输入仍可用。只有无法停止的操作或清理才可能使共享进程失效。代理接受 `--max-request-bytes`、`--max-response-bytes`、`--ax-timeout-ms`、`--timeout-ms`、`--screenshot-timeout-ms`、`--shutdown-grace-ms` 和 `--text-event-interval-ms`；Host 在 hello 中设置相同限制。AX 超时约束单次系统调用。取消可能发生在部分输入之后，结果不确定的输入不自动重放。
 

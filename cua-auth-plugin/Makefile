@@ -4,6 +4,7 @@ CLANG := $(shell xcrun --sdk macosx --find clang)
 SIGNING_IDENTITY ?= Developer ID Application: shaokui gu (62RNP54C47)
 TIMESTAMP ?= none
 BUILD_DIR := build
+DENY_ONLY ?= false
 BUNDLE := $(BUILD_DIR)/WorkBuddyCUAAuthorizationPlugin.bundle
 BINARY := $(BUNDLE)/Contents/MacOS/WorkBuddyCUAAuthorizationPlugin
 
@@ -14,6 +15,7 @@ all: $(BUNDLE)
 $(BUNDLE): Sources/CuaAuthorizationPlugin.m Resources/Info.plist Resources/embedded.provisionprofile
 	@mkdir -p "$(BUNDLE)/Contents/MacOS" "$(BUNDLE)/Contents/Resources"
 	@cp Resources/Info.plist "$(BUNDLE)/Contents/Info.plist"
+	/usr/libexec/PlistBuddy -c "Add :CUADenyOnly bool $(DENY_ONLY)" "$(BUNDLE)/Contents/Info.plist"
 	@cp Resources/embedded.provisionprofile "$(BUNDLE)/Contents/embedded.provisionprofile"
 	$(CLANG) -fobjc-arc -bundle -fmodules \
 		-fmodules-cache-path="$(CURDIR)/$(BUILD_DIR)/ModuleCache" \

@@ -58,14 +58,18 @@ WorkBuddy ⇄ MCP(stdio/JSON-RPC) ⇄ server.py ⇄ workbuddy-cua-native ⇄ 共
 
 ## 任务隐私保护层
 
-`cua_task action=bind` 成功后，helper 在整个任务租约期间：
+`cua_task action=bind` 成功后，helper 建立任务租约及防睡眠断言，隐私状态进入 `watching`：此时不盖屏，也不启动 guardian，用户仍可触发系统锁屏。
 
-- 按住 `PreventUserIdleSystemSleep` 和 `PreventUserIdleDisplaySleep`，阻止空闲睡眠及由显示器睡眠触发的自动锁屏；
-- 在所有显示器和所有 Space 的最上层显示 workbuddy 自己的绿色像素保护层；
-- 拦截保护层上的按键、点击、滚动和触控板手势，并请求 macOS 显示真实登录锁屏；
-- 若合盖、触控 ID 或其它系统路径先锁了电脑，不尝试读取密码或自动解锁；等用户完成系统认证后恢复保护层。
+启用下述可选 Locked use 后，交接流程为：
 
-覆盖层只约束用户输入，不替代系统安全边界。macOS 不允许普通应用无条件否决合盖、触控 ID、系统故障或其它受保护锁定路径，这些限制会在 `sessionPrivacy.limits` 中如实返回。任务结束、租约超时或 helper 退出时会撤掉覆盖层并释放两项电源断言。
+1. 首次观察到系统锁屏，先准备主进程覆盖层与独立 guardian 的第二层覆盖；覆盖及监听就绪后，才签发最长 12 秒、只消费一次的自动解锁票据。
+2. AX 可以轮询读取登录界面，但每次自动解锁流程只提交一次非机密探针串。确认系统自动解锁后，显示 workbuddy 的绿色像素浮层；初次锁屏快捷键的修饰键松开不会被当成新的用户输入。
+3. 浮层显示后，任意新按键、鼠标点击或滚轮输入都会撤销票据、取消后续 AX 动作并暂停任务，再请求真正的系统锁屏。
+4. 确认系统锁定且没有已消费、尚未落地的 ALLOW 后，才撤掉两层覆盖。用户手动解锁后，同一任务仍暂停，直到显式 `cua_task action=end, confirm=true` 触发原生 `powerGuard release`。显式结束解除任务暂停并撤销任务授权，但手动认证要求和未落地 ALLOW 独立保留；认证完成后才可恢复窗口选择，再 `begin` 并显式 `bind` 重建任务。
+
+任务结束或租约超时，若已经覆盖桌面，也先交还真实系统锁屏再释放覆盖；`watching` 阶段直接结束。已交给 authd 的 ALLOW 不能撤回，若其在接管后才实际解锁，必须再锁一次。自有浮层不替代系统安全边界，也不读取或保存真实密码。
+
+2026-11-05 的本次变更仅涉及代码与离线测试，未安装新版或实测新的系统锁屏/解锁交接流程。状态可从 `getCapabilities.sessionPrivacy` / `powerGuard.privacy` 查看。
 
 ### 可选 Locked use
 
@@ -75,12 +79,12 @@ WorkBuddy ⇄ MCP(stdio/JSON-RPC) ⇄ server.py ⇄ workbuddy-cua-native ⇄ 共
 cua-auth-plugin/
 ```
 
-它使用与官方 Codex Locked use 相同的系统接入点：
+本项目的系统接入方式如下：
 
 - 修改 `system.login.screensaver`，保留 `use-login-window-ui`；
 - 安装 `WorkBuddyCUAAuthorizationPlugin.bundle`；
-- 通过同用户 Unix socket 校验插件与 helper 的代码签名 identifier/Team ID；
-- 只有活动任务、未手动锁屏抑制且票据未消费时才允许；
+- 通过 Unix socket 的内核 audit token 校验对端：插件用 SecTask 核对 helper 的签名 identifier/Team ID，helper 验证 Apple 授权宿主；
+- 协议仍为 `AUTHORIZE 3` / `ALLOW 3`；只有活动任务、未被用户暂停、未处于手动认证抑制、保护租约有效且票据未过期或消费时才允许；
 - 安装前保存原始 authorization right，支持完整卸载恢复。
 
 该插件默认未安装。安装会修改系统登录策略，必须在受控账户或虚拟机中由管理员显式执行。`cua_permissions` 的状态文本会显示 Locked use 是否可用以及允许/拒绝次数。
@@ -89,7 +93,7 @@ cua-auth-plugin/
 
 - **自绘界面**（游戏、Unity、canvas、部分 Electron 控件）：AX 树为空，`cua_state` 会明确提示，只能截图 + 坐标点击。
 - **浏览器**：`getCapabilities.browser=false`，没有 DOM/JS 通道，网页操作只能走 AX/坐标，比 Playwright 脆弱。
-- **敏感场景**：安全输入框、TCC 系统弹窗、系统真实锁屏（`sessionLocked=true`）不可操作；任务隐私层本身不存储密码。
+- **敏感场景**：常规桌面工具不能操作安全输入框、TCC 系统弹窗或真实系统锁屏（`sessionLocked=true`）。上述可选自动解锁使用独立、受票据约束的登录界面 AX 流程，任务隐私层不存储密码。
 - **截图体积**：2116×1394 约 375 KB base64，连续截图会显著吃上下文，按需再截。
 
 ## 重编代价：已改成稳定签名（2026-10-30）

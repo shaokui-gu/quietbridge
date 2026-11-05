@@ -216,12 +216,15 @@ def remove_branch(right):
         raise RuntimeError("无法移除插件分支: " + right)
 
 
-def install(bundle=None, experimental=False):
+def install(bundle=None, experimental=False, deny_only=False):
     if not experimental:
         transformed_right(b"")  # legacy installation stays disabled
     require_root("install")
     source = checked_path(bundle or SOURCE_BUNDLE)
     signature = verify_bundle(source)
+    bundle_info = plistlib.loads((source / "Contents" / "Info.plist").read_bytes())
+    if bundle_info.get("CUADenyOnly", False) is not deny_only:
+        raise RuntimeError("插件 CUADenyOnly 与请求的安装模式不匹配")
     checked_path(STATE_DIRECTORY)
     checked_path(INSTALLED_BUNDLE)
     if STATE_DIRECTORY.exists() or INSTALLED_BUNDLE.exists():
@@ -249,6 +252,7 @@ def install(bundle=None, experimental=False):
         "version": 2, "protocolVersion": 3,
         "enabled": False, "experimentalOptIn": True,
         "validatedForUnlock": False, "phase": "prepared",
+        "denyOnly": deny_only,
         "installedAt": datetime.datetime.now(datetime.timezone.utc).isoformat(),
         "bundleIdentifier": PLUGIN_IDENTIFIER, "teamIdentifier": TEAM_IDENTIFIER,
         "mechanism": PLUGIN_MECHANISM, "right": RIGHT,
@@ -282,7 +286,7 @@ def install(bundle=None, experimental=False):
             metadata["phase"] = "wrote:" + right
             metadata["actualPolicies"] = actual
             atomic_plist(STATE_FILE, metadata, 0o644)
-        metadata.update(enabled=True, phase="committed")
+        metadata.update(enabled=not deny_only, phase="committed")
         atomic_plist(STATE_FILE, metadata, 0o644)
     except Exception as error:
         # Disable grants before attempting restoration. Never remove the loaded
@@ -344,6 +348,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("action", choices=["status", "build", "plan", "install", "uninstall"])
     parser.add_argument("--bundle", type=Path)
+    parser.add_argument("--deny-only", action="store_true",
+                        help="仅安装签名的拒绝自动解锁版本，用于验证原生锁屏")
     parser.add_argument("--experimental", action="store_true",
                         help="显式启用第二版实验安装；不代表已通过锁屏验证")
     parser.add_argument("--output", type=Path)
@@ -359,7 +365,7 @@ def main():
             bundle = build_bundle()
             result = {"bundle": str(bundle), "signature": verify_bundle(bundle)}
         elif args.action == "install":
-            result = install(args.bundle, experimental=args.experimental)
+            result = install(args.bundle, experimental=args.experimental, deny_only=args.deny_only)
         else:
             result = uninstall()
         print(json.dumps(result, ensure_ascii=False, indent=2, default=str))

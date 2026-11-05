@@ -33,12 +33,7 @@ struct LockScreenAXNode {
 
 final class LockScreenUnlocker: @unchecked Sendable {
     static let shared = LockScreenUnlocker()
-    /// One grant per locked episode is the authorization rule; the attempt cap
-    /// only bounds how many times the UI is poked before giving up.
-    static let maximumAttemptsPerEpisode = 3
-
-    private let stateLock = NSLock()
-    private var attempts = 0
+    private let executionLock = NSLock()
 
     private init() {}
 
@@ -51,7 +46,7 @@ final class LockScreenUnlocker: @unchecked Sendable {
             throw NativeFailure(code: "PERMISSION_DENIED", message: "需要辅助功能权限")
         }
         let (pid, element) = try loginWindowElement()
-        let nodes = walk(element)
+        let nodes = walk(element, checkCancellation: {})
         let secureFields = nodes.filter { $0.subrole == "AXSecureTextField" }.count
         let buttons = nodes.filter { $0.role == "AXButton" }.count
         let probes = probeShortcuts(app: element)
@@ -83,7 +78,7 @@ final class LockScreenUnlocker: @unchecked Sendable {
             probes.append("focused role=\(string(element, kAXRoleAttribute))"
                           + " subrole=\(string(element, kAXSubroleAttribute))"
                           + " pid=\(pidOf(element))")
-            let subtree = walk(element)
+            let subtree = walk(element, checkCancellation: {})
             probes.append("focused subtree=\(subtree.count) secure=\(subtree.filter { $0.subrole == "AXSecureTextField" }.count)")
         } else {
             probes.append("focused unavailable")
@@ -133,22 +128,44 @@ final class LockScreenUnlocker: @unchecked Sendable {
 
     /// One bounded unlock attempt: focus the credential field, clear its value
     /// and submit. Returns a step log so a failure is attributable.
-    func unlock() throws -> JSONValue {
+    func unlock(attempt: TaskPrivacyUnlockAttempt) throws -> JSONValue {
+        try attempt.check()
+        executionLock.lock()
+        defer { executionLock.unlock() }
+        func requireInput() throws {
+            try attempt.check()
+            try LockedUseAuthorizationServer.shared.requireAutomaticUnlockAllowed()
+            guard NativePlatform.sessionLocked() == true else {
+                throw NativeFailure(code: "SESSION_NOT_LOCKED", message: "当前会话未锁定，停止自动解锁")
+            }
+        }
+        func wait(_ microseconds: useconds_t) throws {
+            var remaining = microseconds
+            while remaining > 0 {
+                try attempt.check()
+                let interval = min(remaining, 25_000)
+                usleep(interval)
+                remaining -= interval
+            }
+            try attempt.check()
+        }
+        try requireInput()
         guard AXIsProcessTrusted() else {
             throw NativeFailure(code: "PERMISSION_DENIED", message: "需要辅助功能权限")
         }
-        let locked = NativePlatform.sessionLocked()
-        noteSessionState(locked)
-        guard locked == true else {
-            throw NativeFailure(code: "SESSION_NOT_LOCKED", message: "当前会话未锁定，未执行任何动作")
-        }
         let (pid, application) = try loginWindowElement()
+        func scan(stopWhen: ((LockScreenAXNode) -> Bool)? = nil, observationOnly: Bool = false) throws -> [LockScreenAXNode] {
+            try walk(application, stopWhen: stopWhen, checkCancellation: {
+                if observationOnly { try attempt.check() }
+                else { try requireInput() }
+            })
+        }
         // Stop as soon as the credential element shows up: the lock-screen tree
         // can run to hundreds of decorative nodes.
-        var nodes = walk(application, stopWhen: { Self.isCredentialNode($0) })
+        var nodes = try scan(stopWhen: { Self.isCredentialNode($0) })
         var found = nodes.last(where: { Self.isCredentialNode($0) })
         if found == nil {
-            nodes = walk(application)
+            nodes = try scan()
             found = nodes.first(where: { $0.role == "AXTextField" })
         }
         // A sleeping display collapses the tree to a stub: loginwindow only
@@ -156,15 +173,16 @@ final class LockScreenUnlocker: @unchecked Sendable {
         // activity (which does not authenticate anything) and rescan.
         var wake: String?
         if nodes.count < unlockMinimumNodes, NativePlatform.sessionLocked() == true {
+            try requireInput()
             var assertion: IOPMAssertionID = 0
             let status = IOPMAssertionDeclareUserActivity(
                 "CUAAutoUnlock" as CFString, kIOPMUserActiveLocal, &assertion)
-            usleep(unlockWakeDelay)
+            try wait(unlockWakeDelay)
             wake = "status=\(status) assertion=\(assertion)"
-            nodes = walk(application, stopWhen: { Self.isCredentialNode($0) })
+            nodes = try scan(stopWhen: { Self.isCredentialNode($0) })
             found = nodes.last(where: { Self.isCredentialNode($0) })
             if found == nil {
-                nodes = walk(application)
+                nodes = try scan()
                 found = nodes.first(where: { $0.role == "AXTextField" })
             }
         }
@@ -180,15 +198,16 @@ final class LockScreenUnlocker: @unchecked Sendable {
         // The lock screen first shows the user tile with a "show all users"
         // button; the credential field only exists after that is pressed.
         if found == nil, let reveal = Self.revealButton(in: nodes) {
+            try requireInput()
             let press = AXUIElementPerformAction(reveal.element, kAXPressAction as CFString)
             steps.append(.object(["step": .string("reveal"),
                                   "title": .string(reveal.title),
                                   "axError": .number(Double(press.rawValue))]))
-            usleep(unlockRevealDelay)
-            nodes = walk(application, stopWhen: { Self.isCredentialNode($0) })
+            try wait(unlockRevealDelay)
+            nodes = try scan(stopWhen: { Self.isCredentialNode($0) })
             found = nodes.last(where: { Self.isCredentialNode($0) })
             if found == nil {
-                nodes = walk(application)
+                nodes = try scan()
                 found = nodes.first(where: { $0.role == "AXTextField" })
             }
             steps.append(.object(["step": .string("rescan"),
@@ -198,15 +217,16 @@ final class LockScreenUnlocker: @unchecked Sendable {
         // The revealed list shows one button per account; the credential field
         // only appears after the console user's own tile is selected.
         if found == nil, let row = Self.userRow(in: nodes) {
+            try requireInput()
             let press = AXUIElementPerformAction(row.element, kAXPressAction as CFString)
             steps.append(.object(["step": .string("selectUser"),
                                   "description": .string(row.description),
                                   "axError": .number(Double(press.rawValue))]))
-            usleep(unlockRevealDelay)
-            nodes = walk(application, stopWhen: { Self.isCredentialNode($0) })
+            try wait(unlockRevealDelay)
+            nodes = try scan(stopWhen: { Self.isCredentialNode($0) })
             found = nodes.last(where: { Self.isCredentialNode($0) })
             if found == nil {
-                nodes = walk(application)
+                nodes = try scan()
                 found = nodes.first(where: { $0.role == "AXTextField" })
             }
             steps.append(.object(["step": .string("rescanUser"),
@@ -221,50 +241,53 @@ final class LockScreenUnlocker: @unchecked Sendable {
             dump(nodes, probes: ["unlock-failed", "step-count=\(steps.count)"])
             return finish(steps: steps, verdict: "no-credential-field", unlocked: false)
         }
-        guard let attempt = claimAttempt() else {
-            throw NativeFailure(code: "UNLOCK_ATTEMPTS_EXHAUSTED",
-                                message: "本段锁屏的自动解锁尝试已用尽")
-        }
-        steps.append(.object(["step": .string("claim"), "attempt": .number(Double(attempt))]))
+        try requireInput()
+        try attempt.claimSubmission()
+        steps.append(.object(["step": .string("claim"), "attempt": .number(1)]))
 
+        try requireInput()
         var error = AXUIElementSetAttributeValue(field.element, kAXFocusedAttribute as CFString,
                                                  kCFBooleanTrue)
         steps.append(.object(["step": .string("focus"), "axError": .number(Double(error.rawValue))]))
         if error != .success {
+            try requireInput()
             _ = AXUIElementPerformAction(field.element, kAXPressAction as CFString)
         }
 
         // A non-empty probe value forces loginwindow down its real
         // authentication path. The credential itself is irrelevant: the
         // authorization plug-in answers before any password is checked.
+        try requireInput()
         error = AXUIElementSetAttributeValue(field.element, kAXValueAttribute as CFString,
                                              unlockProbeCredential as CFString)
         steps.append(.object(["step": .string("setValue"), "axError": .number(Double(error.rawValue))]))
-
-        usleep(unlockSubmitDelay)
-        let confirm = AXUIElementPerformAction(field.element, kAXConfirmAction as CFString)
-        steps.append(.object(["step": .string("confirm"), "axError": .number(Double(confirm.rawValue))]))
-
-        // AXConfirm is a no-op on this field (it reports success but the value
-        // survives), and the arrow button only exists once the field holds
-        // text, so the tree has to be rescanned before it can be pressed.
-        let withValue = walk(application)
-        if let button = submitButton(in: withValue) {
-            let press = AXUIElementPerformAction(button.element, kAXPressAction as CFString)
-            steps.append(.object(["step": .string("pressSubmit"),
-                                  "label": .string(button.title + "|" + button.description),
-                                  "axError": .number(Double(press.rawValue))]))
-        } else {
-            steps.append(.object(["step": .string("pressSubmit"),
-                                  "label": .string("not-found"),
-                                  "nodes": .number(Double(withValue.count))]))
+        guard error == .success else {
+            throw NativeFailure(code: "LOGINWINDOW_SET_VALUE_FAILED", message: "登录框未接受自动解锁探针，未提交")
         }
 
-        usleep(unlockVerifyDelay)
+        // The arrow only appears after text is entered. AXConfirm reports
+        // success without submitting. Wait for the button to appear without
+        // filling the field again or dispatching a second submission.
+        var submission: LockScreenAXNode?
+        for _ in 0..<8 {
+            try wait(unlockSubmitDelay)
+            submission = submitButton(in: try scan())
+            if submission != nil { break }
+        }
+        guard let button = submission else {
+            throw NativeFailure(code: "LOGINWINDOW_SUBMIT_UNAVAILABLE", message: "登录提交按钮未就绪，未提交")
+        }
+        try requireInput()
+        let press = AXUIElementPerformAction(button.element, kAXPressAction as CFString)
+        steps.append(.object(["step": .string("pressSubmit"),
+                              "label": .string(button.title + "|" + button.description),
+                              "axError": .number(Double(press.rawValue))]))
+
+        try wait(unlockVerifyDelay)
         // A rejected credential clears the field and paints a hint. Seeing one
         // proves loginwindow ran a local check instead of consulting the
         // authorization plug-in, which is the difference we need to observe.
-        let after = walk(application)
+        let after = try scan(observationOnly: true)
         let hint = after.first { node in
             let haystack = (node.title + " " + node.description + " " + node.subrole).lowercased()
             return unlockFailureKeywords.contains { haystack.contains($0) }
@@ -277,28 +300,10 @@ final class LockScreenUnlocker: @unchecked Sendable {
             "hint": .string(hint.map { "\($0.role)|\($0.title)|\($0.description)" } ?? ""),
         ]))
         let unlocked = NativePlatform.sessionLocked() == false
-        if unlocked {
-            noteSessionState(false)
-        } else {
+        if !unlocked {
             dump(after, probes: ["post-confirm"])
         }
         return finish(steps: steps, verdict: unlocked ? "unlocked" : "still-locked", unlocked: unlocked)
-    }
-
-    // MARK: - Session bookkeeping
-
-    private func noteSessionState(_ locked: Bool?) {
-        stateLock.lock()
-        defer { stateLock.unlock() }
-        if locked == false { attempts = 0 }
-    }
-
-    private func claimAttempt() -> Int? {
-        stateLock.lock()
-        defer { stateLock.unlock() }
-        guard attempts < Self.maximumAttemptsPerEpisode else { return nil }
-        attempts += 1
-        return attempts
     }
 
     // MARK: - Target resolution
@@ -335,11 +340,13 @@ final class LockScreenUnlocker: @unchecked Sendable {
     // MARK: - Tree projection
 
     private func walk(_ root: AXUIElement, limit: Int = unlockMaximumNodes,
-                      stopWhen: ((LockScreenAXNode) -> Bool)? = nil) -> [LockScreenAXNode] {
+                      stopWhen: ((LockScreenAXNode) -> Bool)? = nil,
+                      checkCancellation: () throws -> Void = {}) rethrows -> [LockScreenAXNode] {
         var queue: [(AXUIElement, Int)] = [(root, 0)]
         var nodes: [LockScreenAXNode] = []
         var index = 0
         while index < queue.count && nodes.count < limit {
+            try checkCancellation()
             let (element, depth) = queue[index]
             index += 1
             _ = AXUIElementSetMessagingTimeout(element, unlockAXTimeout)
@@ -364,6 +371,7 @@ final class LockScreenUnlocker: @unchecked Sendable {
             }
             for child in next { queue.append((child, depth + 1)) }
         }
+        try checkCancellation()
         return nodes
     }
 

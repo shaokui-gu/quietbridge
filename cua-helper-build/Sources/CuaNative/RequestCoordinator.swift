@@ -309,8 +309,8 @@ import Darwin
         return .object(fields)
     }
 
-    /// 防睡眠和隐私覆盖层只随任务租约存在。覆盖层不保存或输入系统密码；
-    /// 系统实际锁定后，GUI 操作仍被拒绝，等待本人完成系统认证。
+    /// 任务租约先监视系统锁屏；首次锁屏自动解锁一次并显示浮层。
+    /// 用户接管后等待真正系统锁屏，再释放浮层并暂停当前任务。
     private func powerControl(_ params: RequestParameters) async throws -> JSONValue {
         let action = try params.string("action")
         switch action {
@@ -318,10 +318,17 @@ import Darwin
             // AX traversal blocks for up to the messaging timeout per element;
             // never run it on the main actor that also drives the shield.
             let inspectOnly = action == "unlockInspect"
-            let outcome = try await Task.detached(priority: .userInitiated) { () throws -> JSONValue in
+            let attempt = inspectOnly ? nil : try TaskPrivacyController.shared.currentUnlockAttempt()
+            let operation = Task.detached(priority: .userInitiated) { () throws -> JSONValue in
                 if inspectOnly { return try LockScreenUnlocker.shared.inspect() }
-                return try LockScreenUnlocker.shared.unlock()
-            }.value
+                guard let attempt else { throw NativeFailure(code: "AUTOMATIC_UNLOCK_NOT_ALLOWED", message: "没有自动解锁任务") }
+                return try LockScreenUnlocker.shared.unlock(attempt: attempt)
+            }
+            let outcome = try await withTaskCancellationHandler {
+                try await operation.value
+            } onCancel: {
+                operation.cancel()
+            }
             return .object([
                 "action": .string(action),
                 "result": outcome,
@@ -341,6 +348,9 @@ import Darwin
             guard seconds >= PowerGuard.minimumSeconds, seconds <= PowerGuard.maximumSeconds else {
                 throw RequestParameters.invalid("durationSeconds 必须在 \(Int(PowerGuard.minimumSeconds))...\(Int(PowerGuard.maximumSeconds)) 之间")
             }
+            guard TaskPrivacyController.shared.hold(seconds: seconds) else {
+                throw NativeFailure(code: "MANUAL_AUTHENTICATION_REQUIRED", message: "用户已接管；先结束当前任务，再显式绑定新任务")
+            }
             var guardStatus: JSONValue
             do {
                 try PowerGuard.shared.hold(seconds: seconds)
@@ -351,7 +361,6 @@ import Darwin
                     "error": .string("\(failure.code): \(failure.message)"),
                 ])
             }
-            TaskPrivacyController.shared.hold(seconds: seconds)
             return .object([
                 "action": .string("hold"),
                 "guard": guardStatus,

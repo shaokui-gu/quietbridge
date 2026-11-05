@@ -505,10 +505,10 @@ def task_status(record):
 
 
 def hold_power_guard():
-    """让任务租约同时按住防睡眠断言和全屏任务隐私保护层。
+    """任务租约按住防睡眠断言，并监视首次系统锁屏。
 
     尽力而为：断言不可用时不给任务本身添麻烦，返回值仅用于回报状态。
-    隐私层绝不读取或输入系统密码；用户触碰后会请求 macOS 自身锁屏。
+    首次锁屏自动解锁一次后显示浮层；用户触碰后交回 macOS 自身锁屏。
     """
     now = time.monotonic()
     # 有界等待期间不续租：既不吃等待预算，也不给轮询额外加一次往返。
@@ -1739,11 +1739,11 @@ TOOLS = [
     {
         "name": "cua_task",
         "description": "持久任务绑定：begin 生成 UUID，保持 awaiting_window，不创建或启动浏览器。bind 必须显式 appHandle、windowId、confirm=true，仅 attach 已有窗口，mode=attached_existing，不等于新建或数据隔离。status 只读核验进程代际和窗口；跨连接 requires_revalidation，需重新显式确认，绝不按 PID 自动接管。任务期间观察和输入严格限制目标，应用级键盘接口拒绝。"
-                       "bind 成功后自动按住防睡眠断言并显示全屏任务隐私层：任务租约期间阻止显示器空闲睡眠/自动锁屏，"
-                       "任何用户按键或点击会请求 macOS 真实登录锁屏；覆盖层不读取或输入密码。"
-                       "若另行安装并签名了 Authorization Plug-in，活跃任务在外部锁屏后可通过短时票据尝试恢复；"
-                       "覆盖层触发的真实锁屏仍要求本人认证。合盖、触控 ID 和其它不可拦截路径不会被隐藏。"
-                       "动作时续租，end 一并释放共享、覆盖层与断言。",
+                       "bind 成功后按住防睡眠断言并等待用户首次系统锁屏，此时不显示浮层。"
+                       "安装并签名 Authorization Plug-in 后，首次锁屏可使用单次短时票据自动解锁并显示全屏隐私浮层。"
+                       "浮层中的新按键或点击会撤销自动授权、暂停当前任务，确认 macOS 真正锁定后撤掉浮层，由本人认证。"
+                       "不读取或输入真实密码；手动解锁不自动恢复当前任务，需 end(confirm=true) 后 begin 并显式 bind。"
+                       "动作时续租；若已接管锁屏，end 先交回系统锁屏再释放覆盖层与断言。",
         "inputSchema": {
             "type": "object", "additionalProperties": False,
             "properties": {

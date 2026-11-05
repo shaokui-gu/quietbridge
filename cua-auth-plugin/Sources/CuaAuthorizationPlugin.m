@@ -267,7 +267,10 @@ static OSStatus CUAMechanismInvoke(AuthorizationMechanismRef mechanismRef) {
     if (mechanism == NULL || mechanism->plugin == NULL || mechanism->engine == NULL) {
         return errAuthorizationInternal;
     }
-    BOOL allowed = CUAAskAuthorizationService();
+    NSBundle *bundle = [NSBundle bundleForClass:[CuaAuthorizationPluginMarker class]];
+    BOOL denyOnly = [[bundle objectForInfoDictionaryKey:@"CUADenyOnly"] boolValue];
+    if (denyOnly) NSLog(@"workbuddy-cua deny-only: authorization service skipped");
+    BOOL allowed = !denyOnly && CUAAskAuthorizationService();
     AuthorizationResult result = allowed ? kAuthorizationResultAllow : kAuthorizationResultDeny;
     NSLog(@"workbuddy-cua authorization mechanism returned %@", allowed ? @"Allow" : @"Deny");
     return mechanism->plugin->callbacks.SetResult(mechanism->engine, result);

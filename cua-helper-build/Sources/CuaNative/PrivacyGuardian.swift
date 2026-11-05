@@ -10,6 +10,79 @@ import Foundation
 /// other type's static from inside the callback crashes the Swift optimiser.
 private let guardianSyntheticMarker: Int64 = 0x57424355414c4f43
 
+/// The lock gesture belongs to the user until the replacement cover is ready.
+/// In particular, releasing Ctrl/Command after locking is not a new takeover.
+struct PrivacyGuardianInputPolicy {
+    private(set) var armed = false
+    private var modifiers: CGEventFlags = []
+    private static let modifierMask: CGEventFlags = [
+        .maskAlphaShift, .maskShift, .maskControl, .maskAlternate,
+        .maskCommand, .maskHelp, .maskSecondaryFn,
+    ]
+
+    mutating func arm(flags: CGEventFlags) {
+        modifiers = flags.intersection(Self.modifierMask)
+        armed = true
+    }
+
+    mutating func accepts(flagsChanged: Bool, flags: CGEventFlags,
+                          sourcePID: Int64, userData: Int64) -> Bool {
+        guard sourcePID == 0, userData != guardianSyntheticMarker else { return false }
+        guard flagsChanged else { return true }
+        let current = flags.intersection(Self.modifierMask)
+        let pressed = current.subtracting(modifiers)
+        modifiers = current
+        return armed && !pressed.isEmpty
+    }
+}
+
+/// Once revoked, a queued heartbeat cannot restore the same guardian's lease.
+struct PrivacyGuardianLeaseState {
+    private(set) var takeoverPending = false
+    private(set) var lastReportAt: TimeInterval = 0
+    private var announcedReady = false
+
+    func isReady(at now: TimeInterval) -> Bool {
+        !takeoverPending && announcedReady && now - lastReportAt < 1
+    }
+
+    mutating func receivedHeartbeat(at now: TimeInterval) {
+        guard !takeoverPending else { return }
+        announcedReady = true
+        lastReportAt = now
+    }
+
+    @discardableResult
+    mutating func revoke() -> Bool {
+        let first = !takeoverPending
+        takeoverPending = true
+        announcedReady = false
+        return first
+    }
+}
+
+/// A guardian cannot inspect authd's outstanding Allow. The parent tells it
+/// when that decision has settled; without that proof an old lock is not enough.
+struct PrivacyGuardianHandoffState {
+    private(set) var revocationAcknowledged = false
+    private var automaticUnlockMayBePending = true
+
+    mutating func automaticUnlockSettled() { automaticUnlockMayBePending = false }
+
+    mutating func acknowledgeRevocation(automaticUnlockPending: Bool) {
+        revocationAcknowledged = true
+        automaticUnlockMayBePending = automaticUnlockPending
+    }
+
+    mutating func observeSessionLocked(_ locked: Bool?) {
+        if locked == false { automaticUnlockMayBePending = false }
+    }
+
+    func mayReleaseAfterParentLoss(sessionLocked: Bool?) -> Bool {
+        sessionLocked == true && !automaticUnlockMayBePending
+    }
+}
+
 @MainActor
 final class PrivacyGuardianClient {
     private var process: Process?
@@ -17,9 +90,8 @@ final class PrivacyGuardianClient {
     private var reports: FileHandle?
     private var generation = UUID()
     private var buffered = Data()
-    private var lastReportAt: TimeInterval = 0
-    private var announcedReady = false
-    var ready: Bool { announcedReady && ProcessInfo.processInfo.systemUptime - lastReportAt < 1 }
+    private var lease = PrivacyGuardianLeaseState()
+    var ready: Bool { lease.isReady(at: ProcessInfo.processInfo.systemUptime) }
     private(set) var lastError: String?
     var onTakeover: (() -> Void)?
 
@@ -28,6 +100,9 @@ final class PrivacyGuardianClient {
     func start() {
         guard process == nil else { return }
         generation = UUID()
+        lease = PrivacyGuardianLeaseState()
+        buffered.removeAll()
+        lastError = nil
         let currentGeneration = generation
         let child = Process()
         let input = Pipe(), output = Pipe()
@@ -47,11 +122,7 @@ final class PrivacyGuardianClient {
         child.terminationHandler = { [weak self] _ in
             Task { @MainActor [weak self] in
                 guard let self, self.generation == currentGeneration else { return }
-                self.announcedReady = false
-                LockedUseAuthorizationServer.shared.renewProtection(ready: false)
-                self.lastError = "隐私守护进程已退出"
-                LockedUseAuthorizationServer.shared.suppressForManualAuthentication()
-                self.onTakeover?()
+                self.revoke(error: "隐私守护进程已退出")
             }
         }
         do {
@@ -61,30 +132,42 @@ final class PrivacyGuardianClient {
             process = child
             commands = input.fileHandleForWriting
         } catch {
-            announcedReady = false
-            lastError = error.localizedDescription
             reports?.readabilityHandler = nil
             reports = nil
+            revoke(error: error.localizedDescription)
         }
     }
 
     func pulse() {
         guard process?.isRunning == true else {
-            announcedReady = false
-            LockedUseAuthorizationServer.shared.renewProtection(ready: false)
+            revoke(error: "隐私守护进程未运行")
             return
         }
         send("PING")
-        LockedUseAuthorizationServer.shared.renewProtection(ready: ready, validUntil: lastReportAt + 1)
+        LockedUseAuthorizationServer.shared.renewProtection(ready: ready, validUntil: lease.lastReportAt + 1)
     }
 
-    func manualUnlockConfirmed() { send("RESUME") }
+    func armTakeover() {
+        guard !lease.takeoverPending else { return }
+        send("ARM_TAKEOVER")
+    }
+
+    /// Called only after the parent has observed the final system lock and
+    /// proved that no previously consumed Allow can unlock it again.
+    func completeHandoff() {
+        close(command: "HANDOFF")
+    }
 
     func stop() {
+        let pending = LockedUseAuthorizationServer.shared.automaticUnlockPending
+        close(command: pending ? "STOP_PENDING" : "STOP")
+    }
+
+    private func close(command: String) {
         generation = UUID()
-        announcedReady = false
+        lease.revoke()
         LockedUseAuthorizationServer.shared.renewProtection(ready: false)
-        send("STOP")
+        send(command)
         try? commands?.close()
         commands = nil
         reports?.readabilityHandler = nil
@@ -98,17 +181,21 @@ final class PrivacyGuardianClient {
     private func send(_ command: String) {
         do { try commands?.write(contentsOf: Data((command + "\n").utf8)) }
         catch {
-            announcedReady = false
-            LockedUseAuthorizationServer.shared.renewProtection(ready: false)
-            lastError = error.localizedDescription
+            revoke(error: error.localizedDescription)
         }
+    }
+
+    private func revoke(error: String? = nil) {
+        let first = lease.revoke()
+        if let error { lastError = error }
+        LockedUseAuthorizationServer.shared.renewProtection(ready: false)
+        LockedUseAuthorizationServer.shared.suppressForManualAuthentication()
+        if first { onTakeover?() }
     }
 
     private func receive(_ data: Data) {
         guard !data.isEmpty, buffered.count + data.count <= 4096 else {
-            announcedReady = false
-            LockedUseAuthorizationServer.shared.renewProtection(ready: false)
-            lastError = "隐私守护连接中断"
+            revoke(error: "隐私守护连接中断")
             return
         }
         buffered.append(data)
@@ -117,21 +204,16 @@ final class PrivacyGuardianClient {
             buffered.removeSubrange(...newline)
             switch line {
             case "READY", "ALIVE":
-                announcedReady = true
+                guard !lease.takeoverPending else { continue }
+                lease.receivedHeartbeat(at: ProcessInfo.processInfo.systemUptime)
                 lastError = nil
-                lastReportAt = ProcessInfo.processInfo.systemUptime
             case "TAKEOVER":
                 // Revoke synchronously before acknowledging that the guardian
                 // may ask macOS to lock. The helper must not auto-unlock it.
-                announcedReady = false
-                LockedUseAuthorizationServer.shared.renewProtection(ready: false)
-                LockedUseAuthorizationServer.shared.suppressForManualAuthentication()
-                onTakeover?()
-                send("REVOKED")
+                revoke()
+                send(LockedUseAuthorizationServer.shared.automaticUnlockPending ? "REVOKED_PENDING" : "REVOKED")
             default:
-                announcedReady = false
-                LockedUseAuthorizationServer.shared.renewProtection(ready: false)
-                lastError = line
+                revoke(error: line)
             }
         }
     }
@@ -147,8 +229,9 @@ final class PrivacyGuardianProcess {
     private var tapSource: CFRunLoopSource?
     private var lastHeartbeat = ProcessInfo.processInfo.systemUptime
     private var takeoverRequestedAt: TimeInterval?
-    private var revoked = false
-    private var observedLock = false
+    private var inputPolicy = PrivacyGuardianInputPolicy()
+    private var handoff = PrivacyGuardianHandoffState()
+    private var lockedSince: TimeInterval?
     private var failed = false
     private var nextLockAttempt: TimeInterval = 0
 
@@ -194,7 +277,8 @@ final class PrivacyGuardianProcess {
             panel.hidesOnDeactivate = false
             panel.collectionBehavior = [.canJoinAllSpaces, .stationary, .fullScreenAuxiliary, .ignoresCycle]
             panel.level = NSWindow.Level(rawValue: Int(CGWindowLevelForKey(.screenSaverWindow)) + 2)
-            panel.contentView = PrivacyShieldView(screenIndex: 0) { [weak self] in self?.takeover() }
+            panel.contentView = PrivacyShieldView(screenIndex: 0) { [weak self] in self?.viewInput() }
+            if inputPolicy.armed { (panel.contentView as? PrivacyShieldView)?.armTakeover() }
             panel.orderFrontRegardless()
             return panel
         }
@@ -215,12 +299,10 @@ final class PrivacyGuardianProcess {
                     guardian.failed = true
                     guardian.report("ERROR input listener disabled")
                     guardian.takeover("tap-disabled type=\(type.rawValue)")
-                } else if event.getIntegerValueField(.eventSourceUserData) == guardianSyntheticMarker {
-                    // The helper's own unlock keystroke is not a human takeover.
-                    // No trace call here: a nonisolated static call inside this
-                    // MainActor closure crashes the Swift optimiser.
-                    _ = type
-                } else if event.getIntegerValueField(.eventSourceUnixProcessID) == 0 {
+                } else if guardian.inputPolicy.accepts(
+                    flagsChanged: type == .flagsChanged, flags: event.flags,
+                    sourcePID: event.getIntegerValueField(.eventSourceUnixProcessID),
+                    userData: event.getIntegerValueField(.eventSourceUserData)) {
                     guardian.takeover("hid-input type=\(type.rawValue)")
                 }
             }
@@ -237,6 +319,15 @@ final class PrivacyGuardianProcess {
         return CGEvent.tapIsEnabled(tap: tap)
     }
 
+    private func viewInput() {
+        guard let event = NSApp.currentEvent, let cgEvent = event.cgEvent,
+              inputPolicy.accepts(
+                flagsChanged: event.type == .flagsChanged, flags: cgEvent.flags,
+                sourcePID: cgEvent.getIntegerValueField(.eventSourceUnixProcessID),
+                userData: cgEvent.getIntegerValueField(.eventSourceUserData)) else { return }
+        takeover("cover-input type=\(event.type.rawValue)")
+    }
+
     private func receive(_ data: Data) {
         guard !data.isEmpty, inputBuffer.count + data.count <= 4096 else {
             failed = true
@@ -251,24 +342,28 @@ final class PrivacyGuardianProcess {
             case "PING":
                 lastHeartbeat = ProcessInfo.processInfo.systemUptime
                 if !failed, takeoverRequestedAt == nil, !panels.isEmpty { report("ALIVE") }
-            case "RESUME":
-                if observedLock, !failed, NativePlatform.sessionLocked() == false {
-                    takeoverRequestedAt = nil
-                    observedLock = false
-                    revoked = false
-                    nextLockAttempt = 0
-                    report("READY")
-                }
-            case "REVOKED": revoked = true
-            case "STOP":
-                if takeoverRequestedAt != nil {
-                    // An interrupted task must not cancel a user-requested lock.
-                    revoked = true
-                    failed = true
-                    continue
-                }
-                panels.forEach { $0.orderOut(nil) }
-                exit(0)
+            case "ARM_TAKEOVER":
+                guard takeoverRequestedAt == nil else { continue }
+                inputPolicy.arm(flags: CGEventSource.flagsState(.combinedSessionState))
+                panels.forEach { ($0.contentView as? PrivacyShieldView)?.armTakeover() }
+                handoff.automaticUnlockSettled()
+            case "REVOKED", "REVOKED_PENDING":
+                handoff.acknowledgeRevocation(automaticUnlockPending: line == "REVOKED_PENDING")
+            case "HANDOFF":
+                // The parent has revoked grants and checked for an outstanding
+                // Allow. Recheck the system before removing this final cover.
+                handoff.acknowledgeRevocation(automaticUnlockPending: false)
+                if NativePlatform.sessionLocked() == true { finish() }
+                failed = true
+                takeover("handoff-lock-not-confirmed")
+            case "STOP", "STOP_PENDING":
+                let pending = line == "STOP_PENDING"
+                if takeoverRequestedAt == nil && !pending { finish() }
+                // A cancelled task cannot discard a requested system lock or
+                // a cover that may still be needed for an in-flight Allow.
+                handoff.acknowledgeRevocation(automaticUnlockPending: pending)
+                failed = true
+                takeover("parent-stopped")
             default:
                 failed = true
                 takeover("unknown-command \(line.prefix(24))")
@@ -295,18 +390,19 @@ final class PrivacyGuardianProcess {
         guard let requested = takeoverRequestedAt else { return }
         // ACK revokes immediately. On helper failure, its protection lease
         // expires after one second, before this fallback lock request.
-        guard revoked || now - requested > 1.5 else { return }
-        if NativePlatform.sessionLocked() == true {
-            observedLock = true
-            if failed { exit(0) }
-            // Remain until the manual unlock, then allow a fresh input episode.
+        guard handoff.revocationAcknowledged || now - requested > 1.5 else { return }
+        let locked = NativePlatform.sessionLocked()
+        handoff.observeSessionLocked(locked)
+        if locked == true {
+            if lockedSince == nil { lockedSince = now }
+            if failed, handoff.mayReleaseAfterParentLoss(sessionLocked: locked),
+               let lockedSince, now - lockedSince >= 0.75 { finish() }
+            // With a live parent, HANDOFF is the only completion signal. With
+            // no parent and unknown pending Allow, retain cover until that
+            // unlock is observed and a subsequent lock is stable.
             return
         }
-        if observedLock, !failed {
-            // A false lock result is not proof of manual authentication. Do
-            // not clear suppression here; parent confirms the locked->unlocked transition.
-            return
-        }
+        lockedSince = nil
         if now >= nextLockAttempt {
             nextLockAttempt = now + 1
             Self.trace("requesting system lock (guardian fallback)")
@@ -317,5 +413,10 @@ final class PrivacyGuardianProcess {
 
     private func report(_ value: String) {
         try? FileHandle.standardOutput.write(contentsOf: Data((value + "\n").utf8))
+    }
+
+    private func finish() -> Never {
+        panels.forEach { $0.orderOut(nil) }
+        exit(0)
     }
 }
