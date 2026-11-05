@@ -7,8 +7,18 @@
 2026-11-05 用户已验证 deny-only 版本保留正常全屏锁屏及密码解锁。
 随后已切换至自动解锁插件（`denyOnly=false`、`enabled=true`），并部署新版 helper
 与桥接程序；权限及插件可用性检查通过，用户确认当前登录会话内完整自动解锁与浮层交接测试通过。
-注销并重新登录后的原生锁屏样式与完整交接流程仍待验证。
-下述 deny-only 为前一步验证模式，非当前安装模式。
+随后用户确认：注销并重新登录后，锁屏变成黑屏与密码弹窗。当前会话的成功不能证明
+原生锁屏样式得到保留，remote/stock 授权组合未满足需求。随后已恢复原始规则并卸载旧组合。
+根据本机 Codex 安装器与 loginwindow 的静态证据，新候选将 `use-login-window-ui`
+直接保留在顶层。用户于 2026-11-05 确认注销重新登录后的界面及密码解锁正常，
+已开放显式 `--experimental` 自动解锁安装；旧 remote/stock 结构继续禁用。
+新结构拒绝版已于 2026-11-05 安装，事务状态为 `committed`，读回确认顶层原生 UI 标记存在；
+新登录会话验证已通过；恢复自动解锁后的安装器与插件测试共 15 项通过。
+用户随后确认新结构下完整流程通过：系统锁屏后自动解锁并显示插件浮层，
+本地输入后交回系统全屏锁屏，密码解锁正常。helper 状态记录 `consumedCount=1`、
+`lastTransition=system-lock-handed-back`、`pausedByUser=true`、`automationPaused=true`，
+无待处理自动解锁、无可见浮层、无 Guardian 错误。测试租约已释放，最终实时检查
+`sessionLocked=false`，隐私状态为 `inactive`。本次为单机手动验证，不代表零桌面暴露保证。
 验证包签名配置 `CUADenyOnly=true`，机制跳过授权服务并返回 Deny；安装记录
 `denyOnly=true`、`enabled=false`，不会启用自动解锁。构建使用
 `make -B BUILD_DIR=build-deny-only DENY_ONLY=true`，安装使用
@@ -22,17 +32,21 @@
 ## 授权结构
 
 第二版不把 `use-login-window-ui` 放入 mechanisms。安装器仅接受未定制的原始规则，
-生成三个独立的数据库条目：
+生成两个独立的数据库条目：
 
 | 条目 | 内容 |
 | --- | --- |
-| `system.login.screensaver` | `class=rule`、`k-of-n=1`，依次引用 remote 和 stock |
+| `system.login.screensaver` | `class=rule`、`k-of-n=1`，直接引用 remote 和 `use-login-window-ui` |
 | `com.workbuddy.cua.AuthorizationPlugin.remote` | `class=evaluate-mechanisms`，仅含插件 mechanism，`shared=false` |
-| `com.workbuddy.cua.AuthorizationPlugin.stock` | 原始系统规则的完整副本，保留 `use-login-window-ui` |
 
-这是参考本机 `/System/Library/Security/authorization.plist` 的候选组合，不能仅凭
-配置结构认定 loginwindow 一定会尝试两个分支。取消、拒绝、密码重试、Touch ID 的
-实际行为仍需本机验证；编译和签名不证明解锁可用。
+原始系统规则仅存入恢复备份，不再创建 stock 分支。`tries=1` 仅用于 remote；
+本机 authorizationdb 不持久化 `class=rule` 的 `tries`，安装器按实际可持久化字段严格读回核验。
+旧的 remote/stock 间接引用组合导致注销后锁屏样式回归，不可继续安装。
+本机 loginwindow 的 `-[LWScreenLock readUseDefaultScreenLockUI]` 包含读取 `rule`、
+检查 `use-login-window-ui` 的路径，并有明确日志字符串说明：找不到该规则时使用
+SecurityAgent UI。结合本次顶层改为 remote/stock 后的复现，推断顶层 UI 选择没有按预期
+递归识别 stock 中的原始规则；具体读取与缓存时机尚未验证。不能把“授权能回退”当成
+“原生全屏锁屏界面能保留”。
 
 ## 通信与会话绑定
 

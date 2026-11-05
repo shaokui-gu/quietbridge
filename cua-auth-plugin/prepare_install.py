@@ -10,11 +10,14 @@ import shutil
 import subprocess
 import sys
 import tempfile
+from install import require_supported_lock_ui
 
 ROOT = Path(__file__).resolve().parent
 
 
 def main():
+    # Fail before publishing a helper, staging files or asking for root access.
+    require_supported_lock_ui()
     if not (ROOT / 'build/WorkBuddyCUAAuthorizationPlugin.bundle').is_dir():
         raise RuntimeError('请先构建授权插件')
     with tempfile.TemporaryDirectory(prefix='workbuddy-cua-install-', dir='/private/tmp') as directory:

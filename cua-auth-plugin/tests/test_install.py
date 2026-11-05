@@ -1,6 +1,7 @@
 import importlib.util
 from pathlib import Path
 import plistlib
+import tempfile
 import unittest
 from unittest.mock import patch
 
@@ -21,27 +22,54 @@ class InstallationGateTests(unittest.TestCase):
             read.assert_not_called()
 
     def test_install_stops_before_any_system_access(self):
-        with patch.object(installer, "require_root") as root, \
+        with patch.object(installer, "DIRECT_UI_VALIDATED_AFTER_FRESH_LOGIN", False), \
+             patch.object(installer, "require_root") as root, \
              patch.object(installer, "authorization_read") as read, \
              patch.object(installer, "authorization_write") as write:
-            with self.assertRaisesRegex(RuntimeError, "安装已禁用"):
-                installer.install()
+            for experimental in (False, True):
+                for deny_only in (False, True):
+                    if experimental and deny_only:
+                        continue
+                    with self.subTest(experimental=experimental, deny_only=deny_only):
+                        with self.assertRaisesRegex(RuntimeError, "安装已禁用"):
+                            installer.install(experimental=experimental, deny_only=deny_only)
             root.assert_not_called()
             read.assert_not_called()
             write.assert_not_called()
 
+    def test_prepare_stops_before_staging_publishing_or_sudo(self):
+        spec = importlib.util.spec_from_file_location("auth_prepare", ROOT / "prepare_install.py")
+        prepare = importlib.util.module_from_spec(spec)
+        with patch.dict("sys.modules", {"install": installer}):
+            spec.loader.exec_module(prepare)
+        with patch.object(installer, "DIRECT_UI_VALIDATED_AFTER_FRESH_LOGIN", False), \
+             patch.object(prepare.tempfile, "TemporaryDirectory") as stage, \
+             patch.object(prepare.subprocess, "run") as run:
+            with self.assertRaisesRegex(RuntimeError, "注销重新登录"):
+                prepare.main()
+            stage.assert_not_called()
+            run.assert_not_called()
+
+    def test_auto_unlock_gate_opens_after_fresh_login_validation(self):
+        self.assertTrue(installer.DIRECT_UI_VALIDATED_AFTER_FRESH_LOGIN)
+        installer.require_supported_lock_ui()
+
 
 class CandidatePolicyTests(unittest.TestCase):
-    def test_keeps_original_as_separate_branch(self):
-        original = {"class": "rule", "rule": ["use-login-window-ui"], "tries": 10000}
+    def test_keeps_native_ui_marker_directly_in_primary(self):
+        original = {"class": "rule", "rule": ["use-login-window-ui"],
+                    "tries": 10000, "comment": "original system policy"}
         plan = installer.candidate_policy(plistlib.dumps(original))
-        self.assertEqual(plan[installer.STOCK_RIGHT], original)
+        self.assertNotIn(installer.STOCK_RIGHT, plan)
         self.assertEqual(plan[installer.RIGHT]["k-of-n"], 1)
         self.assertEqual(plan[installer.RIGHT]["rule"],
-                         [installer.REMOTE_RIGHT, installer.STOCK_RIGHT])
+                         [installer.REMOTE_RIGHT, "use-login-window-ui"])
+        self.assertEqual(original["rule"], ["use-login-window-ui"])
+        self.assertEqual(plan[installer.RIGHT]["comment"], original["comment"])
         self.assertNotIn("mechanisms", plan[installer.RIGHT])
         self.assertNotIn("shared", plan[installer.RIGHT])
         self.assertNotIn("tries", plan[installer.RIGHT])
+        self.assertEqual(plan[installer.REMOTE_RIGHT]["tries"], 1)
         self.assertEqual(plan[installer.REMOTE_RIGHT]["mechanisms"],
                          [installer.PLUGIN_MECHANISM])
 
@@ -51,11 +79,73 @@ class CandidatePolicyTests(unittest.TestCase):
             installer.candidate_policy(plistlib.dumps(source))
 
 
+class InstallationTransactionTests(unittest.TestCase):
+    def test_validation_install_and_uninstall_restore_exact_original(self):
+        self.exercise_transaction(fail_primary=False)
+
+    def test_primary_write_failure_restores_original_and_keeps_backup(self):
+        self.exercise_transaction(fail_primary=True)
+
+    def exercise_transaction(self, fail_primary):
+        original = {"class": "rule", "rule": ["use-login-window-ui"],
+                    "version": 1, "comment": "original"}
+        original_raw = plistlib.dumps(original)
+        database = {installer.RIGHT: original}
+        writes = []
+        failed = False
+
+        def write(right, value):
+            nonlocal failed
+            writes.append(right)
+            database[right] = value
+            if fail_primary and right == installer.RIGHT and not failed:
+                failed = True
+                raise RuntimeError("simulated read-back failure")
+            return value
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            bundle = root / "source.bundle"
+            (bundle / "Contents").mkdir(parents=True)
+            (bundle / "Contents/Info.plist").write_bytes(plistlib.dumps({"CUADenyOnly": True}))
+            state = root / "state"
+            state_file = state / "installation.plist"
+            original_file = state / "system.login.screensaver.original.plist"
+            with patch.multiple(installer, STATE_DIRECTORY=state, STATE_FILE=state_file,
+                                ORIGINAL_RIGHT_FILE=original_file,
+                                INSTALLED_BUNDLE=root / "plugins" / installer.BUNDLE_NAME), \
+                 patch.object(installer, "require_root"), \
+                 patch.object(installer, "verify_bundle", return_value=""), \
+                 patch.object(installer.subprocess, "run"), \
+                 patch.object(installer, "authorization_read",
+                              side_effect=lambda right=installer.RIGHT: plistlib.dumps(database[right])), \
+                 patch.object(installer, "right_exists", side_effect=lambda right: right in database), \
+                 patch.object(installer, "write_verified", side_effect=write), \
+                 patch.object(installer, "remove_branch", side_effect=lambda right: database.pop(right, None)):
+                if fail_primary:
+                    with self.assertRaisesRegex(RuntimeError, "simulated"):
+                        installer.install(bundle, experimental=True, deny_only=True)
+                    self.assertEqual(database[installer.RIGHT], original)
+                    self.assertEqual(plistlib.loads(state_file.read_bytes())["phase"], "entry-restored")
+                else:
+                    result = installer.install(bundle, experimental=True, deny_only=True)
+                    self.assertEqual(writes, [installer.REMOTE_RIGHT, installer.RIGHT])
+                    self.assertEqual(database[installer.RIGHT]["rule"],
+                                     [installer.REMOTE_RIGHT, "use-login-window-ui"])
+                    self.assertFalse(result["state"]["enabled"])
+                    self.assertTrue(result["state"]["validatedAfterFreshLogin"])
+                self.assertEqual(original_file.read_bytes(), original_raw)
+                self.assertNotIn(installer.STOCK_RIGHT, database)
+                installer.uninstall()
+                self.assertEqual(database, {installer.RIGHT: original})
+                self.assertFalse(state.exists())
+
+
 class ReadbackVerificationTests(unittest.TestCase):
-    def test_rejects_lost_stock_branch(self):
+    def test_rejects_wrapping_native_ui_in_stock_branch(self):
         expected = {"class": "rule", "k-of-n": 1,
-                    "rule": [installer.REMOTE_RIGHT, installer.STOCK_RIGHT]}
-        damaged = {"class": "evaluate-mechanisms", "mechanisms": [installer.PLUGIN_MECHANISM]}
+                    "rule": [installer.REMOTE_RIGHT, "use-login-window-ui"]}
+        damaged = dict(expected, rule=[installer.REMOTE_RIGHT, installer.STOCK_RIGHT])
         self.assertFalse(installer.policy_matches(damaged, expected))
 
     def test_rejects_unexpected_policy_flags(self):

@@ -28,6 +28,9 @@ PLUGIN_MECHANISM = "WorkBuddyCUAAuthorizationPlugin:allow"
 # ledger and rollback tooling can recognise an installation made with it.
 LEGACY_PRIVILEGED_MECHANISM = "WorkBuddyCUAAuthorizationPlugin:allow,privileged"
 RIGHT = "system.login.screensaver"
+# User confirmed native full-screen UI and password unlock after logout/login
+# on 2026-11-05 with the direct-login-window-ui deny-only installation.
+DIRECT_UI_VALIDATED_AFTER_FRESH_LOGIN = True
 
 
 def checked_path(path):
@@ -57,11 +60,16 @@ def authorization_write(data, right=RIGHT):
                            "无法写入 authorization right")
 
 
-def transformed_right(source, include_plugin=True):
+def require_supported_lock_ui(deny_only=False):
+    if deny_only or DIRECT_UI_VALIDATED_AFTER_FRESH_LOGIN:
+        return
     raise RuntimeError(
-        "安装已禁用：旧版将 use-login-window-ui 规则误当作 mechanism，"
-        "可能移除系统密码认证路径。新授权分支尚未完成验证；"
-        "默认入口不写系统；第二版实验安装需显式 --experimental。")
+        "自动解锁安装已禁用：新的顶层 use-login-window-ui 授权结构"
+        "仍需注销重新登录后的界面验证。仅允许 --experimental --deny-only 安装验证版。")
+
+
+def transformed_right(source, include_plugin=True):
+    raise RuntimeError("安装已禁用：必须显式选择 --experimental；旧授权结构不再支持。")
 
 
 REMOTE_RIGHT = "com.workbuddy.cua.AuthorizationPlugin.remote"
@@ -75,19 +83,23 @@ def candidate_policy(source):
             or original.get("rule") not in (["use-login-window-ui"], "use-login-window-ui")
             or "mechanisms" in original):
         raise ValueError("只支持未定制的 use-login-window-ui 原始规则；拒绝猜测迁移")
+    # loginwindow selects its native UI from the top-level rule array. Wrapping
+    # this marker in a stock subrule changed the UI after a fresh login.
+    primary = dict(original)
+    # authorizationdb does not persist tries for class=rule; it belongs to the
+    # evaluate-mechanisms branch. Compare the persisted policy without weakening
+    # read-back verification for other fields.
+    primary.pop("tries", None)
+    primary.update({"class": "rule", "k-of-n": 1,
+                    "rule": [REMOTE_RIGHT, "use-login-window-ui"]})
     return {
-        STOCK_RIGHT: original,
         REMOTE_RIGHT: {
             "class": "evaluate-mechanisms",
             "mechanisms": [PLUGIN_MECHANISM],
             "shared": False,
             "tries": 1,
         },
-        RIGHT: {
-            "class": "rule",
-            "k-of-n": 1,
-            "rule": [REMOTE_RIGHT, STOCK_RIGHT],
-        },
+        RIGHT: primary,
     }
 
 
@@ -219,6 +231,8 @@ def remove_branch(right):
 def install(bundle=None, experimental=False, deny_only=False):
     if not experimental:
         transformed_right(b"")  # legacy installation stays disabled
+    # Validate the new UI topology after a fresh login before enabling grants.
+    require_supported_lock_ui(deny_only=deny_only)
     require_root("install")
     source = checked_path(bundle or SOURCE_BUNDLE)
     signature = verify_bundle(source)
@@ -252,6 +266,8 @@ def install(bundle=None, experimental=False, deny_only=False):
         "version": 2, "protocolVersion": 3,
         "enabled": False, "experimentalOptIn": True,
         "validatedForUnlock": False, "phase": "prepared",
+        "policyTopology": "direct-login-window-ui",
+        "validatedAfterFreshLogin": DIRECT_UI_VALIDATED_AFTER_FRESH_LOGIN,
         "denyOnly": deny_only,
         "installedAt": datetime.datetime.now(datetime.timezone.utc).isoformat(),
         "bundleIdentifier": PLUGIN_IDENTIFIER, "teamIdentifier": TEAM_IDENTIFIER,
@@ -276,7 +292,7 @@ def install(bundle=None, experimental=False, deny_only=False):
         # Dependencies first, primary entry last. A mechanism never replaces the
         # login-window rule. Keep each actual read-back for uninstall conflict checks.
         actual = {}
-        for right in (STOCK_RIGHT, REMOTE_RIGHT, RIGHT):
+        for right in (REMOTE_RIGHT, RIGHT):
             if right == RIGHT:
                 # Refuse intervening policy edits before touching the entry point.
                 if plistlib.loads(authorization_read()) != plistlib.loads(current_raw):
