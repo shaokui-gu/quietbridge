@@ -18,6 +18,10 @@ WorkBuddy ⇄ MCP(stdio/JSON-RPC) ⇄ server.py ⇄ workbuddy-cua-native ⇄ 共
 
 范围只跟随同一连接及同一应用窗口，结束共享、新任务、更换目标或重连后恢复应用共享。目标位于后台 Space 时，应用共享会明确降为目标窗口预览；桌面共享不会降为窗口冒充成功，需要手动切换到目标桌面后重试。
 
+共享目标与预览面板分别绑定：捕获持续使用任务的原应用/窗口，预览面板跟随固定的 WorkBuddy 宿主窗口。WorkBuddy 换 Space 时，即使屏幕坐标不变，也会把透明的自有预览面板迁到宿主的 Space，并回读验证后再显示；不会激活应用、切换用户桌面或把面板加入所有桌面。手动拖动或调整预览大小后，仍跟随宿主移动并保留相对位置。宿主暂时不可用或迁移无法验证时，隐藏面板并返回诊断状态，不将它留在另一个桌面冒充成功。
+
+目标窗口跨 Space 后仍按原窗口捕获；应用共享在目标不属于当前 Space 时收窄为原窗口流，`mode` 表示请求范围，`captureMode`/`scope` 表示实际捕获范围。显式桌面共享暂不可用时保留绑定并显示等待状态，目标桌面恢复后重建原显示器上的流。有效共享租约期间，目标回到当前桌面也不会再让窗口预览自动消失。
+
 ## 固定浏览器目标与后台操作
 
 列出窗口只返回列表，不改变已选目标。缓存目标关闭时返回 `TARGET_LOST`；没有目标且存在多个窗口时返回 `TARGET_REQUIRED`，需要显式选择。已绑定任务仍校验原窗口、进程身份与连接，不会按当前焦点或窗口排序换目标。
@@ -33,6 +37,8 @@ AX 点击后不再为了恢复前台而激活另一个应用；日志记录动�
 界面观察和鼠标操作默认写入 JSONL 日志。普通安装位置为 `~/Library/Logs/workbuddy-cua/bridge-operations.jsonl` 与同目录的 `native-operations.jsonl`；设置 `CUA_CONFIG_DIR` 时位于该目录的 `logs/`。可以用 `CUA_DIAGNOSTICS_DIR` 指定目录，或以 `CUA_OPERATION_LOG=0` 关闭。环境变量需要传给桥接和 helper；更改后重新连接。
 
 每次工具调用返回 `structuredContent.diagnostics`，包含 `toolTraceId` 和日志路径。桥接的 `nativeRequestId` 对应原生日志的 `requestId`，可串起请求发送、几何校验、事件创建/投递、结束或错误。点击结果中的 `pointer` 包含窗口边界、窗口内坐标与最终屏幕坐标。原生日志还会记录 CG/AX 边界差异、观察后窗口移动、显示器位置以及实际投递路线。
+
+预览诊断另含 `hostWindowId`、`hostSpaceIds`、`panelSpaceIds`、`panelSpaceVerified`、`panelPlacementError`，用来核对 WorkBuddy 宿主与预览面板是否在同一组 Space；`trackingWindowId` 始终表示独立的捕获目标。原生日志在这些绑定状态变化时记录 `preview.hostRoute`。
 
 坐标点击的 `x/y` 始终是**窗口左上角起算的 macOS point**。截图的 `pixelWidth/pixelHeight` 是像素，日志中的 `pixelsPerPointX/Y` 给出比例：窗口内截图像素位置应分别除以该比例，再作为点击坐标；整个桌面的截图坐标还需减去窗口原点。共享预览面板的显示尺寸也不等于点击坐标尺寸。
 

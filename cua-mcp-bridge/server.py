@@ -133,6 +133,20 @@ def diagnostic_result(result):
         for key, keys in (("windowBounds", ("x", "y", "width", "height")), ("windowPoint", ("x", "y")), ("screenPoint", ("x", "y"))):
             safe[key] = diagnostic_geometry(pointer.get(key), keys)
         fields["pointer"] = safe
+    preview = result.get("preview")
+    if isinstance(preview, dict):
+        safe = diagnostic_geometry(preview, ("trackingWindowId", "hostWindowId", "hostPid", "displayId"))
+        for key in ("panelSpaceVerified", "hostOnCurrentSpace", "panelOnCurrentSpace", "visible", "streamReady", "waitingForTargetDesktop"):
+            if type(preview.get(key)) is bool:
+                safe[key] = preview[key]
+        for key in ("hostSpaceIds", "panelSpaceIds"):
+            values = preview.get(key)
+            if isinstance(values, list) and len(values) <= 64 and all(type(v) is int and v > 0 for v in values):
+                safe[key] = values
+        for key in ("mode", "captureMode"):
+            if preview.get(key) in ("window", "application", "desktop"):
+                safe[key] = preview[key]
+        fields["preview"] = safe
     return fields
 
 

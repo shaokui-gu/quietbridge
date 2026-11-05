@@ -319,6 +319,16 @@ import Darwin
             "frameAgeMs": frameAge,
             "displayId": displayID == 0 ? .null : .number(Double(displayID)),
             "trackingWindowId": .number(Double(values["trackingWindowId"] as? Int ?? 0)),
+            "captureMode": (values["captureMode"] as? String).map(JSONValue.string) ?? .null,
+            "waitingForTargetDesktop": .bool(values["waitingForTargetDesktop"] as? Bool ?? false),
+            "hostWindowId": (values["hostWindowId"] as? Int).map { .number(Double($0)) } ?? .null,
+            "hostPid": (values["hostPid"] as? Int).map { .number(Double($0)) } ?? .null,
+            "hostSpaceIds": .array((values["hostSpaceIds"] as? [UInt64] ?? []).map { .number(Double($0)) }),
+            "panelSpaceIds": .array((values["panelSpaceIds"] as? [UInt64] ?? []).map { .number(Double($0)) }),
+            "hostOnCurrentSpace": (values["hostOnCurrentSpace"] as? Bool).map(JSONValue.bool) ?? .null,
+            "panelOnCurrentSpace": (values["panelOnCurrentSpace"] as? Bool).map(JSONValue.bool) ?? .null,
+            "panelSpaceVerified": .bool(values["panelSpaceVerified"] as? Bool ?? false),
+            "panelPlacementError": (values["panelPlacementError"] as? String).map(JSONValue.string) ?? .null,
         ]
         return .object(fields)
     }

@@ -43,6 +43,21 @@ class OperationLogTests(unittest.TestCase):
             self.assertEqual(server.diagnostic_fields(value), {})
         self.assertEqual(server.diagnostic_fields({"x": float("nan"), "y": float("inf"), "windowId": True}), {})
 
+    def test_preview_host_and_capture_targets_are_logged_separately_without_ui_contents(self):
+        preview = {"trackingWindowId": 7, "hostWindowId": 10, "hostPid": 42,
+                   "hostSpaceIds": [8], "panelSpaceIds": [2], "panelSpaceVerified": False,
+                   "mode": "application", "captureMode": "window", "visible": False,
+                   "status": "synthetic-content-must-stay-out-of-logs",
+                   "panelPlacementError": "synthetic-content-must-stay-out-of-logs"}
+        result = server.diagnostic_result({"preview": preview})
+        self.assertEqual(result['preview']['trackingWindowId'], 7)
+        self.assertEqual(result['preview']['hostWindowId'], 10)
+        self.assertEqual(result['preview']['hostSpaceIds'], [8])
+        self.assertEqual(result['preview']['panelSpaceIds'], [2])
+        self.assertFalse(result['preview']['panelSpaceVerified'])
+        self.assertNotIn('synthetic-content', json.dumps(result))
+        self.assertNotIn('hostSpaceIds', server.diagnostic_result({'preview': {'hostSpaceIds': ['private-content']}})['preview'])
+
     def test_disabled_logging_does_not_create_files(self):
         with mock.patch.dict(os.environ, {"CUA_OPERATION_LOG": "0"}):
             server.operation_log("fixture")

@@ -67,7 +67,6 @@ final class SpacePreview {
     private var view: PreviewView?
     private var timer: Timer?
     private var target: (pid: Int32, windowID: UInt32)?
-    private var targetSpaces: [UInt64] = []
     private var canvas: CGRect = CGRect(x: 0, y: 0, width: 2560, height: 1440)
     private var width: CGFloat = 380
     private var stream: SCStream?
@@ -79,15 +78,25 @@ final class SpacePreview {
     private var lastFrameTime: TimeInterval?
     private var frameCount = 0
     private var userMoved = false
-    private var lastHostFrame: CGRect?
+    private var lastHostBounds: CGRect?
     private var visible = false
     private var lastActivity: TimeInterval = 0
-    private var hostWindowID: UInt32?
+    private var hostWindow: PreviewHostWindow?
+    private var hostSpaceIDs: [UInt64] = []
+    private var panelSpaceIDs: [UInt64] = []
+    private var panelSpaceVerified = false
+    private var panelPlacementError: String?
+    private var workspaceObserver: NSObjectProtocol?
+    private var displayObserver: NSObjectProtocol?
+    private var lastRouteRecord: JSONValue?
+    private let panelTrace = OperationTrace(requestID: "preview-panel", method: "preview")
     private var spaces = WindowSpaces()
     private var holdDeadline: TimeInterval?
     private var holdSeconds: TimeInterval = SpacePreview.defaultHoldSeconds
     /// 桌面共享只捕获目标显示器当前可见的 Space，不捕获后台 Space。
     private var source: PreviewSource = .window
+    private var captureSource: PreviewSource?
+    private var waitingForTargetDesktop = false
     private var displayID: CGDirectDisplayID?
     /// 租约结束时通知守护进程重新判断是否该退出（没有客户端时才真正退出）。
     var onHoldEnded: (() -> Void)?
@@ -108,6 +117,7 @@ final class SpacePreview {
         let changed = !sameTarget || self.source != nextSource
             || (nextSource.usesDisplay && displayID != nextDisplay)
         if changed { teardown() }
+        else if streamError != nil, !waitingForTargetDesktop { resetCapture() }
         target = (pid, windowID)
         self.source = nextSource
         let now = ProcessInfo.processInfo.systemUptime
@@ -119,8 +129,6 @@ final class SpacePreview {
             if let displayID, let screen = Self.displayBounds(displayID) { canvas = screen }
         } else if let bounds { canvas = bounds }
         start()
-        guard self.target != nil else { return }
-        if changed || (stream == nil && !streamStarting) { beginStream(pid: pid, windowID: windowID) }
     }
 
     /// Explicitly keep the panel (and the daemon owning it) alive for `seconds`.
@@ -148,7 +156,7 @@ final class SpacePreview {
         var succeeded = false
         defer {
             // 只清理本次等待的失败流，不能关闭重入请求已建立的新共享。
-            if !succeeded, generation == token { stop() }
+            if !succeeded, generation == token, !waitingForTargetDesktop { stop() }
         }
         let deadline = ProcessInfo.processInfo.systemUptime + 3
         while true {
@@ -195,28 +203,46 @@ final class SpacePreview {
     func stop() {
         teardown()
         clearHold()
+        hostWindow = nil
+        lastHostBounds = nil
+        userMoved = false
     }
 
     /// Stop tracking without ending an active share lease (for example when switching targets).
     private func teardown() {
         timer?.invalidate()
         timer = nil
+        if let workspaceObserver { NSWorkspace.shared.notificationCenter.removeObserver(workspaceObserver) }
+        if let displayObserver { NotificationCenter.default.removeObserver(displayObserver) }
+        workspaceObserver = nil
+        displayObserver = nil
         target = nil
-        targetSpaces = []
+        captureSource = nil
+        displayID = nil
+        waitingForTargetDesktop = false
+        hostSpaceIDs = []
+        panelSpaceIDs = []
+        panelSpaceVerified = false
+        panelPlacementError = nil
+        resetCapture()
+        panel?.alphaValue = 0
+        panel?.orderOut(nil)
+        visible = false
+    }
+
+    /// Reconfigure capture without changing either the target identity or the preview host.
+    private func resetCapture() {
         generation = UUID()
         streamStarting = false
         streamStarted = false
         streamError = nil
         lastFrameTime = nil
         frameCount = 0
-        displayID = nil
         if let stream { Task { try? await stream.stopCapture() } }
         stream = nil
         streamOutput = nil
         view?.video.flushAndRemoveImage()
         view?.mirrorCursor(nil, canvas: canvas)
-        panel?.orderOut(nil)
-        visible = false
     }
 
     private func clearHold() {
@@ -227,13 +253,23 @@ final class SpacePreview {
 
     private func start() {
         ensurePanel()
-        guard let panel else { return }
-        if !userMoved { anchorToHost(panel: panel) }
-        Self.debug("start panel=\(panel.frame) visible=\(visible) host=\(String(describing: hostWindowFrame()))")
-        timer?.invalidate()
-        timer = Timer.scheduledTimer(withTimeInterval: captureInterval, repeats: true) { _ in
-            Task { @MainActor in SpacePreview.shared.tick() }
+        guard panel != nil else { return }
+        if workspaceObserver == nil {
+            workspaceObserver = NSWorkspace.shared.notificationCenter.addObserver(
+                forName: NSWorkspace.activeSpaceDidChangeNotification, object: nil, queue: .main
+            ) { [weak self] _ in Task { @MainActor in self?.tick() } }
         }
+        if displayObserver == nil {
+            displayObserver = NotificationCenter.default.addObserver(
+                forName: NSApplication.didChangeScreenParametersNotification, object: nil, queue: .main
+            ) { [weak self] _ in Task { @MainActor in self?.tick() } }
+        }
+        timer?.invalidate()
+        let timer = Timer(timeInterval: captureInterval, repeats: true) { [weak self] _ in
+            Task { @MainActor in self?.tick() }
+        }
+        self.timer = timer
+        RunLoop.main.add(timer, forMode: .common)
         tick()
     }
 
@@ -253,26 +289,48 @@ final class SpacePreview {
             stop()
             return
         }
-        // 窗口移到其他显示器后，流和画布一起跟随目标，避免继续共享旧桌面。
-        if source.usesDisplay,
-           Self.displayID(containing: CGPoint(x: targetBounds.midX, y: targetBounds.midY)) != displayID {
-            track(pid: target.pid, windowID: target.windowID, source: source)
-            return
+        let nextDisplay = Self.displayID(containing: CGPoint(x: targetBounds.midX, y: targetBounds.midY))
+        if nextDisplay != displayID {
+            displayID = nextDisplay
+            if captureSource?.usesDisplay == true { resetCapture() }
         }
         let membership = spaces.memberships(windowIDs: [target.windowID])[target.windowID]
-        if source == .desktop, membership?.onCurrentSpace != true {
-            stop()
-            return
+        switch PreviewCaptureRoute.decide(source: source, targetOnCurrentSpace: membership?.onCurrentSpace) {
+        case .capture(let nextSource):
+            if captureSource != nextSource || waitingForTargetDesktop { resetCapture() }
+            captureSource = nextSource
+            waitingForTargetDesktop = false
+            if nextSource.usesDisplay {
+                if let displayID, let bounds = Self.displayBounds(displayID) { canvas = bounds }
+            } else { canvas = targetBounds }
+            if stream == nil, !streamStarting, streamError == nil { beginStream(pid: target.pid, windowID: target.windowID) }
+        case .waitingForTargetDesktop:
+            if captureSource != nil { resetCapture() }
+            captureSource = nil
+            waitingForTargetDesktop = true
+            let message = "目标桌面不在显示器当前 Space，保留绑定并等待返回"
+            streamError = message
+            view?.status = message
         }
-        if source.usesDisplay {
-            if let displayID, let bounds = Self.displayBounds(displayID) { canvas = bounds }
-        } else { canvas = targetBounds }
-        let hostOnScreen = hostWindowFrame() != nil
-        let targetIsCurrent = membership?.onCurrentSpace == true
-        // 应用和桌面共享始终显示；窗口共享保留仅异 Space 显示的原有行为。
+        let host = resolveHostWindow()
+        let hostMembership = host.flatMap { spaces.memberships(windowIDs: [$0.windowID])[$0.windowID] }
+        hostSpaceIDs = hostMembership?.spaceIDs ?? []
         let leased = holdDeadline != nil
-        let shouldShow = (hostOnScreen || leased) && (source.usesDisplay || membership?.onCurrentSpace == false)
-        Self.debug("tick hostOnScreen=\(hostOnScreen) targetCurrent=\(targetIsCurrent) shouldShow=\(shouldShow) holding=\(isHolding)")
+        var shouldShow = false
+        if let panel, let host,
+           case .host(let destination) = PreviewHostRoute.decide(host: host, membership: hostMembership,
+                held: leased, source: source, targetOnCurrentSpace: membership?.onCurrentSpace) {
+            let panelID = UInt32(exactly: panel.windowNumber)
+            let actual = panelID.flatMap { spaces.memberships(windowIDs: [$0])[$0]?.spaceIDs }
+            if !CursorSpaceRoute.matches(actual, target: destination) { panel.alphaValue = 0 }
+            if syncAnchor(panel: panel, host: host) {
+                shouldShow = assignPanel(panel, to: destination, host: host)
+            } else { panelSpaceVerified = false }
+        } else {
+            panelSpaceVerified = false
+            panelPlacementError = host == nil ? "宿主窗口不可用" : "宿主不可见或 Space 归属未确认"
+        }
+        recordPanelRoute()
         if shouldShow && !visible {
             // Time spent hidden does not count toward the idle timeout.
             lastActivity = now
@@ -283,7 +341,6 @@ final class SpacePreview {
             stop()
             return
         }
-        if let panel, shouldShow, !userMoved { syncAnchor(panel: panel) }
         setVisible(shouldShow)
         if shouldShow, holdDeadline == nil {
             // 面板出现过就默认续租：不再“每个动作显示几秒就关掉”。
@@ -306,7 +363,7 @@ final class SpacePreview {
         lastFrameTime = nil
         frameCount = 0
         let token = generation
-        let source = self.source
+        guard let source = captureSource else { streamStarting = false; return }
         let wantedDisplay = displayID
         view?.status = "正在连接\(source.label)…"
         Task { @MainActor in
@@ -382,7 +439,7 @@ final class SpacePreview {
                 if let panel {
                     let height = width * canvas.height / max(1, canvas.width) + titleHeight
                     panel.setFrame(NSRect(x: panel.frame.minX, y: panel.frame.maxY - height, width: width, height: height), display: true)
-                    anchorToHost(panel: panel)
+                    if let hostWindow { _ = syncAnchor(panel: panel, host: hostWindow) }
                 }
             } catch {
                 guard generation == token else { return }
@@ -406,14 +463,15 @@ final class SpacePreview {
         let panel = PreviewPanel(contentRect: initial, styleMask: [.borderless, .nonactivatingPanel],
                                  backing: .buffered, defer: false)
         panel.isOpaque = false
+        panel.alphaValue = 0
         panel.backgroundColor = .clear
         panel.hasShadow = true
         // The panel is never key: mouse-moved tracking is what turns the pointer into
         // a resize arrow at the card edges.
         panel.acceptsMouseMovedEvents = true
         panel.level = NSWindow.Level(rawValue: Int(CGWindowLevelForKey(.floatingWindow)))
-        // Stay on the desktop that owns this window (the WorkBuddy one). Joining all
-        // spaces made the preview follow the person to every desktop.
+        // Membership is explicitly kept equal to the bound WorkBuddy window below.
+        // Never join every Space or activate the host to bring the preview along.
         panel.collectionBehavior = [.stationary, .fullScreenAuxiliary, .ignoresCycle]
         let view = PreviewView(frame: initial)
         view.delegate = self
@@ -423,33 +481,80 @@ final class SpacePreview {
     }
 
     private func setVisible(_ next: Bool) {
-        guard let panel, next != visible else { return }
-        if next { panel.orderFrontRegardless() } else { panel.orderOut(nil) }
+        guard let panel else { return }
+        if next {
+            if !panel.isVisible { panel.orderFrontRegardless() }
+            panel.alphaValue = 1
+        } else {
+            panel.alphaValue = 0
+            if panel.isVisible { panel.orderOut(nil) }
+        }
         visible = next
     }
 
-    /// Re-anchor when the host window moves or resizes and the person has not dragged us.
-    private func syncAnchor(panel: NSPanel) {
-        guard !userMoved, let host = hostWindowFrame(), host != lastHostFrame else { return }
-        anchorToHost(panel: panel)
+    /// Move only the transparent, helper-owned panel, then verify both memberships again.
+    private func assignPanel(_ panel: NSPanel, to destination: [UInt64], host: PreviewHostWindow) -> Bool {
+        if panel.windowNumber <= 0 { panel.alphaValue = 0; panel.orderFrontRegardless() }
+        guard let panelID = UInt32(exactly: panel.windowNumber), panelID > 0 else {
+            panelSpaceVerified = false
+            panelPlacementError = "预览面板窗口号不可用"
+            return false
+        }
+        panelSpaceIDs = spaces.memberships(windowIDs: [panelID])[panelID]?.spaceIDs ?? []
+        if !CursorSpaceRoute.matches(panelSpaceIDs, target: destination) || !panel.isVisible {
+            panel.alphaValue = 0
+            panel.orderFrontRegardless()
+            guard spaces.assignOverlay(panel, to: destination) else {
+                panelSpaceVerified = false
+                panelPlacementError = "预览面板迁移未通过 Space 回读验证"
+                return false
+            }
+        }
+        let after = spaces.memberships(windowIDs: [host.windowID, panelID])
+        panelSpaceIDs = after[panelID]?.spaceIDs ?? []
+        guard CursorSpaceRoute.decide(windowID: host.windowID, membership: after[host.windowID]) == .target(destination),
+              CursorSpaceRoute.matches(panelSpaceIDs, target: destination) else {
+            panelSpaceVerified = false
+            panelPlacementError = "宿主或预览面板在迁移期间改变了 Space"
+            return false
+        }
+        panelSpaceVerified = true
+        panelPlacementError = nil
+        return true
     }
 
-    private func anchorToHost(panel: NSPanel) {
-        let screenHeight = NSScreen.screens.first?.frame.maxY ?? 0
-        let size = panel.frame.size
-        guard let host = hostWindowFrame() else {
-            // Headless host: pin to the bottom-right of the main screen instead of hiding.
-            // visibleFrame keeps the panel clear of the Dock and the menu bar.
-            let main = NSScreen.main?.visibleFrame ?? CGRect(x: 0, y: 0, width: 1440, height: 900)
-            panel.setFrame(NSRect(x: main.maxX - size.width - 24, y: main.minY + 16,
-                                  width: size.width, height: size.height), display: true)
-            return
+    /// A manual offset survives host movement; dragging never disables Space tracking.
+    @discardableResult private func syncAnchor(panel: NSPanel, host: PreviewHostWindow) -> Bool {
+        guard let display = Self.displayID(containing: CGPoint(x: host.bounds.midX, y: host.bounds.midY)),
+              let screen = NSScreen.screens.first(where: {
+                  ($0.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber)?.uint32Value == display
+              }) else {
+            panelPlacementError = "宿主显示器不可用，未改为跟随当前焦点显示器"
+            return false
         }
-        lastHostFrame = host
-        // CGWindow bounds use a top-left origin; NSWindow frames use bottom-left.
-        let originX = host.maxX - 16 - size.width
-        let originY = screenHeight - host.minY - 16 - size.height
-        panel.setFrame(NSRect(x: originX, y: originY, width: size.width, height: size.height), display: true)
+        if userMoved, host.bounds == lastHostBounds { return true }
+        let next = PreviewHostGeometry.frame(for: panel.frame, hostBounds: host.bounds,
+            previousHostBounds: lastHostBounds, manuallyPositioned: userMoved,
+            mainDisplayHeight: NSScreen.screens.first?.frame.maxY ?? 0, visibleFrame: screen.visibleFrame)
+        if panel.frame != next { panel.setFrame(next, display: true) }
+        lastHostBounds = host.bounds
+        return true
+    }
+
+    private func recordPanelRoute() {
+        let fields: [String: JSONValue] = [
+            "trackingWindowId": target.map { .number(Double($0.windowID)) } ?? .null,
+            "hostWindowId": hostWindow.map { .number(Double($0.windowID)) } ?? .null,
+            "hostPid": hostWindow.map { .number(Double($0.pid)) } ?? .null,
+            "hostSpaceIds": .array(hostSpaceIDs.map { .number(Double($0)) }),
+            "panelSpaceIds": .array(panelSpaceIDs.map { .number(Double($0)) }),
+            "panelSpaceVerified": .bool(panelSpaceVerified),
+            "placementError": panelPlacementError.map(JSONValue.string) ?? .null,
+        ]
+        let record = JSONValue.object(fields)
+        guard record != lastRouteRecord else { return }
+        lastRouteRecord = record
+        panelTrace.mark("preview.hostRoute", fields: fields)
     }
 
     /// 共享端只消费真实浮层的同一帧，不拥有另一个位置、动画或空闲计时器。
@@ -463,8 +568,11 @@ final class SpacePreview {
 
     func diagnostics() -> [String: Any] {
         let membership = target.flatMap { spaces.memberships(windowIDs: [$0.windowID])[$0.windowID] }
-        return ["videoFrames": frameCount, "visible": visible, "status": view?.status ?? "",
-         "scope": source.scope,
+        let hostMembership = hostWindow.flatMap { spaces.memberships(windowIDs: [$0.windowID])[$0.windowID] }
+        let panelMembership = panel.flatMap { UInt32(exactly: $0.windowNumber) }
+            .flatMap { spaces.memberships(windowIDs: [$0])[$0] }
+        return ["videoFrames": frameCount, "visible": visible && panelMembership?.onCurrentSpace == true, "status": view?.status ?? "",
+         "scope": captureSource?.scope ?? source.scope,
          "targetOnCurrentSpace": membership?.onCurrentSpace as Any? ?? NSNull(),
          "streamStarting": streamStarting, "streamStarted": streamStarted, "streamReady": streamReady,
          "streamError": streamError as Any? ?? NSNull(),
@@ -474,7 +582,17 @@ final class SpacePreview {
          "videoLayerFailed": view?.video.status == .failed,
          "holding": isHolding, "holdRemainingSeconds": holdRemainingSeconds ?? 0,
          "mode": source.rawValue,
+         "captureMode": captureSource?.rawValue as Any? ?? NSNull(),
+         "waitingForTargetDesktop": waitingForTargetDesktop,
          "displayId": displayID.map { Int($0) } ?? 0,
+         "hostWindowId": hostWindow.map { Int($0.windowID) } as Any? ?? NSNull(),
+         "hostPid": hostWindow.map { Int($0.pid) } as Any? ?? NSNull(),
+         "hostSpaceIds": hostSpaceIDs,
+         "panelSpaceIds": panelSpaceIDs,
+         "hostOnCurrentSpace": hostMembership?.onCurrentSpace as Any? ?? NSNull(),
+         "panelOnCurrentSpace": panelMembership?.onCurrentSpace as Any? ?? NSNull(),
+         "panelSpaceVerified": panelSpaceVerified,
+         "panelPlacementError": panelPlacementError as Any? ?? NSNull(),
          "trackingWindowId": target.map { Int($0.windowID) } ?? 0]
     }
 
@@ -545,48 +663,31 @@ final class SpacePreview {
         return nil
     }
 
-    /// Display hosting the given top-left-origin rect, expressed in the same coordinates.
-    private static func displayRect(containing rect: CGRect) -> CGRect {
-        let center = CGPoint(x: rect.midX, y: rect.midY)
-        for screen in NSScreen.screens {
-            let screenHeight = screen.frame.maxY
-            let topLeft = CGRect(x: screen.frame.minX, y: screenHeight - screen.frame.maxY,
-                                 width: screen.frame.width, height: screen.frame.height)
-            if topLeft.contains(center) { return topLeft }
-        }
-        let main = NSScreen.main?.frame ?? CGRect(x: 0, y: 0, width: 2560, height: 1440)
-        return CGRect(x: 0, y: 0, width: main.width, height: main.height)
-    }
-
-    private func hostWindowFrame() -> CGRect? {
+    private func resolveHostWindow() -> PreviewHostWindow? {
         let selfPID = getpid()
-        // Prefer the WorkBuddy window: the preview belongs at its top-right corner and must
-        // stay on the desktop WorkBuddy lives on, not follow the user around.
-        var hostPIDs: [pid_t] = []
-        for app in NSRunningApplication.runningApplications(withBundleIdentifier: "com.tencent.workbuddy.mac") {
-            hostPIDs.append(app.processIdentifier)
-        }
-        let pid = NativePlatform.responsiblePID(selfPID)
-        if let pid, pid != selfPID { hostPIDs.append(pid) }
-        guard !hostPIDs.isEmpty else {
-            hostWindowID = nil
-            return nil
-        }
+        let workBuddyPIDs = Set(NSRunningApplication.runningApplications(withBundleIdentifier: "com.tencent.workbuddy.mac")
+            .map(\.processIdentifier))
+        let responsible = NativePlatform.responsiblePID(selfPID)
         let list = CGWindowListCopyWindowInfo([.optionAll, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] ?? []
-        var best: (area: CGFloat, rect: CGRect, id: UInt32)?
-        for entry in list {
+        let candidates: [PreviewHostWindow] = list.compactMap { entry in
             guard let owner = entry[kCGWindowOwnerPID as String] as? Int32, owner != selfPID,
-                  hostPIDs.contains(owner),
-                  (entry[kCGWindowIsOnscreen as String] as? Bool) == true,
+                  workBuddyPIDs.contains(owner) || (workBuddyPIDs.isEmpty && owner == responsible),
+                  (entry[kCGWindowLayer as String] as? Int) == 0,
+                  let id = entry[kCGWindowNumber as String] as? UInt32,
                   let boundsDict = entry[kCGWindowBounds as String] as? [String: Any],
                   let rect = CGRect(dictionaryRepresentation: boundsDict as CFDictionary),
-                  rect.width > 300, rect.height > 200 else { continue }
-            let area = rect.width * rect.height
-            let id = entry[kCGWindowNumber as String] as? UInt32
-            if best == nil || area > best!.area { best = (area, rect, id ?? 0) }
+                  rect.width > 300, rect.height > 200 else { return nil }
+            return PreviewHostWindow(windowID: id, pid: owner, bounds: rect,
+                isOnScreen: (entry[kCGWindowIsOnscreen as String] as? Bool) == true)
         }
-        hostWindowID = best?.id
-        return best?.rect
+        let selected = PreviewHostWindow.select(candidates, workBuddyPIDs: workBuddyPIDs,
+            responsiblePID: responsible, previous: hostWindow)
+        if selected?.windowID != hostWindow?.windowID || selected?.pid != hostWindow?.pid {
+            lastHostBounds = nil
+            userMoved = false
+        }
+        hostWindow = selected
+        return selected
     }
 
 }
