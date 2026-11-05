@@ -36,6 +36,8 @@ enum WindowGeometry {
 
     /// CG must stay unchanged during the read. Integral point rectangles absorb frame representation rounding.
     static func validate(before: WindowBounds, after: WindowBounds, accessibility: WindowBounds?) throws {
+        OperationTrace.current?.mark("geometry.frames", fields: [
+            "cgBefore": before.json, "cgAfter": after.json, "axBounds": accessibility?.json ?? .null])
         guard before == after else {
             throw NativeFailure(code: "WINDOW_CHANGED", message: "Window moved or resized while checking geometry; read fresh state")
         }

@@ -74,13 +74,14 @@ func refusesInvalidRequestEnvelopes(_ source: String) {
     }
 }
 
-@Test func admitsPreviewLeaseWithoutGrantingInput() throws {
+@Test(arguments: ["application", "window", "desktop"])
+func admitsPreviewLeaseWithoutGrantingInput(_ source: String) throws {
     #expect(NativeProtocol.modelMethods.contains("preview"))
-    let hold = try RequestParameters(NativeRequest(data: Data(#"{"id":"p","method":"preview","params":{"action":"hold","appHandle":"app","windowId":7,"durationSeconds":900,"source":"desktop"}}"#.utf8)))
+    let hold = try RequestParameters(NativeRequest(data: Data("{\"id\":\"p\",\"method\":\"preview\",\"params\":{\"action\":\"hold\",\"appHandle\":\"app\",\"windowId\":7,\"durationSeconds\":900,\"source\":\"\(source)\"}}".utf8)))
     #expect(try hold.string("action") == "hold")
     #expect(try hold.windowID() == 7)
     #expect(try hold.number("durationSeconds") == 900)
-    #expect(try hold.string("source") == "desktop")
+    #expect(try hold.string("source") == source)
     // release/status carry no target: the task may end after the app quit.
     for action in ["release", "status"] {
         let params = try RequestParameters(NativeRequest(data: Data("{\"id\":\"p\",\"method\":\"preview\",\"params\":{\"action\":\"\(action)\"}}".utf8)))

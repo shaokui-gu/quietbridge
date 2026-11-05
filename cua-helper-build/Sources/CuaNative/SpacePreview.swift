@@ -5,6 +5,26 @@ import ScreenCaptureKit
 import AVFoundation
 import CoreMedia
 
+enum PreviewSource: String {
+    case window, application, desktop
+
+    var usesDisplay: Bool { self != .window }
+    var scope: String {
+        switch self {
+        case .window: "window"
+        case .application: "application_current_space"
+        case .desktop: "display_current_space"
+        }
+    }
+    var label: String {
+        switch self {
+        case .window: "窗口共享"
+        case .application: "应用共享"
+        case .desktop: "桌面共享"
+        }
+    }
+}
+
 private final class VideoSample: @unchecked Sendable {
     let buffer: CMSampleBuffer
     init(_ buffer: CMSampleBuffer) { self.buffer = buffer }
@@ -67,37 +87,39 @@ final class SpacePreview {
     private var holdDeadline: TimeInterval?
     private var holdSeconds: TimeInterval = SpacePreview.defaultHoldSeconds
     /// 桌面共享只捕获目标显示器当前可见的 Space，不捕获后台 Space。
-    private var desktopMode = false
+    private var source: PreviewSource = .window
     private var displayID: CGDirectDisplayID?
     /// 租约结束时通知守护进程重新判断是否该退出（没有客户端时才真正退出）。
     var onHoldEnded: (() -> Void)?
 
     /// 按任务跟踪目标；显式桌面共享不因目标位于当前 Space 而隐藏。
-    func track(pid: Int32, windowID: UInt32, desktop: Bool? = nil) {
+    func track(pid: Int32, windowID: UInt32, source: PreviewSource? = nil) {
         // 未知 Space 不等于异 Space；绑定前确认窗口归属和 host 当前可显示。
         guard NativePlatform.sessionLocked() == false, CGPreflightScreenCaptureAccess(),
               NativePlatform.windows().contains(where: { $0.windowID == windowID && $0.pid == pid }) else {
             stop()
             return
         }
-        // 普通动作只续租，不改变已经选定的共享范围（窗口 / 整桌面）。
-        let nextDesktop = desktop ?? desktopMode
+        // 普通动作只续租；目标改变时默认收窄到应用，不继承另一应用的桌面范围。
+        let sameTarget = target?.pid == pid && target?.windowID == windowID
+        let nextSource = source ?? (sameTarget ? self.source : .application)
         let bounds = Self.windowBounds(windowID)
         let nextDisplay = bounds.flatMap { Self.displayID(containing: CGPoint(x: $0.midX, y: $0.midY)) }
-        let changed = target?.pid != pid || target?.windowID != windowID || desktopMode != nextDesktop
-            || (nextDesktop && displayID != nextDisplay)
+        let changed = !sameTarget || self.source != nextSource
+            || (nextSource.usesDisplay && displayID != nextDisplay)
         if changed { teardown() }
         target = (pid, windowID)
-        desktopMode = nextDesktop
+        self.source = nextSource
         let now = ProcessInfo.processInfo.systemUptime
         lastActivity = now
         // 每个动作都续租，避免任务中途因为两次操作间隔而关掉共享面板。
         if holdDeadline != nil { holdDeadline = now + holdSeconds }
         displayID = nextDisplay
-        if desktopMode {
+        if self.source.usesDisplay {
             if let displayID, let screen = Self.displayBounds(displayID) { canvas = screen }
         } else if let bounds { canvas = bounds }
         start()
+        guard self.target != nil else { return }
         if changed || (stream == nil && !streamStarting) { beginStream(pid: pid, windowID: windowID) }
     }
 
@@ -227,16 +249,29 @@ final class SpacePreview {
             stop()
             return
         }
-        // 桌面流与画布始终使用同一显示器；窗口移动不改变已绑定的桌面范围。
-        if desktopMode {
-            if let displayID, let bounds = Self.displayBounds(displayID) { canvas = bounds }
-        } else if let bounds = Self.windowBounds(target.windowID) { canvas = bounds }
-        let hostOnScreen = hostWindowFrame() != nil
+        guard let targetBounds = Self.windowBounds(target.windowID) else {
+            stop()
+            return
+        }
+        // 窗口移到其他显示器后，流和画布一起跟随目标，避免继续共享旧桌面。
+        if source.usesDisplay,
+           Self.displayID(containing: CGPoint(x: targetBounds.midX, y: targetBounds.midY)) != displayID {
+            track(pid: target.pid, windowID: target.windowID, source: source)
+            return
+        }
         let membership = spaces.memberships(windowIDs: [target.windowID])[target.windowID]
+        if source == .desktop, membership?.onCurrentSpace != true {
+            stop()
+            return
+        }
+        if source.usesDisplay {
+            if let displayID, let bounds = Self.displayBounds(displayID) { canvas = bounds }
+        } else { canvas = targetBounds }
+        let hostOnScreen = hostWindowFrame() != nil
         let targetIsCurrent = membership?.onCurrentSpace == true
-        // 桌面共享始终显示；窗口共享保留仅异 Space 显示的原有行为。
+        // 应用和桌面共享始终显示；窗口共享保留仅异 Space 显示的原有行为。
         let leased = holdDeadline != nil
-        let shouldShow = (hostOnScreen || leased) && (desktopMode || membership?.onCurrentSpace == false)
+        let shouldShow = (hostOnScreen || leased) && (source.usesDisplay || membership?.onCurrentSpace == false)
         Self.debug("tick hostOnScreen=\(hostOnScreen) targetCurrent=\(targetIsCurrent) shouldShow=\(shouldShow) holding=\(isHolding)")
         if shouldShow && !visible {
             // Time spent hidden does not count toward the idle timeout.
@@ -271,9 +306,9 @@ final class SpacePreview {
         lastFrameTime = nil
         frameCount = 0
         let token = generation
-        let desktop = desktopMode
+        let source = self.source
         let wantedDisplay = displayID
-        view?.status = desktop ? "正在连接桌面共享…" : "正在连接窗口共享…"
+        view?.status = "正在连接\(source.label)…"
         Task { @MainActor in
             do {
                 let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: false)
@@ -284,16 +319,26 @@ final class SpacePreview {
                 let config = SCStreamConfiguration()
                 let filter: SCContentFilter
                 // 只共享精确显示器当前 Space，排除 helper 自有预览和浮层以免递归。
-                if desktop {
+                if source.usesDisplay {
                     guard let wantedDisplay,
                           let display = content.displays.first(where: { $0.displayID == wantedDisplay }) else {
                         throw NativeFailure(code: "SHARE_NOT_READY", message: "目标显示器不可用，未切换到其他显示器或窗口")
                     }
-                    let ownApplications = content.applications.filter { $0.processID == getpid() }
-                    guard !ownApplications.isEmpty else {
-                        throw NativeFailure(code: "SHARE_NOT_READY", message: "无法确认 helper 自有浮层排除范围，未启动可能递归的桌面流")
+                    if source == .application {
+                        guard let application = content.applications.first(where: { $0.processID == pid }), pid != getpid() else {
+                            throw NativeFailure(code: "SHARE_NOT_READY", message: "无法确认目标应用，未扩大共享范围")
+                        }
+                        filter = SCContentFilter(display: display, including: [application], exceptingWindows: [])
+                    } else {
+                        guard spaces.memberships(windowIDs: [windowID])[windowID]?.onCurrentSpace == true else {
+                            throw NativeFailure(code: "SHARE_NOT_READY", message: "目标不在显示器当前桌面，请先手动切换到目标桌面")
+                        }
+                        let ownApplications = content.applications.filter { $0.processID == getpid() }
+                        guard !ownApplications.isEmpty else {
+                            throw NativeFailure(code: "SHARE_NOT_READY", message: "无法确认 helper 自有浮层排除范围，未启动可能递归的桌面流")
+                        }
+                        filter = SCContentFilter(display: display, excludingApplications: ownApplications, exceptingWindows: [])
                     }
-                    filter = SCContentFilter(display: display, excludingApplications: ownApplications, exceptingWindows: [])
                     config.width = max(1, display.width)
                     config.height = max(1, display.height)
                 } else {
@@ -312,7 +357,7 @@ final class SpacePreview {
                         if view.video.isReadyForMoreMediaData { view.video.enqueue(sample.buffer) }
                         owner.frameCount += 1
                         owner.lastFrameTime = ProcessInfo.processInfo.systemUptime
-                        view.status = desktop ? "workbuddy-cua · 当前 Space" : "workbuddy-cua · 窗口共享"
+                        view.status = "workbuddy-cua · \(source.label)"
                     }
                 }, failed: { message in
                     Task { @MainActor in
@@ -419,7 +464,7 @@ final class SpacePreview {
     func diagnostics() -> [String: Any] {
         let membership = target.flatMap { spaces.memberships(windowIDs: [$0.windowID])[$0.windowID] }
         return ["videoFrames": frameCount, "visible": visible, "status": view?.status ?? "",
-         "scope": desktopMode ? "display_current_space" : "window",
+         "scope": source.scope,
          "targetOnCurrentSpace": membership?.onCurrentSpace as Any? ?? NSNull(),
          "streamStarting": streamStarting, "streamStarted": streamStarted, "streamReady": streamReady,
          "streamError": streamError as Any? ?? NSNull(),
@@ -428,7 +473,7 @@ final class SpacePreview {
          "videoLayerReady": view?.video.isReadyForMoreMediaData ?? false,
          "videoLayerFailed": view?.video.status == .failed,
          "holding": isHolding, "holdRemainingSeconds": holdRemainingSeconds ?? 0,
-         "mode": desktopMode ? "desktop" : "window",
+         "mode": source.rawValue,
          "displayId": displayID.map { Int($0) } ?? 0,
          "trackingWindowId": target.map { Int($0.windowID) } ?? 0]
     }

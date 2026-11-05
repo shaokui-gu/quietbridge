@@ -51,6 +51,16 @@ final class PIDEventPoster {
         } else {
             event.postToPid(pid)
         }
+        if [.mouseMoved, .leftMouseDown, .leftMouseUp, .rightMouseDown, .rightMouseUp,
+            .otherMouseDown, .otherMouseUp, .leftMouseDragged, .rightMouseDragged,
+            .otherMouseDragged, .scrollWheel].contains(event.type) {
+            OperationTrace.current?.mark("pointer.event.posted", fields: [
+                "eventType": .number(Double(event.type.rawValue)), "targetPid": .number(Double(pid)),
+                "eventLocation": .object(["x": .number(Double(event.location.x)), "y": .number(Double(event.location.y))]),
+                "clickState": .number(Double(event.getIntegerValueField(.mouseEventClickState))),
+                "deliveryRoute": .string(postToPID == nil ? "CGEventPostToPid" : "SLEventPostToPid"),
+                "receiptVerified": .bool(false)])
+        }
     }
 
     /// Set the destination window and local point before any part of its gesture is posted.
@@ -67,6 +77,10 @@ final class PIDEventPoster {
         for field in windowFields {
             setIntegerField(event, field, Int64(windowID))
         }
+        OperationTrace.current?.mark("pointer.event.stamped", fields: [
+            "targetPid": .number(Double(pid)), "windowId": .number(Double(windowID)),
+            "windowPoint": .object(["x": .number(point.x), "y": .number(point.y)]),
+            "eventLocation": .object(["x": .number(Double(event.location.x)), "y": .number(Double(event.location.y))])])
     }
 
     /// Write the event fields used by the window-directed pointer protocol.

@@ -13,7 +13,7 @@ class VisualStateTests(unittest.TestCase):
     def setUp(self):
         for patcher in (mock.patch.object(server, "TASK_FILE", "/nonexistent/visual-test-task.json"),
                         mock.patch.object(server, "TASK_BINDINGS", {}),
-                        mock.patch.object(server, "ensure_desktop", return_value=None),
+                        mock.patch.object(server, "ensure_share", return_value=None),
                         mock.patch.object(server, "READ_ONLY", False)):
             patcher.start()
             self.addCleanup(patcher.stop)
@@ -105,7 +105,7 @@ class WaitReadyTests(unittest.TestCase):
                         mock.patch.object(server, "TASK_DISPATCH", None),
                         mock.patch.object(server, "WAIT_DEADLINE", None),
                         mock.patch.object(server, "READ_ONLY", False),
-                        mock.patch.object(server, "ensure_desktop", return_value=None),
+                        mock.patch.object(server, "ensure_share", return_value=None),
                         mock.patch.object(server.time, "monotonic", side_effect=lambda: self.now),
                         mock.patch.object(server.threading.Event, "wait", side_effect=self.wait),
                         mock.patch.object(server.time, "sleep", side_effect=AssertionError("不得sleep")),

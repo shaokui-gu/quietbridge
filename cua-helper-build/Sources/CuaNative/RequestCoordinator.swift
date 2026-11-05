@@ -72,6 +72,10 @@ import Darwin
         active = token
         let parsed = try? NativeRequest(data: data)
         activeRequestID = parsed?.id
+        let operationTrace = parsed.flatMap { request in
+            OperationTrace.methods.contains(request.method) ? OperationTrace(requestID: request.id, method: request.method) : nil
+        }
+        if let parsed { operationTrace?.mark("native.received", fields: OperationTrace.requestFields(parsed.params)) }
         let control = NativeRequestControl()
         requestControl = control
         let trace: ScreenshotTrace?
@@ -104,21 +108,32 @@ import Darwin
                 if request.method == "screenshot" { try self.capture.requireAvailable() }
                 let result = try await self.scheduler.perform(cancellation: self.cancellation) {
                     control.startOperation()
-                    return try await self.execute(request, trace: trace)
+                    return try await OperationTrace.$current.withValue(operationTrace) {
+                        operationTrace?.mark("native.started")
+                        return try await self.execute(request, trace: trace)
+                    }
                 }
                 if let failure = control.failure { throw failure }
+                var diagnosticResult: [String: JSONValue] = [:]
+                for key in ["dispatched", "verified", "route", "axAction", "pointer"] where result[key] != .null {
+                    diagnosticResult[key] = result[key]
+                }
+                operationTrace?.mark("native.completed", fields: diagnosticResult)
                 response = .object(["id": requestID, "result": result])
             } catch let error as NativeFailure {
                 let failure = control.failure ?? error
+                operationTrace?.mark("native.failed", fields: ["errorCode": .string(failure.code)])
                 trace?.mark("helper.failed", errorCode: failure.code)
                 response = .object(["id": requestID, "error": .object(["code": .string(failure.code), "message": .string(failure.message)])])
             } catch {
                 let failure = control.failure ?? NativeFailure(code: requestID == .null ? "INVALID_REQUEST" : "NATIVE_ERROR", message: error.localizedDescription)
+                operationTrace?.mark("native.failed", fields: ["errorCode": .string(failure.code)])
                 trace?.mark("helper.failed", errorCode: failure.code)
                 response = .object(["id": requestID, "error": .object([
                     "code": .string(failure.code), "message": .string(failure.message)])])
             }
             control.finishOperation()
+            operationTrace?.flush()
             guard !self.stopping, self.active == token else { return }
             self.replying = true
             do { try await self.writer.write(response, trace: trace) }
@@ -258,18 +273,17 @@ import Darwin
             guard NativePlatform.sessionLocked() == false, CGPreflightScreenCaptureAccess() else {
                 throw NativeFailure(code: "SHARE_NOT_READY", message: "共享需要已授权屏幕录制且会话处于解锁状态")
             }
-            let source = params.contains("source") ? try params.string("source") : "window"
-            guard source == "desktop" || source == "window" else {
-                throw RequestParameters.invalid("source 必须为 desktop 或 window")
+            let rawSource = params.contains("source") ? try params.string("source") : "application"
+            guard let source = PreviewSource(rawValue: rawSource) else {
+                throw RequestParameters.invalid("source 必须为 application、desktop 或 window")
             }
-            let desktop = source == "desktop"
-            SpacePreview.shared.track(pid: target.pid, windowID: target.windowID, desktop: desktop)
+            SpacePreview.shared.track(pid: target.pid, windowID: target.windowID, source: source)
             let granted = SpacePreview.shared.hold(seconds: seconds)
             try await SpacePreview.shared.waitUntilReady { try cancellation.check() }
             return .object(["action": .string("hold"),
                             "windowId": .number(Double(target.windowID)),
                             "pid": .number(Double(target.pid)),
-                            "source": .string(desktop ? "desktop" : "window"),
+                            "source": .string(source.rawValue),
                             "durationSeconds": .number(granted),
                             "preview": previewDiagnostics()])
         case "release":

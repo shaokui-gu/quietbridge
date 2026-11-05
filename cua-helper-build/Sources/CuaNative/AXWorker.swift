@@ -185,7 +185,12 @@ actor AXWorker {
     }
     private func observedCoordinateWindow(_ handle: String, _ identity: ProcessIdentity, _ windowID: UInt32) throws -> WindowInfo {
         let window = try coordinateWindow(identity, windowID)
-        try WindowGeometry.validateObservedSize(observed: observedWindowBounds[handle]?[windowID], current: window.bounds)
+        let observed = observedWindowBounds[handle]?[windowID]
+        OperationTrace.current?.mark("geometry.observation", fields: [
+            "windowId": .number(Double(windowID)), "observedBounds": observed?.json ?? .null,
+            "currentBounds": window.bounds.json,
+            "originChanged": observed.map { .bool($0.x != window.bounds.x || $0.y != window.bounds.y) } ?? .null])
+        try WindowGeometry.validateObservedSize(observed: observed, current: window.bounds)
         return window
     }
     static func actionKey(_ value: String) -> String {
@@ -396,7 +401,12 @@ actor AXWorker {
                 hoverElement = selected
                 // 必须携带目标窗口，浮层才能归属其真实 Space；未知时隐藏。
                 let ownerWindow = try? ax().enclosingWindow(selected, owner: identity)
-                if let frame = try? ax().bounds(selected), frame.width > 0, frame.height > 0 {
+                let elementBounds = try? ax().bounds(selected)
+                OperationTrace.current?.mark("pointer.element", fields: [
+                    "elementBounds": elementBounds?.json ?? .null,
+                    "windowBounds": ownerWindow?.bounds.json ?? .null,
+                    "windowId": ownerWindow.map { .number(Double($0.windowID)) } ?? .null])
+                if let frame = elementBounds, frame.width > 0, frame.height > 0 {
                     AgentCursor.shared.move(to: CGPoint(x: frame.x + frame.width / 2, y: frame.y + frame.height / 2),
                                             pulse: method == "click", windowID: ownerWindow?.windowID)
                 }
@@ -412,20 +422,25 @@ actor AXWorker {
                             Task { @MainActor in SpacePreview.shared.track(pid: previewPID, windowID: previewWindow) }
                         }
                         let frontBefore = NativePlatform.frontPID()
+                        OperationTrace.current?.mark("pointer.axAction.begin", fields: ["axAction": .string(action)])
                         try ax().perform(selected, action)
                         let frontAfterAction = NativePlatform.frontPID()
-                        var restorationAttempted = false
-                        var restorationAccepted: Bool?
-                        // Preserve the existing behavior while reporting it honestly. Restoring
-                        // an app after an action is not proof that focus was never interrupted.
-                        if let frontBefore, frontAfterAction != frontBefore,
-                           let app = NSRunningApplication(processIdentifier: frontBefore) {
-                            restorationAttempted = true
-                            restorationAccepted = app.activate(options: [])
-                        }
-                        return .result(Self.clickResult(route: "accessibility", action: action,
+                        // Application activation can surface a different window; focus changes
+                        // are reported rather than automatically activating an unrelated window.
+                        OperationTrace.current?.mark("pointer.focus", fields: [
+                            "frontPidBefore": frontBefore.map { .number(Double($0)) } ?? .null,
+                            "frontPidAfterAction": frontAfterAction.map { .number(Double($0)) } ?? .null,
+                            "focusRestorationAttempted": .bool(false)])
+                        var result = Self.clickResult(route: "accessibility", action: action,
                             frontBefore: frontBefore, frontAfterAction: frontAfterAction,
-                            restorationAttempted: restorationAttempted, restorationAccepted: restorationAccepted))
+                            restorationAttempted: false, restorationAccepted: nil).object ?? [:]
+                        if let win = ownerWindow, let frame = elementBounds {
+                            result["pointer"] = OperationTrace.geometry(
+                                route: WindowRoute(owner: identity, windowID: win.windowID, bounds: win.bounds),
+                                point: WindowPoint(x: frame.x + frame.width / 2 - win.bounds.x,
+                                                   y: frame.y + frame.height / 2 - win.bounds.y))
+                        }
+                        return .result(.object(result))
                     }
                     try ax().requireEnabled(selected)
                 }
@@ -439,6 +454,12 @@ actor AXWorker {
                 point = try params.point()
             }
             let route = WindowRoute(owner: identity, windowID: window.windowID, bounds: window.bounds)
+            let pointer = OperationTrace.geometry(route: route, point: point)
+            OperationTrace.current?.mark("pointer.resolved", fields: [
+                "pointer": pointer, "isOnScreen": .bool(window.isOnScreen),
+                "display": OperationTrace.display(at: CGPoint(x: window.bounds.x + point.x, y: window.bounds.y + point.y)),
+                "targetOnCurrentSpace": window.onCurrentSpace.map(JSONValue.bool) ?? .null,
+                "frontPid": NativePlatform.frontPID().map { .number(Double($0)) } ?? .null])
             let previewPID = identity.pid, previewWindow = window.windowID
             Task { @MainActor in SpacePreview.shared.track(pid: previewPID, windowID: previewWindow) }
             if method == "hover" {
@@ -458,8 +479,10 @@ actor AXWorker {
             }
             let frontBefore = NativePlatform.frontPID()
             try await inputs().1.click(in: route, at: point, button: button, count: count, modifiers: modifiers, holdMs: holdMs)
-            return .result(Self.clickResult(route: "window-pointer", frontBefore: frontBefore,
-                                             frontAfterAction: NativePlatform.frontPID()))
+            var result = Self.clickResult(route: "window-pointer", frontBefore: frontBefore,
+                                         frontAfterAction: NativePlatform.frontPID()).object ?? [:]
+            result["pointer"] = pointer
+            return .result(.object(result))
         case "scroll", "drag":
             let id = try params.windowID()
             try coordinateSnapshot(handle, params, id)
@@ -586,6 +609,11 @@ actor AXWorker {
         trace?.mark("geometry.after.end")
         guard after.bounds == target.window.bounds else { throw NativeFailure(code: "WINDOW_CHANGED", message: "Window moved or resized during capture; observe again") }
         observedWindowBounds[target.appHandle, default: [:]][after.windowID] = after.bounds
+        OperationTrace.current?.mark("capture.geometry", fields: [
+            "windowId": .number(Double(after.windowID)), "bounds": after.bounds.json,
+            "pixelWidth": .number(Double(image.width)), "pixelHeight": .number(Double(image.height)),
+            "pixelsPerPointX": .number(Double(image.width) / after.bounds.width),
+            "pixelsPerPointY": .number(Double(image.height) / after.bounds.height)])
         trace?.mark("base64.begin")
         let encoded = image.bytes.base64EncodedString()
         trace?.mark("base64.end")

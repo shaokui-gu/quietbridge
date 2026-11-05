@@ -85,6 +85,9 @@ def extension_step(root, home, apply=False, launch=False):
     directory = root / 'browser-observer-extension'
     if not (directory / 'manifest.json').is_file():
         raise ValueError('缺少浏览器扩展目录：' + str(directory))
+    # 必须早于 import：模块内再禁用已来不及阻止本模块的缓存写入。
+    # Chrome 不允许扩展目录中出现 __pycache__。
+    sys.dont_write_bytecode = True
     if str(directory) not in sys.path:
         sys.path.insert(0, str(directory))
     import install_native_host as host

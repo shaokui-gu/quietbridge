@@ -39,6 +39,7 @@ class TaskWindowTests(unittest.TestCase):
                         mock.patch.object(server, "SHOTS_DIR", str(self.shots)),
                         mock.patch.object(server, "TASK_BINDINGS", {}),
                         mock.patch.object(server, "TASK_DISPATCH", None),
+                        mock.patch.object(server, "SHARE_SELECTION", None),
                         mock.patch.object(server, "POWER_GUARD", {"active": False, "nextRenewAt": 0.0}),
                         mock.patch.object(server, "STATE", self.state),
                         mock.patch.object(server, "READ_ONLY", False),
@@ -65,7 +66,7 @@ class TaskWindowTests(unittest.TestCase):
                     "durationSeconds": params.get("durationSeconds"),
                     "preview": {"holding": params.get("action") == "hold", "visible": False,
                                 "streamReady": params.get("action") == "hold", "mode": params.get("source"),
-                                "trackingWindowId": params.get("windowId")}}
+                                "trackingWindowId": params.get("windowId"), "targetOnCurrentSpace": True}}
         if method == "powerGuard":
             return {"action": params.get("action"),
                     "guard": {"holding": params.get("action") == "hold",
@@ -315,7 +316,7 @@ class TaskWindowTests(unittest.TestCase):
         self.assertFalse(result.get("isError"), result)
         self.assertFalse(self.path.exists())
 
-    def test_desktop_shared_before_coordinate_and_ax_inputs(self):
+    def test_application_shared_before_coordinate_and_ax_inputs(self):
         self.bind()
         self.state.update(snapshot="snap-1", snapshot_app="a", snapshot_window=7)
         for name, args in (("cua_click", {"windowId": 7, "x": 1, "y": 2}),
@@ -329,12 +330,12 @@ class TaskWindowTests(unittest.TestCase):
             input_index = next(i for i, c in enumerate(calls) if c.args[0] in server.INPUT_METHODS)
             self.assertLess(preview, input_index)
             self.assertEqual(calls[preview].args[1], {"action": "hold", "appHandle": "a", "windowId": 7,
-                                                     "source": "desktop", "durationSeconds": 600})
+                                                     "source": "application", "durationSeconds": 600})
             structured = result["structuredContent"]
             self.assertEqual(structured["execution"]["status"], "dispatched")
             self.assertNotIn("private", json.dumps(structured))
 
-    def test_unready_desktop_never_dispatches_input(self):
+    def test_unready_application_never_dispatches_input(self):
         self.bind()
         original = self.request
         for field, value in (("streamReady", False), ("mode", "window"), ("trackingWindowId", 8)):
@@ -396,18 +397,37 @@ class TaskWindowTests(unittest.TestCase):
             result = self.rpc("cua_state", windowId=7)
             self.assertEqual(result["structuredContent"]["errorCode"], "SHARE_REQUIRED")
 
-    def test_create_target_bound_shares_before_original_handler(self):
+    def test_create_target_bound_refuses_before_share_or_handler(self):
         bound = self.bind()
         self.fake.request.reset_mock()
-        def handler(args):
-            self.assertTrue(any(c.args[0] == "preview" and c.args[1].get("source") == "desktop"
-                                and c.args[1].get("windowId") == 7 for c in self.fake.request.call_args_list))
-            self.assertEqual(args, {"action": "create_target", "taskId": bound["taskId"]})
-            return '{"status":"queued"}'
-        with mock.patch.object(server, "_events_handler", side_effect=handler) as original:
+        with mock.patch.object(server, "_events_handler") as original:
             result = self.rpc(server._events_tool["name"], action="create_target", taskId=bound["taskId"])
-            self.assertFalse(result.get("isError"), result)
-            original.assert_called_once()
+            self.assertEqual(result['structuredContent']['errorCode'], 'TARGET_ALREADY_BOUND')
+            original.assert_not_called()
+            self.assertFalse(any(c.args[0] == 'preview' for c in self.fake.request.call_args_list))
+
+    def test_listing_preserves_selection_even_when_another_window_is_first(self):
+        self.state['window']['a'] = 8
+        result = self.rpc('cua_windows', action='list', appHandle='a')
+        self.assertFalse(result.get('isError'), result)
+        self.assertEqual(self.state['window']['a'], 8)
+
+    def test_resolve_window_keeps_cached_target_or_stops_when_lost(self):
+        self.state['window']['a'] = 8
+        self.assertEqual(server.resolve_window('a'), 8)
+        self.windows = [self.windows[0]]
+        with self.assertRaises(server.HelperError) as caught:
+            server.resolve_window('a')
+        self.assertEqual(caught.exception.code, 'TARGET_LOST')
+        self.assertEqual(self.state['window']['a'], 8)
+
+    def test_resolve_window_requires_explicit_selection_for_multiple_windows(self):
+        with self.assertRaises(server.HelperError) as caught:
+            server.resolve_window('a')
+        self.assertEqual(caught.exception.code, 'TARGET_REQUIRED')
+        self.assertEqual(self.state['window'], {})
+        self.windows = [self.windows[1]]
+        self.assertEqual(server.resolve_window('a'), 8)
 
     def test_create_target_reports_missing_share_target_without_handler(self):
         awaiting = self.payload(action="begin")
@@ -456,7 +476,7 @@ class TaskWindowTests(unittest.TestCase):
         previews = [c.args for c in self.fake.request.call_args_list if c.args[0] == "preview"]
         self.assertEqual(previews[-1], ("preview", {"action": "hold", "appHandle": "a",
                                                    "windowId": 7, "durationSeconds": 900,
-                                                   "source": "window"}))
+                                                   "source": "application"}))
         released = self.rpc("cua_windows", action="unshare", appHandle="a")
         self.assertFalse(released.get("isError"), self.text(released))
         previews = [c.args for c in self.fake.request.call_args_list if c.args[0] == "preview"]
@@ -470,6 +490,73 @@ class TaskWindowTests(unittest.TestCase):
         sent = [c.args for c in self.fake.request.call_args_list if c.args[0] == "preview"][-1][1]
         self.assertEqual(sent["source"], "desktop")
         self.error("INVALID_ARGUMENT", "cua_windows", action="share", appHandle="a", windowId=7, source="screen")
+
+    def test_explicit_scope_survives_observation_and_input(self):
+        self.bind()
+        for source in ("desktop", "application", "window"):
+            self.rpc("cua_windows", action="share", appHandle="a", windowId=7, source=source)
+            for name, args in (("cua_state", {}), ("cua_click", {"x": 1, "y": 2})):
+                self.fake.request.reset_mock()
+                result = self.rpc(name, windowId=7, **args)
+                self.assertFalse(result.get("isError"), result)
+                previews = [c.args[1] for c in self.fake.request.call_args_list if c.args[0] == "preview"]
+                self.assertEqual(previews[-1]["source"], source)
+                self.assertEqual(result["structuredContent"]["share"]["source"], source)
+
+    def test_unshare_and_new_task_reset_to_application(self):
+        self.bind()
+        self.rpc("cua_windows", action="share", windowId=7, source="desktop")
+        self.rpc("cua_windows", action="unshare")
+        result = self.rpc("cua_state", windowId=7)
+        self.assertEqual(result["structuredContent"]["share"]["source"], "application")
+        self.rpc("cua_windows", action="share", windowId=7, source="desktop")
+        self.bind()
+        result = self.rpc("cua_state", windowId=7)
+        self.assertEqual(result["structuredContent"]["share"]["source"], "application")
+
+    def test_desktop_scope_is_not_inherited_by_other_targets_or_connections(self):
+        server.ensure_share("a", 7, source="desktop")
+        server.ensure_share("a", 8)
+        self.assertEqual(server.SHARE_RECORD["source"], "application")
+        server.ensure_share("a", 7, source="desktop")
+        server.ensure_share("b", 7)
+        self.assertEqual(server.SHARE_RECORD["source"], "application")
+        server.ensure_share("a", 7, source="desktop")
+        self.fake.connection_id = "connection-2"
+        server.ensure_share("a", 7)
+        self.assertEqual(server.SHARE_RECORD["source"], "application")
+
+    def test_desktop_missing_target_never_downgrades_to_window_or_dispatches_input(self):
+        self.bind()
+        self.rpc("cua_windows", action="share", windowId=7, source="desktop")
+        original = self.request
+        for membership in (False, None):
+            def request(method, params=None, **kwargs):
+                result = original(method, params, **kwargs)
+                if method == "preview":
+                    result["preview"]["targetOnCurrentSpace"] = membership
+                return result
+            self.fake.request.side_effect = request
+            self.fake.request.reset_mock()
+            self.error("PREVIEW_NOT_READY", "cua_click", windowId=7, x=1, y=2)
+            self.assertEqual(server.SHARE_SELECTION["source"], "desktop")
+            calls = self.fake.request.call_args_list
+            self.assertFalse(any(c.args[0] in server.INPUT_METHODS for c in calls))
+            self.assertFalse(any(c.args[0] == "preview" and c.args[1].get("source") == "window" for c in calls))
+
+    def test_failed_scope_change_does_not_reuse_previous_desktop_selection(self):
+        server.ensure_share("a", 7, source="desktop")
+        with mock.patch.object(server, "request_share", side_effect=server.HelperError("PREVIEW_NOT_READY", "fixture")):
+            with self.assertRaises(server.HelperError):
+                server.ensure_share("a", 7, source="application")
+        self.assertEqual(server.SHARE_SELECTION["source"], "application")
+
+    def test_share_schema_describes_application_default_and_desktop_for_cross_app(self):
+        tool = server.TOOL_MAP["cua_windows"]
+        source = tool["inputSchema"]["properties"]["source"]
+        self.assertEqual(source["default"], "application")
+        self.assertEqual(set(source["enum"]), {"application", "desktop", "window"})
+        self.assertIn("跨应用", tool["description"])
 
     def test_share_never_retargets_the_bound_window_or_accepts_a_bad_lease(self):
         self.bind()
@@ -495,15 +582,15 @@ class TaskWindowTests(unittest.TestCase):
 
     def test_share_falls_back_to_target_window_on_background_space(self):
         calls = []
-        def request_share(app, window, source):
+        def request_share(app, window, source, duration):
             calls.append(source)
             return ('connection-1', {'streamReady': True, 'mode': source, 'trackingWindowId': window,
-                                     'scope': 'display_current_space' if source == 'desktop' else 'window',
-                                     'targetOnCurrentSpace': False if source == 'desktop' else None})
+                                     'scope': 'application_current_space' if source == 'application' else 'window',
+                                     'targetOnCurrentSpace': False if source == 'application' else None})
         with mock.patch.object(server, 'request_share', side_effect=request_share), \
                 mock.patch.object(server, 'CALL_RECORDS', []), mock.patch.object(server, 'TASK_DISPATCH', None):
-            server.ensure_desktop('a', 7)
-            self.assertEqual(calls, ['desktop', 'window'])
+            server.ensure_share('a', 7)
+            self.assertEqual(calls, ['application', 'window'])
             self.assertEqual(server.SHARE_RECORD['source'], 'window')
             self.assertIn('background_space', server.SHARE_RECORD['reason'])
 
@@ -617,7 +704,7 @@ class TaskWindowTests(unittest.TestCase):
         self.assertEqual([c.kwargs["timeout"] for c in self.fake.request.call_args_list], [5, 4, 3, 3, 2])
         shares = [c for c in self.fake.request.call_args_list if c.args[0] == "preview"]
         self.assertEqual(len(shares), 1)
-        self.assertEqual(shares[0].args[1]["source"], "desktop")
+        self.assertEqual(shares[0].args[1]["source"], "application")
         self.assertEqual(waits, [1])
         self.assertTrue(all(c.kwargs["retry_safe"] is False for c in self.fake.request.call_args_list))
         self.assertIsNone(server.TASK_DISPATCH)

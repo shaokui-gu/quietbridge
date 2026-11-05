@@ -10,6 +10,34 @@ WorkBuddy ⇄ MCP(stdio/JSON-RPC) ⇄ server.py ⇄ workbuddy-cua-native ⇄ 共
 辅助程序本身只讲私有 JSON-lines 协议（`protocol.schema.json`），WorkBuddy 只认 MCP，
 这一层就是两者之间的单向翻译 + 体积裁剪，Swift 侧零改动。
 
+## 共享范围
+
+应用内的观察、截图及输入默认使用 `application`，通过 ScreenCaptureKit 只共享目标应用在目标显示器上的窗口，不包含其他应用。共享面板会标注“应用共享”。
+
+任务涉及跨应用、Dock 或系统界面时，先调用 `cua_windows(action="share", appHandle=..., windowId=..., source="desktop")`，共享目标窗口所在显示器的当前桌面。后续观察及输入会保留所选范围；仅需要指定窗口时仍可显式使用 `source="window"`。
+
+范围只跟随同一连接及同一应用窗口，结束共享、新任务、更换目标或重连后恢复应用共享。目标位于后台 Space 时，应用共享会明确降为目标窗口预览；桌面共享不会降为窗口冒充成功，需要手动切换到目标桌面后重试。
+
+## 固定浏览器目标与后台操作
+
+列出窗口只返回列表，不改变已选目标。缓存目标关闭时返回 `TARGET_LOST`；没有目标且存在多个窗口时返回 `TARGET_REQUIRED`，需要显式选择。已绑定任务仍校验原窗口、进程身份与连接，不会按当前焦点或窗口排序换目标。
+
+Chrome 页面操作优先使用已授权扩展，保持同一任务、浏览器窗口 ID 和标签 ID：先 `cua_browser_events(action="candidates", taskId=...)`，等待扩展刷新后再次查询，用返回的 `browserWindowId/tabId` 调用 `assign`，随后执行 `command(operation="snapshot")` 并查询 `result`。点击使用该快照中的 `ref`；每次动作后再读取快照确认页面变化。`nativeConnection=connected` 仅证明宿主可达，`paired=false` 表示尚未完成标签分配，不应改用重复开窗恢复。
+
+`create_target` 只供等待窗口、尚未绑定的活动任务显式创建专用窗口，采用 `focused=false`。同一任务重复申请会返回原请求或已创建窗口；超时不会生成新请求。扩展把创建标识及结果存入会话存储，worker 重启后只恢复已知结果，结果未知则停止重放。已绑定任务返回 `TARGET_ALREADY_BOUND`，继续使用既有标签。
+
+AX 点击后不再为了恢复前台而激活另一个应用；日志记录动作前后的前台 PID。AX 动作本身仍可能改变焦点，不能据此保证原生操作完全不干扰用户。用户同时操作电脑时应走扩展的固定标签通道；扩展未绑定、权限不足或返回窗口投递错误时报告阻塞，不通过反复切换前台或新建窗口继续。
+
+## 操作诊断日志
+
+界面观察和鼠标操作默认写入 JSONL 日志。普通安装位置为 `~/Library/Logs/workbuddy-cua/bridge-operations.jsonl` 与同目录的 `native-operations.jsonl`；设置 `CUA_CONFIG_DIR` 时位于该目录的 `logs/`。可以用 `CUA_DIAGNOSTICS_DIR` 指定目录，或以 `CUA_OPERATION_LOG=0` 关闭。环境变量需要传给桥接和 helper；更改后重新连接。
+
+每次工具调用返回 `structuredContent.diagnostics`，包含 `toolTraceId` 和日志路径。桥接的 `nativeRequestId` 对应原生日志的 `requestId`，可串起请求发送、几何校验、事件创建/投递、结束或错误。点击结果中的 `pointer` 包含窗口边界、窗口内坐标与最终屏幕坐标。原生日志还会记录 CG/AX 边界差异、观察后窗口移动、显示器位置以及实际投递路线。
+
+坐标点击的 `x/y` 始终是**窗口左上角起算的 macOS point**。截图的 `pixelWidth/pixelHeight` 是像素，日志中的 `pixelsPerPointX/Y` 给出比例：窗口内截图像素位置应分别除以该比例，再作为点击坐标；整个桌面的截图坐标还需减去窗口原点。共享预览面板的显示尺寸也不等于点击坐标尺寸。
+
+`pointer.event.posted` 只说明事件已投递，不证明应用收到或界面发生变化；`verified=false` 会保留。日志不自动重放输入，不记录输入文本、按键内容、页面/窗口标题、AX 正文或截图数据。原生文件写入使用独立队列，避免磁盘写入插入按下与抬起之间。每个文件最多 5 MiB，保留一份轮转文件 `.1`，新建文件权限为 `0600`。
+
 ## 注册
 
 已写入 `~/.workbuddy/mcp.json`：
@@ -54,7 +82,7 @@ WorkBuddy ⇄ MCP(stdio/JSON-RPC) ⇄ server.py ⇄ workbuddy-cua-native ⇄ 共
 1. **坐标系**：`cua_state` 树里的 bounds 是**屏幕坐标**；`cua_click/scroll/drag` 的 `x/y` 是**窗口左上角起算的 point**（含标题栏）。换算：`窗口坐标 = 屏幕坐标 - 截图 bounds.x/y`。Retina 下 PNG 像素是 point 的 2 倍，别把像素当 point。
 2. **快照失效**：每次 `getState` 会升代次，旧 `snapshotId` 再用就是 `STALE_SNAPSHOT`；元素操作必须用同一轮观察拿到的快照。
 3. **不自动重试**：输入类请求失败可能已部分生效，桥接层对输入**永不重放**（只对 `listApps`/`getState`/`screenshot` 这类幂等读取重启重试一次）。
-4. **前台约束**：被遮挡或非前台窗口会返回 `FOREGROUND_REQUIRED`，先 `cua_windows(action="activate")`。
+4. **前台约束**：原生路径的窗口投递错误不能证明可安全点击；需要前台时才显式请求激活。用户同时使用电脑的 Chrome 页面操作优先走已绑定扩展。
 
 ## 任务隐私保护层
 
@@ -92,7 +120,7 @@ cua-auth-plugin/
 ## 已知退化路径
 
 - **自绘界面**（游戏、Unity、canvas、部分 Electron 控件）：AX 树为空，`cua_state` 会明确提示，只能截图 + 坐标点击。
-- **浏览器**：`getCapabilities.browser=false`，没有 DOM/JS 通道，网页操作只能走 AX/坐标，比 Playwright 脆弱。
+- **浏览器**：原生 helper 的 `getCapabilities.browser=false` 不包含独立扩展能力。DOM 操作需要 Chrome 扩展启用、站点授权、宿主连接和显式标签分配均就绪；否则原生 AX/坐标不能充当无干扰的后台网页控制。
 - **敏感场景**：常规桌面工具不能操作安全输入框、TCC 系统弹窗或真实系统锁屏（`sessionLocked=true`）。上述可选自动解锁使用独立、受票据约束的登录界面 AX 流程，任务隐私层不存储密码。
 - **截图体积**：2116×1394 约 375 KB base64，连续截图会显著吃上下文，按需再截。
 

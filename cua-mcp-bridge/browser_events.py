@@ -376,12 +376,18 @@ def sync_peer(message, origin, task_file, event_file):
             created = message['created']
             require(type(created) is dict and set(created) == CREATED_FIELDS, '创建结果字段错误')
             request = peer.get('createRequest')
-            require(type(request) is dict and created['requestId'] == request.get('requestId'),
-                    '未被请求的窗口创建结果')
             require(type(created['requestId']) is str and re.fullmatch('[0-9a-f]{32}', created['requestId']),
                     '创建请求标识错误')
             require(valid_int(created['browserWindowId']) and valid_int(created['tabId']), '创建结果身份错误')
             task_id_now, task_now = active_task(task_file)
+            # 已接受的完全相同回传可再次确认，覆盖 worker 重启/确认响应丢失。
+            accepted = next((t for t in peer.get('createdTargets', [])
+                             if t.get('taskId') == task_id_now and
+                             all(t.get(k) == created[k] for k in CREATED_FIELDS)), None)
+            if accepted and request is None:
+                request = {'taskId': task_id_now, 'requestId': created['requestId']}
+            require(type(request) is dict and created['requestId'] == request.get('requestId'),
+                    '未被请求的窗口创建结果')
             require(task_now is not None and task_now.get('state') in ('awaiting_window', 'bound') and
                     request.get('taskId') == task_id_now, '创建请求已失效')
             peer['createdTargets'] = ([{
@@ -482,7 +488,7 @@ def internal_action(args, task_file=TASK_FILE, event_file=EVENT_FILE):
     action = args.get('action')
     require(action in ('candidates', 'assign', 'create_target', 'command', 'result', 'cancel',
                        'annotate', 'annotations', 'verify_mapping'), '内部操作错误')
-    expected = ({'action'} if action == 'candidates' else
+    expected = ({'action'} | ({'taskId'} if 'taskId' in args else set()) if action == 'candidates' else
                 {'action', 'taskId'} if action in ('create_target', 'annotations') else
                 {'action', 'taskId', 'windows'} if action == 'verify_mapping' else
                 {'action', 'taskId', 'ref', 'note'} if action == 'annotate' else
@@ -493,7 +499,10 @@ def internal_action(args, task_file=TASK_FILE, event_file=EVENT_FILE):
         expected = expected | {key for key in ACTION_FIELDS if key in args}
     if action == 'create_target' and 'url' in args:
         expected = expected | {'url'}
-    require(set(args) == expected, '内部操作字段错误')
+    missing, unexpected = expected - set(args), set(args) - expected
+    require(not missing and not unexpected,
+            '内部操作字段错误：缺少 [%s]；多余 [%s]' %
+            (', '.join(sorted(missing)), ', '.join(sorted(unexpected))))
     with event_store(event_file) as data:
         peer = data.get('peer', {})
         # 单活动任务模型：其他任务的浏览器分配一律淘汰（assign 可能早于下一次 sync）。
@@ -502,6 +511,9 @@ def internal_action(args, task_file=TASK_FILE, event_file=EVENT_FILE):
         live = time.time() - peer.get('lastSeen', 0) < 20
         available = live and peer.get('enabled') and peer.get('permission')
         if action == 'candidates':
+            if 'taskId' in args:
+                require(type(args['taskId']) is str and args['taskId'] == active_now and active_now is not None,
+                        '需要当前活动任务的 taskId')
             peer['requestCandidates'] = True
             data['peer'] = peer
             return {'nativeConnection': 'connected' if live else 'host_unavailable',
@@ -513,15 +525,24 @@ def internal_action(args, task_file=TASK_FILE, event_file=EVENT_FILE):
         task_id, task = active_task(task_file)
         if action == 'create_target':
             # 建窗发生在绑定之前，因此只要求活动任务，不要求 sessionId（那是绑定后才有的）。
-            require(args['taskId'] == task_id and task and
-                    task.get('state') in ('awaiting_window', 'bound'),
-                    '需要当前活动任务')
+            require(args['taskId'] == task_id and task and task.get('state') == 'awaiting_window' and
+                    task.get('windowId') is None, '仅等待绑定窗口的活动任务可新建；已有目标须复用')
+            requested_url = creation_url(args['url']) if 'url' in args else None
+            created = next((t for t in peer.get('createdTargets', [])
+                            if t.get('taskId') == task_id), None)
+            if created:
+                return {'requested': False, 'reused': True, 'requestId': created['requestId'],
+                        'browserWindowId': created['browserWindowId'], 'tabId': created['tabId'],
+                        'mappingVerified': False, 'nextAction': 'candidates_then_assign'}
             pending = peer.get('createRequest')
-            require(not pending or time.time() - pending.get('issuedAt', 0) > 30,
-                    '已有未完成的创建请求')
+            if pending and pending.get('taskId') == task_id:
+                require(pending.get('url') == requested_url, '已有创建请求；复用原目标，不因地址变化另开窗口')
+                return {'requested': True, 'reused': True, 'requestId': pending['requestId'],
+                        'mappingVerified': False, 'nextAction': 'wait_for_created_target',
+                        'limitation': '结果未知时保留原请求，不重发新建窗口'}
             request = {'requestId': secrets.token_hex(16), 'taskId': task_id,
                        'issuedAt': time.time(),
-                       'url': creation_url(args['url']) if 'url' in args else None}
+                       'url': requested_url}
             peer['createRequest'] = request
             return {'requested': True, 'requestId': request['requestId'],
                     'mappingVerified': False,
@@ -782,6 +803,26 @@ def dispatch(message, origin, allowed_origins, task_file=TASK_FILE, event_file=E
 
 
 def make_tool(task_file, validate_task=None):
+    def shape(action, required=(), optional=(), operation=None):
+        fields = {'action': {'const': action}, **{key: {} for key in (*required, *optional)}}
+        needed = ['action', *required]
+        if operation:
+            fields['operation'] = {'const': operation}
+            needed.append('operation')
+        return {'type': 'object', 'properties': fields, 'required': needed, 'additionalProperties': False}
+
+    shapes = [shape('candidates', optional=('taskId',)),
+              shape('status', ('taskId',)), shape('create_target', ('taskId',), ('url',)),
+              shape('assign', ('taskId', 'browserWindowId', 'tabId')),
+              shape('result', ('taskId', 'commandId')), shape('cancel', ('taskId', 'commandId')),
+              shape('annotate', ('taskId', 'ref', 'note')), shape('annotations', ('taskId',)),
+              shape('verify_mapping', ('taskId',))]
+    for operation, required, optional in (
+            ('snapshot', (), ()), ('diagnostics', (), ()), ('click', ('ref',), ()),
+            ('fill', ('ref',), ('value',)), ('select', ('ref',), ('value',)),
+            ('scroll', (), ('ref', 'deltaY')), ('navigate', ('url',), ())):
+        shapes.append(shape('command', ('taskId', *required), optional, operation))
+
     def handler(args):
         require(type(args) is dict, '参数必须是对象')
         if args.get('action') in ('candidates', 'assign', 'create_target', 'command', 'result',
@@ -791,7 +832,7 @@ def make_tool(task_file, validate_task=None):
             return json.dumps(internal_action(args, task_file=task_file()), ensure_ascii=False)
         require(set(args) == {'action', 'taskId'} and args['action'] == 'status', '状态查询需要 taskId')
         return json.dumps(status(args['taskId'], task_file=task_file()), ensure_ascii=False)
-    return {'name': 'cua_browser_events', 'description': '查询只读浏览器观察；candidates 请求已授权标签的 ID/windowId/脱敏 URL（轮询后再次查询）；create_target 为当前活动任务新建专用窗口（可选 url，禁用 focused）；command 下发一个限定操作（snapshot/click/fill/select/scroll/navigate，单飞，8 秒过期），result 轮询（pending/ok/error/expired/canceled/unknown，不重放，附 latencyMs），cancel 取消尚未完成的命令并如实报告 mayHaveExecuted；动作执行过之后必须先用 snapshot 复核才能继续动作；assign 在候选证据中选择标签，创建来的窗口记为 targetEvidence.mode=created。禁止按焦点接管；mappingVerified 恒为 false，performed 不代表业务成功，不授权桌面输入或 wait_ready 判定。'
+    return {'name': 'cua_browser_events', 'description': '通过已授权扩展观察及操作固定浏览器标签。优先 candidates（可带当前 taskId；轮询后再次查询），再以真实 browserWindowId/tabId 显式 assign；ID 不能用 CGWindowID 代替。绑定后持续复用同一标签，不按前台焦点换目标。create_target 仅用于尚无窗口的活动任务，可带 url，focused=false；同一任务重复申请复用原请求或结果，不因超时另开窗口。command 下发限定操作（snapshot/click/fill/select/scroll/navigate/diagnostics，单飞，8 秒过期），result 轮询（pending/ok/error/expired/canceled/unknown，不重放，附 latencyMs），cancel 如实报告 mayHaveExecuted。动作执行过之后必须先用 snapshot 复核才能继续动作。performed 不代表业务成功，浏览器分配不授权桌面输入或 wait_ready 判定。'
                                                           '前提：Chrome 已加载 WorkbuddyExtension 并授予站点权限、原生宿主已登记（可在 cua_permissions 或安装页核对）。网页内容优先走本通道；原生 App 或扩展未就绪时才回落 AX 系列，不要拿 AX 树硬猜网页结构。',
             'inputSchema': {'type': 'object', 'properties': {'action': {'type': 'string', 'enum': ['status', 'candidates', 'create_target', 'command', 'result', 'cancel', 'annotate', 'annotations', 'verify_mapping', 'assign']},
                 'taskId': {'type': 'string'}, 'browserWindowId': {'type': 'integer'}, 'tabId': {'type': 'integer'},
@@ -802,5 +843,8 @@ def make_tool(task_file, validate_task=None):
                 'deltaY': {'type': 'integer', 'minimum': -10, 'maximum': 10, 'description': 'scroll 行数'},
                 'commandId': {'type': 'string', 'description': 'command 返回的标识，用于 result/cancel'},
                 'url': {'type': 'string', 'description': 'create_target 起始地址或 navigate 目标，仅 http/https 且不允许凭据'}},
-                'required': ['action'], 'additionalProperties': False},
+                'required': ['action'], 'additionalProperties': False, 'oneOf': shapes,
+                'examples': [{'action': 'candidates', 'taskId': 'current-task'},
+                             {'action': 'assign', 'taskId': 'current-task', 'browserWindowId': 2, 'tabId': 7},
+                             {'action': 'command', 'taskId': 'current-task', 'operation': 'snapshot'}]},
             'handler': handler, 'readOnly': False}

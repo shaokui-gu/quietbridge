@@ -39,7 +39,7 @@ enum NativeProtocol {
         "paste": ["format": ["html", "text"]],
         "pressKey": ["modifiers": ["command", "control", "fn", "option", "shift"]],
         "powerGuard": ["action": ["hold", "release", "status", "unlock", "unlockInspect", "lockSynthetic"]],
-        "preview": ["action": ["hold", "release", "status"], "source": ["desktop", "window"]],
+        "preview": ["action": ["hold", "release", "status"], "source": ["application", "desktop", "window"]],
         "requestPermission": ["permission": ["accessibility", "screenRecording"]],
         "selectText": ["selectionType": ["cursor_after", "cursor_before", "text"]],
     ]

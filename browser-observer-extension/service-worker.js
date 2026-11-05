@@ -240,8 +240,20 @@ function schedule() {
 }
 async function createWindow(request) {
   if (!request || typeof request.requestId !== 'string' || !request.requestId ||
-      lastCreateRequestId === request.requestId) return;
+      lastCreateRequestId === request.requestId) return false;
+  const { lastCreatedTarget } = await chrome.storage.session.get('lastCreatedTarget');
   lastCreateRequestId = request.requestId;
+  if (lastCreatedTarget?.requestId === request.requestId) {
+    if (lastCreatedTarget.result) {
+      createdReport = lastCreatedTarget.result;
+      return true;
+    }
+    throw new Error('窗口创建已下发但结果未知，未重复建窗');
+  }
+  // 先登记再建窗：worker 重启或回传失败不能产生第二个窗口。
+  await chrome.storage.session.set({ lastCreatedTarget: {
+    requestId: request.requestId, at: Date.now()
+  } });
   const options = { focused: false };
   if (typeof request.url === 'string' && request.url) options.url = request.url;
   const win = await chrome.windows.create(options);
@@ -249,7 +261,12 @@ async function createWindow(request) {
   if (!win || !Number.isInteger(win.id) || !tab || !Number.isInteger(tab.id)) {
     throw new Error('窗口创建结果不完整');
   }
-  createdReport = { requestId: request.requestId, browserWindowId: win.id, tabId: tab.id };
+  const result = { requestId: request.requestId, browserWindowId: win.id, tabId: tab.id };
+  await chrome.storage.session.set({ lastCreatedTarget: {
+    requestId: request.requestId, at: Date.now(), result
+  } });
+  createdReport = result;
+  return true;
 }
 async function sync() {
   try {
@@ -289,8 +306,7 @@ async function sync() {
     else await clearObservation();
     if (r.createRequest && on && permission) {
       try {
-        await createWindow(r.createRequest);
-        serial(sync);
+        if (await createWindow(r.createRequest)) serial(sync);
       } catch (error) {
         connection = { ...connection,
           lastError: String(error?.message || '专用窗口创建失败').slice(0, 500) };

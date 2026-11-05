@@ -233,16 +233,20 @@ async function lifecycleHarness() {
     scripting: { async executeScript() {} },
     alarms: { create() {}, onAlarm: listener() }
   };
-  const context = vm.createContext({ chrome, initialState, reduce, safeUrl, originOf, pause, URL, Date,
-    setTimeout() { return 1; }, clearTimeout() {}, setInterval() { return 2; }, clearInterval() {} });
-  vm.runInContext(code, context);
+  let context;
+  const boot = () => {
+    context = vm.createContext({ chrome, initialState, reduce, safeUrl, originOf, pause, URL, Date,
+      setTimeout() { return 1; }, clearTimeout() {}, setInterval() { return 2; }, clearInterval() {} });
+    vm.runInContext(code, context);
+  };
+  boot();
   const flush = async () => {
     await vm.runInContext('controls', context);
     await vm.runInContext('queue', context);
     await vm.runInContext('controls', context);
   };
   await flush();
-  return { local, chrome, calls, flush,
+  return { local, chrome, calls, flush, async restart() { boot(); await flush(); },
     get state() { return state; },
     get ports() { return ports; },
     set permission(value) { permission = value; },
@@ -424,6 +428,43 @@ test('创建失败保留待回传状态且下一次请求不被静默吞掉', as
   assert.equal(attempts, 1);
   assert.equal(h.calls.some(m => m.created), false, '失败不得伪造创建证据');
   assert.equal((await h.send({ action: 'status' })).nativeConnection.status, 'connected');
+  h.chrome.alarms.onAlarm.fn({ name: 'observer-sync' });
+  await h.flush();
+  assert.equal(attempts, 1, '相同请求只轮询，不得立即同步空转或重放');
+  await h.restart();
+  assert.equal(attempts, 1, 'worker 重启不能重放结果未知的建窗');
+  assert.match((await h.send({ action: 'status' })).nativeConnection.lastError, /结果未知/);
+});
+
+test('建窗证据回传失败后 worker 重启只恢复回传，不再创建窗口', async () => {
+  const h = await lifecycleHarness();
+  h.permission = true;
+  let attempts = 0, acknowledged = false, rejectReport = true;
+  const reports = [];
+  const requestId = 'c'.repeat(32);
+  h.chrome.windows = { async create() {
+    attempts++;
+    return { id: 61, tabs: [{ id: 62, windowId: 61 }] };
+  } };
+  h.native = async message => {
+    if (message.created) {
+      reports.push(structuredClone(message.created));
+      if (rejectReport) throw new Error('确认响应丢失');
+      acknowledged = true;
+    }
+    return { ok: true, protocolVersion: 2, heartbeatAt: 1, taskAssignment: 'no_assignment',
+      createRequest: acknowledged ? null : { requestId, taskId: 'task', url: null } };
+  };
+  await h.send({ action: 'enable' });
+  await h.flush();
+  assert.equal(attempts, 1);
+  assert.equal(reports.length, 1);
+  rejectReport = false;
+  await h.restart();
+  assert.equal(attempts, 1);
+  assert.equal(reports.length, 2);
+  assert.deepEqual(reports[1], reports[0]);
+  assert.equal(acknowledged, true);
 });
 
 test('快照命令绑定已核验文档执行，结果只回传一次', async () => {

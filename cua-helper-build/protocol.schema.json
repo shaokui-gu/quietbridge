@@ -267,7 +267,7 @@
             },
             "source": {
               "type": "string",
-              "enum": ["desktop", "window"]
+              "enum": ["application", "desktop", "window"]
             }
           },
           "required": ["action"],

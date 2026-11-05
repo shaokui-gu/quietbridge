@@ -23,6 +23,7 @@ import math
 import uuid
 import stat
 import fcntl
+from pathlib import Path
 from contextlib import contextmanager
 from urllib.parse import urlsplit
 import ipaddress
@@ -68,6 +69,104 @@ STATE = {
 def log(message):
     sys.stderr.write("[cua-bridge] %s\n" % message)
     sys.stderr.flush()
+
+
+OPERATION_METHODS = {"click", "hover", "scroll", "drag", "getState", "screenshot", "visualState", "listWindows", "preview"}
+OPERATION_TOOLS = {"cua_click", "cua_hover", "cua_scroll", "cua_drag", "cua_state", "cua_screenshot", "cua_visual_state", "cua_wait_ready", "cua_windows", "cua_browser_events"}
+OPERATION_TRACE_ID = None
+OPERATION_LOG_LOCK = threading.Lock()
+OPERATION_LOG_MAX_BYTES = 5 * 1024 * 1024
+
+
+def operation_log_directory():
+    if os.environ.get("CUA_DIAGNOSTICS_DIR"):
+        return Path(os.environ["CUA_DIAGNOSTICS_DIR"])
+    if os.environ.get("CUA_CONFIG_DIR"):
+        return Path(os.environ["CUA_CONFIG_DIR"]) / "logs"
+    return Path.home() / "Library/Logs/workbuddy-cua"
+
+
+def diagnostic_fields(params):
+    """Allowlist geometry/identifiers; never serialize raw tool parameters or UI contents."""
+    if not isinstance(params, dict):
+        return {}
+    numbers = {"windowId", "elementIndex", "x", "y", "fromX", "fromY", "toX", "toY", "clickCount", "holdMs", "deltaLinesX", "deltaLinesY", "durationMs", "steps"}
+    identifiers = {"appHandle", "snapshotId", "mouseButton", "action", "source", "taskId", "operation", "commandId"}
+    numbers.update({"browserWindowId", "tabId"})
+    return {key: value[:256] if isinstance(value, str) else value for key, value in (params or {}).items()
+            if (key in numbers and diagnostic_number(value)) or
+               (key in identifiers and isinstance(value, str))}
+
+
+def diagnostic_geometry(value, fields):
+    return {key: value[key] for key in fields if isinstance(value, dict) and
+            diagnostic_number(value.get(key))}
+
+
+def diagnostic_number(value):
+    return type(value) is int or (type(value) is float and math.isfinite(value))
+
+
+def diagnostic_result(result):
+    if not isinstance(result, dict):
+        return {}
+    fields = diagnostic_fields(result)
+    for key in ("pid", "pixelWidth", "pixelHeight"):
+        if diagnostic_number(result.get(key)):
+            fields[key] = result[key]
+    for key in ("dispatched", "verified"):
+        if type(result.get(key)) is bool:
+            fields[key] = result[key]
+    for key in ("route", "axAction", "coordinateSpace"):
+        if isinstance(result.get(key), str):
+            fields[key] = result[key][:128]
+    bounds = diagnostic_geometry(result.get("bounds"), ("x", "y", "width", "height"))
+    if bounds:
+        fields["bounds"] = bounds
+        for axis, pixel, size in (("X", "pixelWidth", "width"), ("Y", "pixelHeight", "height")):
+            if bounds.get(size, 0) > 0 and fields.get(pixel, 0) > 0:
+                fields["pixelsPerPoint" + axis] = fields[pixel] / bounds[size]
+    pointer = result.get("pointer")
+    if isinstance(pointer, dict):
+        safe = diagnostic_geometry(pointer, ("windowId", "targetPid"))
+        safe["coordinateSpace"] = "window-points"
+        for key, keys in (("windowBounds", ("x", "y", "width", "height")), ("windowPoint", ("x", "y")), ("screenPoint", ("x", "y"))):
+            safe[key] = diagnostic_geometry(pointer.get(key), keys)
+        fields["pointer"] = safe
+    return fields
+
+
+def operation_log(event, **fields):
+    if os.environ.get("CUA_OPERATION_LOG") == "0":
+        return
+    try:
+        record = dict(fields, event=event, timestamp=time.time(), pid=os.getpid(), toolTraceId=OPERATION_TRACE_ID)
+        data = (json.dumps(record, ensure_ascii=False, allow_nan=False, separators=(",", ":")) + "\n").encode()
+        if len(data) > OPERATION_LOG_MAX_BYTES:
+            return
+        path = operation_log_directory() / "bridge-operations.jsonl"
+        with OPERATION_LOG_LOCK:
+            path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+            lockfd = os.open(str(path) + ".lock", os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600)
+            with os.fdopen(lockfd, "ab") as lease:
+                info = os.fstat(lease.fileno())
+                if not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid() or info.st_nlink != 1:
+                    return
+                fcntl.flock(lease.fileno(), fcntl.LOCK_EX)
+                fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW, 0o600)
+                with os.fdopen(fd, "ab", buffering=0) as output:
+                    info = os.fstat(output.fileno())
+                    if not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid() or info.st_nlink != 1:
+                        return
+                    if info.st_size + len(data) > OPERATION_LOG_MAX_BYTES:
+                        os.replace(path, str(path) + ".1")
+                        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW, 0o600)
+                        with os.fdopen(fd, "ab", buffering=0) as fresh:
+                            fresh.write(data)
+                    else:
+                        output.write(data)
+    except (OSError, ValueError, TypeError):
+        pass  # Diagnostics must never change input delivery or its original error.
 
 
 class HelperError(Exception):
@@ -202,11 +301,18 @@ class HelperClient(object):
                 raise HelperError("HELPER_TIMEOUT", "请求预算已耗尽，未发送新请求")
             self.seq += 1
             rid = "mcp-%d-%d" % (os.getpid(), self.seq)
+            started = time.perf_counter()
+            if method in OPERATION_METHODS:
+                operation_log("helper.request", nativeRequestId=rid, method=method, target=diagnostic_fields(params))
             frame = json.dumps({"id": rid, "method": method, "params": params}, ensure_ascii=False)
             try:
                 self.proc.stdin.write((frame + "\n").encode("utf-8"))
                 self.proc.stdin.flush()
+                if method in OPERATION_METHODS:
+                    operation_log("helper.sent", nativeRequestId=rid, method=method)
             except (BrokenPipeError, OSError) as exc:
+                if method in OPERATION_METHODS:
+                    operation_log("helper.failed", nativeRequestId=rid, method=method, errorCode="HELPER_BROKEN")
                 self._stop()
                 raise RuntimeError("helper stdin closed: %s" % exc)
 
@@ -219,6 +325,9 @@ class HelperClient(object):
                 msg = self.responses.pop(rid, None)
 
             if msg is None:
+                if method in OPERATION_METHODS:
+                    operation_log("helper.failed", nativeRequestId=rid, method=method, errorCode="HELPER_TIMEOUT",
+                                  elapsedMs=(time.perf_counter() - started) * 1000)
                 if method == "browserSession" and params.get("action") == "start":
                     self.pending_browser_response = rid
                     raise HelperError("BROWSER_LAUNCH_UNCERTAIN", "start 回包超时；可能已经启动，保留连接接收迟到回包，禁止重试 start")
@@ -232,8 +341,14 @@ class HelperClient(object):
             if "error" in msg and msg["error"]:
                 err = msg["error"]
                 if isinstance(err, dict):
+                    if method in OPERATION_METHODS:
+                        operation_log("helper.failed", nativeRequestId=rid, method=method, errorCode=err.get("code") or "NATIVE_ERROR",
+                                      elapsedMs=(time.perf_counter() - started) * 1000)
                     raise HelperError(err.get("code") or "NATIVE_ERROR", err.get("message") or "native error")
                 raise HelperError("NATIVE_ERROR", str(err))
+            if method in OPERATION_METHODS:
+                operation_log("helper.completed", nativeRequestId=rid, method=method,
+                              elapsedMs=(time.perf_counter() - started) * 1000, result=diagnostic_result(msg.get("result")))
             return msg.get("result")
 
 
@@ -270,6 +385,7 @@ INPUT_METHODS = {"click", "hover", "scroll", "drag", "setValue", "typeText", "pa
 CALL_RECORDS = None
 INPUT_CONNECTION = None
 SHARE_RECORD = None
+SHARE_SELECTION = None  # 显式范围仅属于同一连接和目标，不影响其他应用或任务。
 
 
 def input_window(app, window=None, snapshot=None, allow_unique=False):
@@ -289,9 +405,9 @@ def input_window(app, window=None, snapshot=None, allow_unique=False):
     raise HelperError("TARGET_REQUIRED", "目标不明确：显式指定 windowId 或先观察确切窗口；不会选择第一窗口")
 
 
-def request_share(app, window, source):
+def request_share(app, window, source, duration=600):
     params = {"action": "hold", "appHandle": app, "windowId": window,
-              "source": source, "durationSeconds": 600}
+              "source": source, "durationSeconds": duration}
     if TASK_DISPATCH is not None:
         assert_task_connection(TASK_DISPATCH)
         validate_task_target("preview", params, TASK_DISPATCH)
@@ -308,38 +424,61 @@ def request_share(app, window, source):
         CALL_RECORDS.append({"method": "preview", "target": {"appHandle": app, "windowId": window},
                              "preview": {k: preview[k] for k in ("streamReady", "mode", "trackingWindowId", "scope",
                                           "targetOnCurrentSpace", "displayId", "frameAgeMs", "streamError") if k in preview},
-                             "scopeWarning": "desktop 为目标显示器当前 Space，不保证包含目标后台 Space；可能包含其他应用敏感信息。"})
+                             "scopeWarning": ("desktop 包含目标显示器当前 Space 的其他应用。" if source == "desktop"
+                                              else "仅共享目标应用。" if source == "application" else "仅共享目标窗口。")})
     if current_connection() != connection or not HELPER._alive():
         raise HelperError("REQUIRES_REVALIDATION", "共享期间连接改变，输入未派发")
     if (preview.get("streamReady") is not True or preview.get("mode") != source or
             preview.get("trackingWindowId") != window):
-        raise HelperError("PREVIEW_NOT_READY", "目标%s尚无已确认视频首帧，输入未派发" % ("桌面" if source == "desktop" else "窗口"))
+        raise HelperError("PREVIEW_NOT_READY", "目标%s尚无已确认视频首帧，输入未派发" %
+                          {"desktop": "桌面", "application": "应用", "window": "窗口"}[source])
     if TASK_DISPATCH is not None:
         assert_task_connection(TASK_DISPATCH)
         validate_task_target("preview", params, TASK_DISPATCH)
     return connection, preview
 
 
-def ensure_desktop(app, window):
-    """优先桌面共享；目标在后台 Space 时桌面帧不含目标，改用其独立窗口共享并如实标注。"""
-    global SHARE_RECORD
-    connection, preview = request_share(app, window, "desktop")
-    record = {"source": "desktop", "scope": preview.get("scope") or "display_current_space",
+def ensure_share(app, window, source=None, duration=600):
+    """应用内默认只共享该应用；显式桌面范围在同一目标的后续动作中保留。"""
+    global SHARE_RECORD, SHARE_SELECTION
+    if source is not None:
+        SHARE_SELECTION = None
+    if source is None:
+        selection = SHARE_SELECTION or {}
+        same_target = (selection.get("appHandle") == app and selection.get("windowId") == window
+                       and selection.get("connection") == current_connection() and HELPER._alive())
+        source = selection["source"] if same_target else "application"
+    try:
+        connection, preview = request_share(app, window, source, duration)
+    except HelperError:
+        SHARE_SELECTION = {"appHandle": app, "windowId": window, "connection": current_connection(), "source": source}
+        raise
+    if source == "desktop" and preview.get("targetOnCurrentSpace") is not True:
+        try:
+            call_helper("preview", {"action": "release"})
+        finally:
+            # 失败只关闭视频流，保留任务要求的桌面范围；重试也不能悄悄收窄。
+            SHARE_SELECTION = {"appHandle": app, "windowId": window, "connection": connection, "source": source}
+        raise HelperError("PREVIEW_NOT_READY", "无法确认目标所在桌面正在共享；请先手动切换到目标桌面后重试")
+    record = {"source": source, "scope": preview.get("scope") or
+              {"desktop": "display_current_space", "application": "application_current_space", "window": "window"}[source],
               "targetOnCurrentSpace": preview.get("targetOnCurrentSpace")}
-    if preview.get("targetOnCurrentSpace") is False:
-        connection, preview = request_share(app, window, "window")
+    if source == "application" and preview.get("targetOnCurrentSpace") is False:
+        connection, preview = request_share(app, window, "window", duration)
         record = {"source": "window", "scope": preview.get("scope") or "window",
+                  "requestedSource": "application",
                   "targetOnCurrentSpace": False,
-                  "reason": "target_on_background_space: 桌面共享只覆盖当前 Space，已改为共享目标窗口本身"}
+                  "reason": "target_on_background_space: 应用流不含后台 Space，改为仅共享目标窗口"}
     if CALL_RECORDS is not None:
         CALL_RECORDS.append({"method": "share", "target": {"appHandle": app, "windowId": window},
                              "share": record})
     SHARE_RECORD = record
+    SHARE_SELECTION = {"appHandle": app, "windowId": window, "connection": connection, "source": source}
     return connection
 
 
 def call_helper(method, params=None, **kwargs):
-    global INPUT_CONNECTION
+    global INPUT_CONNECTION, SHARE_SELECTION
     timeout = kwargs.pop("timeout", None) or TIMEOUTS.get(method, 45)
     if TASK_DISPATCH is not None:
         assert_task_connection(TASK_DISPATCH)
@@ -350,11 +489,13 @@ def call_helper(method, params=None, **kwargs):
             raise HelperError("HELPER_TIMEOUT", "等待总预算已耗尽，未发送新请求")
         timeout = min(timeout, remaining)
     params = params or {}
+    if method == "preview" and params.get("action") == "release":
+        SHARE_SELECTION = None
     target = {k: params[k] for k in ("appHandle", "windowId", "snapshotId", "elementIndex") if k in params}
     if method in INPUT_METHODS:
         window = input_window(params.get("appHandle"), params.get("windowId"), params.get("snapshotId"),
                               allow_unique=method in ("typeText", "paste", "pressKey", "activate", "show"))
-        connection = ensure_desktop(params.get("appHandle"), window)
+        connection = ensure_share(params.get("appHandle"), window)
         target["windowId"] = window
         if current_connection() != connection or not HELPER._alive():
             raise HelperError("REQUIRES_REVALIDATION", "输入前连接改变，未派发")
@@ -375,6 +516,9 @@ def call_helper(method, params=None, **kwargs):
         for key in ("dispatched", "verified", "route"):
             if key in result:
                 record[key] = result[key]
+        pointer = diagnostic_result(result).get("pointer")
+        if pointer is not None:
+            record["pointer"] = pointer
         foreground = result.get("foreground")
         if isinstance(foreground, dict):
             record["foreground"] = {k: foreground[k] for k in ("frontPid", "focusedWindowId") if k in foreground}
@@ -550,6 +694,7 @@ def release_power_guard():
 
 
 def tool_task(args):
+    global SHARE_SELECTION
     if not isinstance(args, dict) or set(args) - {"action", "taskId", "appHandle", "windowId", "confirm"}:
         raise HelperError("INVALID_ARGUMENT", "仅接受 action、taskId、appHandle、windowId、confirm")
     action = args.get("action")
@@ -565,6 +710,7 @@ def tool_task(args):
         raise HelperError("INVALID_ARGUMENT", "taskId 必须是非空字符串")
     with task_store() as data:
         if action == "begin":
+            SHARE_SELECTION = None
             previous = data["tasks"].get(data.get("activeTaskId"))
             if isinstance(previous, dict) and previous.get("state") == "bound":
                 try:
@@ -778,18 +924,19 @@ def resolve_window(app_handle, window_id=None, require=True):
     windows = list_windows(app_handle)
     ids = [w.get("windowId") for w in windows]
     cached = STATE["window"].get(app_handle)
-    if cached in ids:
+    if cached is not None and cached in ids:
         return cached
-    STATE["window"].pop(app_handle, None)
-    preferred = (
-        [w for w in windows if w.get("isOnScreen")]
-        or [w for w in windows if w.get("title")]
-        or windows
-    )
-    if preferred:
-        wid = preferred[0]["windowId"]
+    if cached is not None:
+        operation_log("target.lost", appHandle=app_handle, windowId=cached)
+        raise HelperError("TARGET_LOST", "原目标窗口已不可用；请显式选择窗口，不按前台或窗口顺序换目标")
+    valid_ids = {value for value in ids if type(value) is int}
+    if len(valid_ids) == 1:
+        wid = valid_ids.pop()
         STATE["window"][app_handle] = wid
+        operation_log("target.selected", appHandle=app_handle, windowId=wid, reason="only_window")
         return wid
+    if len(valid_ids) > 1:
+        raise HelperError("TARGET_REQUIRED", "应用有多个窗口；请显式指定 windowId，不会选择第一个或当前聚焦窗口")
     if require:
         raise HelperError(
             "WINDOW_UNAVAILABLE",
@@ -800,7 +947,11 @@ def resolve_window(app_handle, window_id=None, require=True):
 
 def remember_window(app_handle, result):
     if isinstance(result, dict) and result.get("windowId"):
+        previous = STATE["window"].get(app_handle)
         STATE["window"][app_handle] = result["windowId"]
+        if previous != result["windowId"]:
+            operation_log("target.selected", appHandle=app_handle, previousWindowId=previous,
+                          windowId=result["windowId"], reason="explicit_observation_result")
 
 
 def observe_window(app_handle, window_id):
@@ -975,7 +1126,7 @@ def share_new_window(app, before, timeout=6.0):
         fresh = [w["windowId"] for w in list_windows(app)
                  if isinstance(w.get("windowId"), int) and w["windowId"] not in before]
         if len(fresh) == 1:
-            ensure_desktop(app, fresh[0])
+            ensure_share(app, fresh[0])
             return True
         if len(fresh) > 1:
             raise HelperError("TARGET_REQUIRED", "新建后出现多个候选窗口，未猜测共享目标；请显式 cua_windows action=share")
@@ -1065,8 +1216,8 @@ def tool_apps(args):
         share = "未发现可核验窗口（%s），共享待补" % reason
         if window is not None:
             try:
-                ensure_desktop(handle, window)
-                share = "已共享窗口 %d" % window
+                ensure_share(handle, window)
+                share = "已共享目标应用（锚点窗口 %d）" % window
             except HelperError as exc:
                 share = "共享未就绪（%s）" % exc.code
         return "已启动 %s appHandle=%s；共享: %s" % (fmt_app_ident(STATE["apps"][handle]), handle, share)
@@ -1086,10 +1237,6 @@ def tool_windows(args):
     app_handle = resolve_app(args.get("appHandle"))
     if action == "list":
         windows = call_helper("listWindows", {"appHandle": app_handle}) or []
-        for w in windows:
-            if w.get("isOnScreen"):
-                STATE["window"][app_handle] = w["windowId"]
-                break
         meta = STATE["apps"].get(app_handle, {})
         return "%s 的窗口 %d 个：\n%s" % (meta.get("name") or "应用", len(windows), fmt_windows(windows))
     if action == "activate":
@@ -1112,18 +1259,14 @@ def tool_windows(args):
         duration = args.get("durationSeconds", 1800)
         if type(duration) not in (int, float) or not 60 <= duration <= 3600:
             raise HelperError("INVALID_ARGUMENT", "durationSeconds 必须在 60 到 3600 之间")
-        source = args.get("source", "window")
-        if source not in ("window", "desktop"):
-            raise HelperError("INVALID_ARGUMENT", "source 必须是 window 或 desktop")
-        result = call_helper("preview", {"action": "hold", "appHandle": app_handle,
-                                         "windowId": window_id, "durationSeconds": duration,
-                                         "source": source}) or {}
-        preview = result.get("preview") or {}
-        scope = "整个桌面" if source == "desktop" else "单个窗口"
-        return ("已开始共享%s（windowId=%d，pid=%s，租约=%s 秒，holding=%s，visible=%s）。"
+        source = args.get("source", "application")
+        if source not in ("application", "window", "desktop"):
+            raise HelperError("INVALID_ARGUMENT", "source 必须是 application、window 或 desktop")
+        ensure_share(app_handle, window_id, source=source, duration=duration)
+        scope = {"desktop": "目标应用所在的整个桌面", "application": "目标应用", "window": "单个窗口"}[SHARE_RECORD["source"]]
+        return ("已开始共享%s（windowId=%d，租约=%s 秒，holding=True）。"
                 "共享面板在任务结束前保持：动作会续租，cua_windows action=unshare 或 cua_task end 会立即关闭。"
-                % (scope, window_id, result.get("pid"), result.get("durationSeconds"),
-                   preview.get("holding"), preview.get("visible")))
+                % (scope, window_id, duration))
     raise HelperError("INVALID_ARGUMENT", "action 必须是 list、activate、share 或 unshare")
 
 
@@ -1166,23 +1309,7 @@ def tool_situation(args):
 
 def tool_state(args):
     app_handle = resolve_app(args.get("appHandle"))
-    explicit = args.get("windowId")
-    windows = list_windows(app_handle)
-    by_id = dict((w.get("windowId"), w) for w in windows)
-
-    window_id = int(explicit) if explicit else None
-    if not window_id:
-        cached = STATE["window"].get(app_handle)
-        if cached in by_id:
-            window_id = cached
-        else:
-            # Only a window that is actually visible can expose an AX tree.
-            visible = [w for w in windows if w.get("isOnScreen") and w.get("title")]
-            pick = visible or [w for w in windows if w.get("onCurrentSpace") is True and w.get("title")]
-            if pick:
-                window_id = pick[0]["windowId"]
-                STATE["window"][app_handle] = window_id
-            # otherwise stay at application scope and let the helper report focus
+    window_id = resolve_window(app_handle, args.get("windowId"))
     params = {
         "appHandle": app_handle,
         "maxElements": int(args.get("maxElements") or 200),
@@ -1209,7 +1336,7 @@ def tool_state(args):
     STATE["snapshot_app"] = app_handle
     STATE["snapshot_window"] = result.get("windowId")
     if result.get("windowId"):
-        STATE["window"][app_handle] = result["windowId"]
+        remember_window(app_handle, result)
 
     tree = result.get("tree") or ""
     if len(tree) > MAX_TREE_CHARS:
@@ -1821,7 +1948,8 @@ TOOLS = [
     {
         "name": "cua_windows",
         "description": "列出应用窗口（windowId、标题、尺寸、屏幕坐标、是否在屏/当前桌面）、请求激活应用，或开始/结束窗口共享预览。share 会让浮动共享面板在整个界面操作任务期间保持（动作自动续租），直到 unshare 或 cua_task end。"
-                       "观察与输入类工具会自动开启并续租共享，不必先手动 share；锁屏时共享立即关闭并清除画面。",
+                       "应用内观察与输入默认只共享目标应用；任务需要跨应用、Dock 或系统界面时，先 share(source=desktop) 共享目标所在桌面，后续动作保留该范围。"
+                       "不必为应用内任务手动 share；锁屏时共享立即关闭并清除画面。",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -1829,8 +1957,8 @@ TOOLS = [
                 "appHandle": APP_HANDLE_PROP,
                 "windowId": {"type": "integer", "minimum": 1, "maximum": 4294967295},
                 "durationSeconds": {"type": "number", "minimum": 60, "maximum": 3600, "default": 1800},
-                "source": {"type": "string", "enum": ["window", "desktop"], "default": "window",
-                           "description": "desktop 共享目标窗口所在整个桌面：搜索窗、弹框、下拉等独立图层也能看到"},
+                "source": {"type": "string", "enum": ["application", "window", "desktop"], "default": "application",
+                           "description": "应用内操作用 application，仅包含目标应用的窗口；跨应用或系统界面操作用 desktop，包含目标显示器当前桌面；window 仅包含指定窗口。所选范围随动作续租，直到结束共享或更换目标。"},
             },
         },
         "handler": tool_windows,
@@ -2067,6 +2195,9 @@ def _events_dispatch(args):
             with task_store() as data:
                 record = data['tasks'].get(task_id)
                 unbound_create = not record or record.get('windowId') is None
+                if not unbound_create:
+                    operation_log("browser.create_refused", taskId=task_id, windowId=record.get('windowId'), reason="target_already_bound")
+                    raise HelperError('TARGET_ALREADY_BOUND', '任务已有固定窗口；复用既有标签页并查询 status/assign，不另开窗口。新建窗口需要新的显式任务。')
         if unbound_create:
             # 没有已绑定窗口：先确认浏览器身份与既有窗口集合，创建后只对唯一新窗口补共享。
             handle, before = browser_window_snapshot()
@@ -2081,7 +2212,7 @@ def _events_dispatch(args):
                 window = record.get('windowId')
             _, context = task_guard('cua_click', {'appHandle': binding['appHandle'], 'windowId': window})
             TASK_DISPATCH = context
-            ensure_desktop(binding['appHandle'], window)
+            ensure_share(binding['appHandle'], window)
             assert_task_connection(context)
             validate_task_target('click', {'appHandle': binding['appHandle'], 'windowId': window}, context)
     if isinstance(args, dict) and args.get('action') == 'verify_mapping':
@@ -2090,7 +2221,12 @@ def _events_dispatch(args):
         CALL_RECORDS.append({'method': 'pageCommand', 'target': {'appHandle': binding['appHandle'], 'windowId': window},
                              'dispatched': 'unknown', 'verified': 'unknown'})
     if unbound_create:
+        operation_log("browser.create_requested", taskId=args.get('taskId'), reason="explicit_create_target")
         output = _events_handler(args)
+        payload = json.loads(output) if isinstance(output, str) else output
+        if isinstance(payload, dict) and payload.get('reused'):
+            operation_log("browser.target_reused", taskId=args.get('taskId'), requestId=payload.get('requestId'))
+            return output
         try:
             share_new_window(handle, before)
         except HelperError as exc:
@@ -2105,6 +2241,7 @@ def _events_dispatch(args):
 TOOLS.append(dict(_events_tool, handler=_events_dispatch))
 TOOL_MAP = dict((t["name"], t) for t in TOOLS)
 HINTS = {
+    "TARGET_LOST": "原窗口不可用时保留任务状态，显式重新选择；不自动新建 Chrome 窗口。",
     "PERMISSION_DENIED": "给 \"workbuddy-cua\" 授予辅助功能/屏幕录制后再试。",
     "FOREGROUND_REQUIRED": "先观察确切目标与焦点；仅在明确需要且允许时请求激活，不自动切换窗口。",
     "STALE_SNAPSHOT": "快照已失效：重新 cua_state 后再操作。",
@@ -2118,10 +2255,14 @@ HINTS = {
 
 
 def call_tool(name, args):
-    global CALL_RECORDS, SHARE_RECORD
+    global CALL_RECORDS, SHARE_RECORD, OPERATION_TRACE_ID
     with TOOL_LOCK:
         CALL_RECORDS = []
         SHARE_RECORD = None
+        OPERATION_TRACE_ID = str(uuid.uuid4()) if name in OPERATION_TOOLS else None
+        started = time.perf_counter()
+        if OPERATION_TRACE_ID:
+            operation_log("tool.started", tool=name, target=diagnostic_fields(args))
         try:
             result = _call_tool(name, args)
             records = CALL_RECORDS
@@ -2163,11 +2304,21 @@ def call_tool(name, args):
                 structured['share'] = SHARE_RECORD
             if isinstance(payload, dict):
                 structured['page'] = {k: payload[k] for k in ('status', 'commandId', 'performed', 'verified', 'mayHaveExecuted') if k in payload}
+            if OPERATION_TRACE_ID:
+                directory = operation_log_directory()
+                structured['diagnostics'] = {"enabled": os.environ.get("CUA_OPERATION_LOG") != "0", "toolTraceId": OPERATION_TRACE_ID,
+                                             "bridgeLogPath": str(directory / "bridge-operations.jsonl"),
+                                             "nativeLogPath": str(directory / "native-operations.jsonl")}
+                operation_log("tool.completed", tool=name, ok=structured['ok'], errorCode=error_code,
+                              execution=execution, elapsedMs=(time.perf_counter() - started) * 1000,
+                              verification=structured['verification']['status'],
+                              pointer=last.get('pointer') if last else None)
             result['structuredContent'] = structured
             return result
         finally:
             CALL_RECORDS = None
             SHARE_RECORD = None
+            OPERATION_TRACE_ID = None
 
 
 def _call_tool(name, args):
@@ -2191,10 +2342,10 @@ def _call_tool(name, args):
                     ("windowId" in guarded and (type(guarded["windowId"]) is not int or not 1 <= guarded["windowId"] <= 4294967295))):
                 raise HelperError("INVALID_ARGUMENT", "视觉观察仅接受有效 appHandle/windowId")
             if READ_ONLY:
-                raise HelperError("SHARE_REQUIRED", "界面观察需要 desktop 共享；只读模式不允许启动共享，请使用 cua_situation")
+                raise HelperError("SHARE_REQUIRED", "界面观察需要共享目标应用；只读模式不允许启动共享，请使用 cua_situation")
             app = resolve_app(guarded.get("appHandle"))
             window = resolve_window(app, guarded.get("windowId"))
-            ensure_desktop(app, window)
+            ensure_share(app, window)
             guarded = dict(guarded, windowId=window)
         out = tool["handler"](guarded)
         if isinstance(out, dict):

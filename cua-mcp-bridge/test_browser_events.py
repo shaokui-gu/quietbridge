@@ -12,6 +12,10 @@ import tempfile
 import unittest
 from unittest import mock
 
+# SourceFileLoader 在模块代码执行前就可能写缓存，必须在首次 load 前禁用。
+# 扩展目录中的 __pycache__ 会让 Chrome 拒绝加载整个扩展。
+sys.dont_write_bytecode = True
+
 # 运行态默认目录是真实用户的 ~/Library/Application Support；测试必须隔离，
 # 否则会读写本机的任务记录。
 os.environ['CUA_CONFIG_DIR'] = tempfile.mkdtemp(prefix='cua-test-config-')
@@ -49,6 +53,19 @@ class BrowserEventsTests(unittest.TestCase):
                      'sessionId': 'session'},
             'other': {'taskId': 'other', 'state': 'bound'}}}))
         self.paths = {'task_file': self.tasks, 'event_file': self.store}
+
+    def await_window(self):
+        data = events.read_file(self.tasks)
+        data['tasks']['task']['state'] = 'awaiting_window'
+        for key in ('windowId', 'pid', 'processIdentity', 'sessionId'):
+            data['tasks']['task'].pop(key, None)
+        self.tasks.write_text(json.dumps(data))
+
+    def bind_native_window(self):
+        data = events.read_file(self.tasks)
+        data['tasks']['task'].update(state='bound', windowId=900, pid=88,
+            processIdentity={'pid': 88, 'startedSeconds': '10', 'startedMicroseconds': '1'}, sessionId='session')
+        self.tasks.write_text(json.dumps(data))
 
     def request(self, message, origin=ORIGIN):
         return events.dispatch(message, origin, [ORIGIN], **self.paths)
@@ -88,11 +105,7 @@ class BrowserEventsTests(unittest.TestCase):
 
     def test_create_target_works_before_binding(self):
         # 建窗必须发生在绑定之前，因此不能用 sessionId 作为前置条件。
-        data = events.read_file(self.tasks)
-        data['tasks']['task'].update(state='awaiting_window')
-        for key in ('windowId', 'pid', 'processIdentity', 'sessionId'):
-            data['tasks']['task'].pop(key, None)
-        self.tasks.write_text(json.dumps(data))
+        self.await_window()
         self.sync()
         queued = events.internal_action({'action': 'create_target', 'taskId': 'task',
                                          'url': 'https://example.org/'}, **self.paths)
@@ -100,17 +113,20 @@ class BrowserEventsTests(unittest.TestCase):
         self.assertEqual(self.sync()['createRequest']['url'], 'https://example.org/')
 
     def test_create_target_is_single_flight_and_bound_to_active_task(self):
+        self.await_window()
         self.sync()
         first = events.internal_action({'action': 'create_target', 'taskId': 'task'}, **self.paths)
         self.assertTrue(first['requested'])
         self.assertRegex(first['requestId'], '^[0-9a-f]{32}$')
         self.assertEqual(self.sync()['createRequest']['requestId'], first['requestId'])
-        with self.assertRaises(ValueError):
-            events.internal_action({'action': 'create_target', 'taskId': 'task'}, **self.paths)
+        repeated = events.internal_action({'action': 'create_target', 'taskId': 'task'}, **self.paths)
+        self.assertTrue(repeated['reused'])
+        self.assertEqual(repeated['requestId'], first['requestId'])
         with self.assertRaises(ValueError):
             events.internal_action({'action': 'create_target', 'taskId': 'other'}, **self.paths)
 
     def test_created_result_needs_the_pending_request_and_clears_it(self):
+        self.await_window()
         self.sync()
         request = events.internal_action({'action': 'create_target', 'taskId': 'task'}, **self.paths)
         created = {'requestId': request['requestId'], 'browserWindowId': 5, 'tabId': 9}
@@ -118,13 +134,16 @@ class BrowserEventsTests(unittest.TestCase):
             self.sync(created=created | {'requestId': '0' * 32})
         self.assertTrue(self.sync(created=created)['ok'])
         self.assertIsNone(self.sync()['createRequest'])
+        self.assertTrue(self.sync(created=created)['ok'], '确认响应丢失后允许相同证据再次回传')
         with self.assertRaises(ValueError):
-            self.sync(created=created)
+            self.sync(created=created | {'tabId': 10})
 
     def test_assign_distinguishes_created_and_selected_windows(self):
+        self.await_window()
         self.sync()
         request = events.internal_action({'action': 'create_target', 'taskId': 'task'}, **self.paths)
         self.sync(created={'requestId': request['requestId'], 'browserWindowId': 2, 'tabId': 7})
+        self.bind_native_window()
         events.internal_action({'action': 'candidates'}, **self.paths)
         self.sync(candidates=[{'tabId': 7, 'browserWindowId': 2, 'url': 'https://example.org/path'}])
         result = events.internal_action({'action': 'assign', 'taskId': 'task', 'tabId': 7,
@@ -140,6 +159,7 @@ class BrowserEventsTests(unittest.TestCase):
 
     def test_created_window_belongs_only_to_its_active_task(self):
         # 单活动任务模型：切换活动任务后，旧建窗证据失效，新任务可按普通候选选择。
+        self.await_window()
         self.sync()
         request = events.internal_action({'action': 'create_target', 'taskId': 'task'}, **self.paths)
         self.sync(created={'requestId': request['requestId'], 'browserWindowId': 2, 'tabId': 7})
@@ -154,6 +174,52 @@ class BrowserEventsTests(unittest.TestCase):
                                          'browserWindowId': 2}, **self.paths)
         self.assertEqual(result['targetEvidence']['mode'], 'selected')
         self.assertIsNone(result['targetEvidence']['createdRequestId'])
+
+    def test_pending_creation_is_reused_even_after_thirty_seconds(self):
+        self.await_window()
+        self.sync()
+        first = events.internal_action({'action': 'create_target', 'taskId': 'task'}, **self.paths)
+        with events.event_store(self.store) as data:
+            data['peer']['createRequest']['issuedAt'] -= 60
+        repeated = events.internal_action({'action': 'create_target', 'taskId': 'task'}, **self.paths)
+        self.assertEqual(repeated['requestId'], first['requestId'])
+        self.assertTrue(repeated['reused'])
+        with self.assertRaisesRegex(ValueError, '已有创建请求'):
+            events.internal_action({'action': 'create_target', 'taskId': 'task',
+                                    'url': 'https://example.org/new'}, **self.paths)
+
+    def test_created_target_is_reused_and_bound_task_cannot_create(self):
+        self.await_window()
+        self.sync()
+        first = events.internal_action({'action': 'create_target', 'taskId': 'task'}, **self.paths)
+        self.sync(created={'requestId': first['requestId'], 'browserWindowId': 2, 'tabId': 7})
+        repeated = events.internal_action({'action': 'create_target', 'taskId': 'task'}, **self.paths)
+        self.assertFalse(repeated['requested'])
+        self.assertTrue(repeated['reused'])
+        self.assertEqual((repeated['browserWindowId'], repeated['tabId']), (2, 7))
+        self.assertIsNone(self.sync()['createRequest'])
+        self.bind_native_window()
+        with self.assertRaisesRegex(ValueError, '已有目标须复用'):
+            events.internal_action({'action': 'create_target', 'taskId': 'task'}, **self.paths)
+
+    def test_candidates_accepts_current_task_id_without_losing_permissions(self):
+        self.sync()
+        result = events.internal_action({'action': 'candidates', 'taskId': 'task'}, **self.paths)
+        self.assertEqual(result['nativeConnection'], 'connected')
+        with self.assertRaisesRegex(ValueError, '当前活动任务'):
+            events.internal_action({'action': 'candidates', 'taskId': 'other'}, **self.paths)
+        self.request({'action': 'sync', 'enabled': True, 'permission': False})
+        result = events.internal_action({'action': 'candidates', 'taskId': 'task'}, **self.paths)
+        self.assertFalse(result['globalPermission'])
+        self.assertEqual(result['candidates'], [])
+
+    def test_bad_fields_report_names_without_values(self):
+        with self.assertRaises(ValueError) as caught:
+            events.internal_action({'action': 'assign', 'taskId': 'task', 'tabId': 7,
+                                    'unexpected': 'content-must-not-be-reported'}, **self.paths)
+        self.assertIn('缺少 [browserWindowId]', str(caught.exception))
+        self.assertIn('多余 [unexpected]', str(caught.exception))
+        self.assertNotIn('content-must-not-be-reported', str(caught.exception))
 
     SNAPSHOT = {'url': 'https://example.org/path', 'readyState': 'complete', 'elementCount': 12,
                 'elements': [{'ref': 1, 'tag': 'a', 'role': 'link', 'name': 'Docs',
