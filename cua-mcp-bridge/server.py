@@ -13,6 +13,7 @@ Requires Python 3.9+ (system /usr/bin/python3). No third-party packages.
 import collections
 import json
 import os
+import urllib.request
 import subprocess
 import sys
 import threading
@@ -51,8 +52,23 @@ SERVER_NAME = "workbuddy-cua"
 SERVER_VERSION = "1.0.0"
 DEFAULT_PROTOCOL = "2024-11-05"
 
-SHOTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "shots")
+def shots_directory():
+    """Screenshots must land somewhere the signed app bundle never owns."""
+    override = os.environ.get("CUA_DIAGNOSTICS_DIR")
+    if override:
+        return os.path.join(override, "shots")
+    return os.path.join(os.path.expanduser("~/Library/Application Support/workbuddy-cua"), "shots")
+
+
+SHOTS_DIR = shots_directory()
 READ_ONLY = os.environ.get("CUA_READ_ONLY", "").strip() in ("1", "true", "yes")
+CONTROL_URL = os.environ.get("CUA_CONTROL_URL", "http://127.0.0.1:47631/")
+CAPABILITIES = {
+    "cua_situation": "native_observe", "cua_state": "native_observe", "cua_visual_state": "native_observe",
+    "cua_screenshot": "native_observe", "cua_wait_ready": "native_observe",
+    "cua_click": "native_input", "cua_hover": "native_input", "cua_scroll": "native_input", "cua_drag": "native_input",
+    "cua_type_text": "native_input", "cua_paste": "native_input", "cua_key": "native_input", "cua_set_value": "native_input",
+}
 ALLOWLIST = [x.strip().lower() for x in os.environ.get("CUA_ALLOWLIST", "").split(",") if x.strip()]
 MAX_TREE_CHARS = 24000
 
@@ -64,6 +80,35 @@ STATE = {
     "snapshot_app": None,
     "snapshot_window": None,
 }
+
+
+def control_snapshot():
+    """Read the resident menu bar once. No process means the current behavior remains."""
+    try:
+        with urllib.request.urlopen(CONTROL_URL, timeout=0.15) as response:
+            payload = json.loads(response.read(4096).decode())
+    except (OSError, ValueError, json.JSONDecodeError):
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def capability_block(name, args, switches):
+    if not isinstance(switches, dict):
+        return None
+    if switches.get("master") is False and name != "cua_permissions":
+        return "master"
+    key = CAPABILITIES.get(name)
+    if name == "cua_apps" and isinstance(args, dict) and args.get("action") == "launch":
+        key = "app_launch"
+    if name == "cua_windows" and isinstance(args, dict) and args.get("action") in ("activate", "share", "unshare"):
+        key = "native_input"
+    if name == "cua_browser_session" and isinstance(args, dict) and args.get("action") in ("start", "attach"):
+        key = "app_launch"
+    if name == "cua_browser_events" and isinstance(args, dict) and args.get("action") in ("command", "assign", "create_target", "select_tab"):
+        key = "browser"
+    if key and switches.get(key) is False:
+        return key
+    return None
 
 
 def log(message):
@@ -454,6 +499,21 @@ def request_share(app, window, source, duration=600, require_frame=True):
     return connection, preview
 
 
+def browser_channel_state():
+    """Extension presence, not a task binding: fresh heartbeat plus consent."""
+    import browser_events
+    try:
+        data = browser_events.read_file(browser_events.EVENT_FILE, {"version": 1, "tasks": {}})
+    except (ValueError, OSError):
+        return False
+    peer = data.get("peer") if isinstance(data, dict) else None
+    if not isinstance(peer, dict):
+        return False
+    if time.time() - (peer.get("lastSeen") or 0) >= 20:
+        return False
+    return bool(peer.get("enabled") and peer.get("permission") and peer.get("clientVersion"))
+
+
 def native_preview_matches(task_id):
     """A browser tab lease alone does not prove a WindowServer capture target."""
     from browser_events import status
@@ -695,8 +755,12 @@ def hold_power_guard():
     if POWER_GUARD["active"] and now < POWER_GUARD["nextRenewAt"]:
         return {}
     try:
-        payload = call_helper("powerGuard", {"action": "hold", "durationSeconds": POWER_GUARD_SECONDS},
-                              timeout=5) or {}
+        params = {"action": "hold", "durationSeconds": POWER_GUARD_SECONDS}
+        switches = control_snapshot()
+        # A new lease records the switch. Renewals omit it so the running task stays unchanged.
+        if not POWER_GUARD["active"] and isinstance(switches, dict) and switches.get("locked_use") is False:
+            params["lockedUse"] = False
+        payload = call_helper("powerGuard", params, timeout=5) or {}
     except HelperError:
         return {}
     guard = payload.get("guard") or {}
@@ -1089,11 +1153,13 @@ def tool_permissions(args):
     locked_use = privacy.get("lockedUse")
     if not isinstance(locked_use, dict):
         locked_use = {}
+    # The native side hardcodes this field; the extension host is the only real
+    # source for whether a browser tab is actually reachable.
     payload = {
         "platform": caps.get("platform"),
         "permissions": caps.get("permissions"),
         "sessionLocked": caps.get("sessionLocked"),
-        "browserChannel": caps.get("browser"),
+        "browserChannel": browser_channel_state(),
         "coordinateSpace": caps.get("coordinateSpace"),
         "responsibleApp": launch.get("name"),
         "responsiblePath": launch.get("path"),
@@ -2401,11 +2467,20 @@ def call_tool(name, args):
             OPERATION_TRACE_ID = None
 
 
+def capability_failure(name, key):
+    return {"content": [{"type": "text", "text": "CAPABILITY_DISABLED: %s 已关闭，本次调用未执行" % key}],
+            "isError": True, "errorCode": "CAPABILITY_DISABLED"}
+
+
 def _call_tool(name, args):
     global TASK_DISPATCH, WAIT_DEADLINE
     tool = TOOL_MAP.get(name)
     if not tool:
         return {"content": [{"type": "text", "text": "未知工具: %s" % name}], "isError": True}
+    switches = control_snapshot()
+    blocked = capability_block(name, args, switches or {})
+    if blocked:
+        return capability_failure(name, blocked)
     if READ_ONLY and not tool["readOnly"]:
         return {"content": [{"type": "text", "text": "CUA_READ_ONLY=1，输入类工具已禁用"}], "isError": True}
     try:
@@ -2432,6 +2507,10 @@ def _call_tool(name, args):
             return out
         return {"content": [{"type": "text", "text": out}]}
     except HelperError as exc:
+        # The failed attempt is not retried. Only the current switch state can replace its result.
+        blocked = capability_block(name, args, control_snapshot() or {})
+        if blocked:
+            return capability_failure(name, blocked)
         text = "%s: %s" % (exc.code, exc.message)
         hint = HINTS.get(exc.code)
         if not hint and "absent from the selected snapshot" in exc.message:

@@ -22,7 +22,7 @@ struct RequestParameters: Sendable {
             switch values["action"]?.string {
             case "hold":
                 guard ["action", "appHandle", "windowId"].allSatisfy({ values[$0] != nil }),
-                      Set(values.keys).isSubset(of: ["action", "appHandle", "windowId", "durationSeconds", "source"]) else {
+                      Set(values.keys).isSubset(of: ["action", "appHandle", "windowId", "durationSeconds", "source", "waitForFrame"]) else {
                     throw Self.invalid("hold 需要 appHandle、windowId，可选 durationSeconds 与 source")
                 }
             case "release", "status":
@@ -34,8 +34,8 @@ struct RequestParameters: Sendable {
         if request.method == "powerGuard" {
             switch values["action"]?.string {
             case "hold":
-                guard Set(values.keys).isSubset(of: ["action", "durationSeconds"]) else {
-                    throw Self.invalid("hold 仅接受可选的 durationSeconds")
+                guard Set(values.keys).isSubset(of: ["action", "durationSeconds", "lockedUse"]) else {
+                    throw Self.invalid("hold 仅接受可选的 durationSeconds 与 lockedUse")
                 }
             case "release", "status", "unlock", "unlockInspect", "lockSynthetic":
                 guard Set(values.keys) == ["action"] else {

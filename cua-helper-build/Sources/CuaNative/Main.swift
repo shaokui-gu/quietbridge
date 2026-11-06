@@ -35,6 +35,14 @@ import Darwin
                 app.run()
                 return
             }
+            if arguments.first == "--menubar" {
+                let app = NSApplication.shared
+                app.setActivationPolicy(.accessory)
+                let panel = MenuBarPanel()
+                panel.start()
+                withExtendedLifetime(panel) { app.run() }
+                return
+            }
             if arguments.first == "--ensure-shared" {
                 try SharedHelperLauncher.ensure(SharedHelperOptions(arguments: arguments))
                 return
@@ -49,6 +57,16 @@ import Darwin
                 withExtendedLifetime(server) { app.run() }
                 return
             }
+            // Opened from Finder or `open`: no stdio channel and no arguments.
+            // Show the resident control panel instead of failing as a proxy.
+            if arguments.isEmpty, Self.launchedWithoutStdioChannel() {
+                let app = NSApplication.shared
+                app.setActivationPolicy(.accessory)
+                let panel = MenuBarPanel()
+                panel.start()
+                withExtendedLifetime(panel) { app.run() }
+                return
+            }
             let configuration = try HelperConfiguration(arguments: arguments)
             try SharedHelperProxy.run(configuration: configuration)
         } catch {
@@ -61,5 +79,15 @@ import Darwin
             if let data = "workbuddy-cua-native: \(diagnostic)\n".data(using: .utf8) { try? FileHandle.standardError.write(contentsOf: data) }
             exit(1)
         }
+    }
+
+    /// The bridge talks to this process over a pipe; Finder and `open` hand it
+    /// /dev/null. Both are character/other devices, so only a tty proves that a
+    /// person ran it by hand and still wants the usage error.
+    static func launchedWithoutStdioChannel(fd: Int32 = STDIN_FILENO) -> Bool {
+        var info = stat()
+        guard fstat(fd, &info) == 0 else { return false }
+        guard (info.st_mode & S_IFMT) != S_IFIFO else { return false }
+        return isatty(fd) == 0
     }
 }

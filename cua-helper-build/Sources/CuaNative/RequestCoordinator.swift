@@ -376,7 +376,8 @@ import Darwin
             guard seconds >= PowerGuard.minimumSeconds, seconds <= PowerGuard.maximumSeconds else {
                 throw RequestParameters.invalid("durationSeconds 必须在 \(Int(PowerGuard.minimumSeconds))...\(Int(PowerGuard.maximumSeconds)) 之间")
             }
-            guard TaskPrivacyController.shared.hold(seconds: seconds) else {
+            let lockedUse = try params.optionalBoolean("lockedUse") ?? true
+            guard TaskPrivacyController.shared.hold(seconds: seconds, lockedUse: lockedUse) else {
                 throw NativeFailure(code: "MANUAL_AUTHENTICATION_REQUIRED", message: "用户已接管；先结束当前任务，再显式绑定新任务")
             }
             var guardStatus: JSONValue

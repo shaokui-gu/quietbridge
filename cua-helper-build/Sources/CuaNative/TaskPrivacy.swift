@@ -158,7 +158,7 @@ final class TaskPrivacyController {
     }
 
     @discardableResult
-    func hold(seconds: TimeInterval) -> Bool {
+    func hold(seconds: TimeInterval, lockedUse: Bool = true) -> Bool {
         guard !pausedByUser else { return false }
         let clamped = min(max(seconds, Self.minimumSeconds), Self.maximumSeconds)
         Self.trace("hold \(Int(clamped))s active=\(active) paused=\(pausedByUser) locked=\(String(describing: sessionState()))")
@@ -170,8 +170,12 @@ final class TaskPrivacyController {
             lockRequestInFlight = false
             lastError = nil
             releaseAfterHandoff = false
-            LockedUseAuthorizationServer.shared.start()
-            LockedUseAuthorizationServer.shared.beginTask()
+            // A switch applies only when this lease starts. Renewals keep the
+            // capability decision already attached to the running task.
+            if lockedUse {
+                LockedUseAuthorizationServer.shared.start()
+                LockedUseAuthorizationServer.shared.beginTask()
+            }
             startTicker()
             observeScreenChanges()
             transition("waiting-for-system-lock")

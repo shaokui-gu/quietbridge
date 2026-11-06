@@ -811,7 +811,9 @@ class TaskWindowTests(unittest.TestCase):
 
     def test_bind_holds_power_guard_and_end_releases_it(self):
         # 锁屏不会终止进程，空闲睡眠才会；断言必须跟着任务租约出现和消失。
-        bound = self.bind()
+        # 隔离正在运行的菜单栏，让这里只验证无面板时的既有参数。
+        with mock.patch.object(server, "control_snapshot", return_value=None):
+            bound = self.bind()
         self.assertTrue(bound["powerGuard"]["holding"])
         self.assertTrue(bound["powerGuard"]["privacy"]["active"])
         self.assertTrue(bound["powerGuard"]["privacy"]["shieldVisible"])

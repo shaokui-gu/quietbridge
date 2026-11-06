@@ -19,7 +19,7 @@ enum NativeProtocol {
         "paste": ["appHandle", "format", "maxClipboardBytes", "maxDepth", "maxElements", "pasteReadTimeoutMs", "text"],
         "performSecondaryAction": ["action", "appHandle", "elementIndex", "snapshotId"],
         "permissionStatus": [],
-        "powerGuard": ["action", "durationSeconds"],
+        "powerGuard": ["action", "durationSeconds", "lockedUse"],
         "pressKey": ["appHandle", "key", "modifiers"],
         "preview": ["action", "appHandle", "durationSeconds", "source", "windowId"],
         "requestPermission": ["permission"],
