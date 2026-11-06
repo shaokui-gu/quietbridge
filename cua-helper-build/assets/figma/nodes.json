@@ -1,0 +1,13 @@
+{
+  "status-enabled": "9:2",
+  "status-paused": "9:7",
+  "status-attention": "9:12",
+  "cursor": "9:62",
+  "app": "9:66",
+  "browser": "9:71",
+  "preview": "9:76",
+  "log": "9:81",
+  "lock": "9:90",
+  "quit": "11:124",
+  "eye": "9:57"
+}

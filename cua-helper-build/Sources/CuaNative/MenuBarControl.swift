@@ -47,6 +47,15 @@ struct CapabilitySwitches: Equatable, Sendable {
     }
 
     var snapshot: [String: Bool] { Dictionary(uniqueKeysWithValues: Self.keys.map { ($0, enabled($0)) }) }
+
+    // The panel shows the person's choices even while master gates the API.
+    var preferences: [String: Bool] {
+        var ungated = self
+        ungated.master = true
+        var values = ungated.snapshot
+        values["master"] = master
+        return values
+    }
 }
 
 enum CapabilityRouting {
@@ -70,6 +79,7 @@ final class CapabilityControl: @unchecked Sendable {
     private var switches = CapabilitySwitches()
 
     func snapshot() -> [String: Bool] { lock.withLock { switches.snapshot } }
+    func preferences() -> [String: Bool] { lock.withLock { switches.preferences } }
     func set(_ key: String, _ value: Bool) -> [String: Bool]? {
         lock.withLock {
             guard switches.set(key, value) else { return nil }

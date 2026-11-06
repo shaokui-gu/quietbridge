@@ -1,11 +1,6 @@
 const $ = id => document.getElementById(id);
 let hasPermission = false;
 let refreshSequence = 0;
-let reviewKey = '';
-let reviewImage = null;
-let reviewAnnotations = [];
-let reviewSelection = null;
-let reviewStart = null;
 $('extid').textContent = chrome.runtime.id || '未知';
 
 async function send(message) {
@@ -22,62 +17,6 @@ function showError(message) {
 function setValue(id, text, tone = '') {
   $(id).textContent = text;
   $(id).className = `row-value ${tone}`;
-}
-
-function drawReview() {
-  if (!reviewImage) return;
-  const canvas = $('review-canvas');
-  const ctx = canvas.getContext('2d');
-  canvas.width = reviewImage.naturalWidth;
-  canvas.height = reviewImage.naturalHeight;
-  ctx.drawImage(reviewImage, 0, 0);
-  const scale = Math.max(1, canvas.width / 800);
-  ctx.lineWidth = 3 * scale;
-  ctx.font = `bold ${16 * scale}px sans-serif`;
-  const drawBox = (box, index) => {
-    const x = box.x * canvas.width, y = box.y * canvas.height;
-    const w = box.width * canvas.width, h = box.height * canvas.height;
-    ctx.strokeStyle = '#df4936';
-    ctx.strokeRect(x, y, w, h);
-    if (index != null) {
-      ctx.fillStyle = '#df4936';
-      const label = String(index + 1);
-      const labelWidth = ctx.measureText(label).width + 12 * scale;
-      ctx.fillRect(x, y, labelWidth, 24 * scale);
-      ctx.fillStyle = '#fff';
-      ctx.fillText(label, x + 6 * scale, y + 17 * scale);
-    }
-  };
-  reviewAnnotations.forEach((item, index) => drawBox(item.box, index));
-  if (reviewSelection) drawBox(reviewSelection, null);
-}
-
-function renderReview(review) {
-  $('review-panel').hidden = !review;
-  const key = review ? JSON.stringify([review.capturedAt, review.annotations]) : '';
-  if (key === reviewKey) return;
-  reviewKey = key;
-  reviewSelection = null;
-  reviewImage = null;
-  reviewAnnotations = review?.annotations || [];
-  $('review-notes').replaceChildren();
-  reviewAnnotations.forEach((item, index) => {
-    const row = document.createElement('li');
-    const label = document.createElement('span');
-    label.textContent = `${index + 1}. ${item.note}`;
-    const remove = document.createElement('button');
-    remove.type = 'button';
-    remove.className = 'remove-annotation';
-    remove.textContent = '删除';
-    remove.addEventListener('click', () => run(() => send({ action: 'remove_review_annotation', index })));
-    row.appendChild(label);
-    row.appendChild(remove);
-    $('review-notes').appendChild(row);
-  });
-  if (!review) { reviewImage = null; return; }
-  const img = new Image();
-  img.onload = () => { if (reviewKey === key) { reviewImage = img; drawReview(); } };
-  img.src = `data:image/jpeg;base64,${review.image}`;
 }
 
 async function refresh() {
@@ -147,41 +86,6 @@ async function refresh() {
   showError(/forbidden/i.test(error)
     ? `${error}（注册的 allowed_origins 不含当前扩展 ID ${chrome.runtime.id}）` : error);
   $('state').textContent = r.state ? JSON.stringify(r.state, null, 2) : '无观察状态；等待内部任务和目标分配';
-  $('current-task').hidden = !r.taskSummary;
-  $('task-site').textContent = r.taskSummary?.url || '等待页面状态';
-  $('task-id').textContent = r.taskSummary?.taskId ? `任务 ID：${r.taskSummary.taskId}` : '';
-  $('stop-task').hidden = !r.taskSummary?.canStop;
-  $('capture-review').disabled = !r.state?.documentId;
-  const names = { snapshot: '读取页面快照', screenshot: '页面截图', diagnostics: '页面诊断',
-    click: '点击', fill: '填写', select: '选择', scroll: '滚动', navigate: '导航', keypress: '按键', download: '候选下载' };
-  const outcomes = { completed: '已返回', not_performed: '未执行', failed: '失败', started: '已开始' };
-  const activity = $('activity');
-  activity.replaceChildren();
-  for (const item of (r.activity || [])) {
-    const row = document.createElement('li');
-    const time = new Date(item.at);
-    row.textContent = `${Number.isNaN(time.getTime()) ? '时间未知' : time.toLocaleTimeString()} · ${names[item.operation] || '操作'} · ${outcomes[item.outcome] || '未知'}${item.site ? ` · ${item.site}` : ''}`;
-    activity.appendChild(row);
-  }
-  if (!activity.children.length) {
-    const row = document.createElement('li');
-    row.textContent = '暂无活动记录';
-    activity.appendChild(row);
-  }
-  const downloads = $('downloads');
-  downloads.replaceChildren();
-  const downloadStates = { started: '已开始', inProgress: '下载中', completed: '已完成', canceled: '已取消' };
-  for (const item of (r.downloads || [])) {
-    const row = document.createElement('li');
-    row.textContent = `${item.filename} · ${downloadStates[item.state] || '状态未知'}`;
-    downloads.appendChild(row);
-  }
-  if (!downloads.children.length) {
-    const row = document.createElement('li');
-    row.textContent = '暂无候选下载';
-    downloads.appendChild(row);
-  }
-  renderReview(r.review);
 }
 
 async function run(fn) {
@@ -208,76 +112,6 @@ $('enable').addEventListener('click', () => {
   });
 });
 $('disable').addEventListener('click', () => run(() => send({ action: 'disable' })));
-$('stop-task').addEventListener('click', () => run(() => send({ action: 'stop_task' })));
-$('clear-activity').addEventListener('click', () => run(() => send({ action: 'clear_activity' })));
-$('capture-review').addEventListener('click', () => run(() => send({ action: 'capture_review' })));
-const reviewCanvas = $('review-canvas');
-function reviewPoint(event) {
-  const rect = reviewCanvas.getBoundingClientRect();
-  return { x: Math.max(0, Math.min(1, (event.clientX - rect.left) / rect.width)),
-    y: Math.max(0, Math.min(1, (event.clientY - rect.top) / rect.height)) };
-}
-reviewCanvas.addEventListener('pointerdown', event => {
-  if (!reviewImage) return;
-  reviewStart = reviewPoint(event);
-  reviewSelection = null;
-  drawReview();
-  reviewCanvas.setPointerCapture(event.pointerId);
-});
-reviewCanvas.addEventListener('pointermove', event => {
-  if (!reviewStart) return;
-  const end = reviewPoint(event);
-  reviewSelection = { x: Math.min(reviewStart.x, end.x), y: Math.min(reviewStart.y, end.y),
-    width: Math.abs(end.x - reviewStart.x), height: Math.abs(end.y - reviewStart.y) };
-  drawReview();
-});
-reviewCanvas.addEventListener('pointerup', () => { reviewStart = null; });
-reviewCanvas.addEventListener('pointercancel', () => { reviewStart = null; reviewSelection = null; drawReview(); });
-$('save-review').addEventListener('click', () => {
-  const note = $('review-note').value.trim();
-  if (!reviewSelection || reviewSelection.width < 0.005 || reviewSelection.height < 0.005 || !note) {
-    showError('请先选择截图区域并填写批注内容');
-    return;
-  }
-  return run(async () => {
-    await send({ action: 'annotate_review', box: reviewSelection, note });
-    $('review-note').value = '';
-  });
-});
-$('export-review').addEventListener('click', () => {
-  if (!reviewImage) return;
-  reviewSelection = null;
-  drawReview();
-  const output = document.createElement('canvas');
-  const scale = Math.max(1, reviewCanvas.width / 800);
-  const fontSize = 16 * scale, padding = 16 * scale, lineHeight = 24 * scale;
-  const ctx = output.getContext('2d');
-  ctx.font = `${fontSize}px sans-serif`;
-  const lines = [];
-  reviewAnnotations.forEach((item, index) => {
-    let line = `${index + 1}. `;
-    for (const character of item.note) {
-      if (ctx.measureText(line + character).width > reviewCanvas.width - padding * 2 && line.trim()) {
-        lines.push(line);
-        line = '';
-      }
-      line += character;
-    }
-    lines.push(line);
-  });
-  output.width = reviewCanvas.width;
-  output.height = reviewCanvas.height + (lines.length ? padding * 2 + lines.length * lineHeight : 0);
-  ctx.fillStyle = '#fff';
-  ctx.fillRect(0, 0, output.width, output.height);
-  ctx.drawImage(reviewCanvas, 0, 0);
-  ctx.font = `${fontSize}px sans-serif`;
-  ctx.fillStyle = '#192a23';
-  lines.forEach((line, index) => ctx.fillText(line, padding, reviewCanvas.height + padding + fontSize + index * lineHeight));
-  const link = document.createElement('a');
-  link.download = 'workbuddy-cua-review.png';
-  link.href = output.toDataURL('image/png');
-  link.click();
-});
 $('refresh').addEventListener('click', () => run(async () => {}));
 setInterval(() => { if (document.visibilityState === 'visible') refresh().catch(() => {}); }, 5000);
 run(async () => {});

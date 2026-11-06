@@ -350,7 +350,7 @@ def bound_native_target(task):
 
 def sync_peer(message, origin, task_file, event_file):
     base = {'action', 'enabled', 'permission'}
-    optional = ('candidates', 'created', 'commandResult', 'clientVersion', 'assignmentTitle', 'capabilities')
+    optional = ('candidates', 'created', 'commandResult', 'clientVersion', 'assignmentTitle', 'capabilities', 'panelState', 'panelResult')
     allowed = {frozenset(base | set(combo))
                for size in range(len(optional) + 1)
                for combo in itertools.combinations(optional, size)}
@@ -359,6 +359,36 @@ def sync_peer(message, origin, task_file, event_file):
     now = time.time()
     with event_store(event_file) as data:
         peer = data.setdefault('peer', {})
+        if 'panelState' in message:
+            state = message['panelState']
+            require(type(state) is dict and set(state) == {'taskSummary', 'activity', 'downloads', 'review'}, '面板状态字段错误')
+            require(len(json.dumps(state, ensure_ascii=False).encode('utf-8')) <= 600000, '面板状态过大')
+            task_id, _ = active_task(task_file)
+            summary = state['taskSummary']
+            require(summary is None or type(summary) is dict, '面板任务格式错误')
+            if summary and summary.get('taskId') != task_id:
+                state = {'taskSummary': None, 'activity': [], 'downloads': [], 'review': None}
+                summary = None
+            require(type(state['activity']) is list and len(state['activity']) <= 100 and
+                    type(state['downloads']) is list and len(state['downloads']) <= 50, '面板列表无效')
+            review = state['review']
+            require(review is None or (type(review) is dict and summary and review.get('taskId') == task_id and
+                    type(review.get('image')) is str and len(review['image']) <= 500000 and
+                    re.fullmatch(r'[A-Za-z0-9+/]+={0,2}', review['image']) and
+                    type(review.get('annotations')) is list and len(review['annotations']) <= 20), '面板截图无效')
+            peer['panelState'] = {**copy.deepcopy(state), 'at': now}
+            if len(json.dumps(data, ensure_ascii=False).encode('utf-8')) > MAX_BYTES - 32768:
+                peer['panelState']['review'] = None
+                peer['panelState']['reviewOmitted'] = bool(review)
+        if 'panelResult' in message:
+            result = message['panelResult']
+            pending = peer.get('panelCommand')
+            require(type(result) is dict and set(result) == {'requestId', 'status', 'error'} and
+                    result['status'] in ('ok', 'error') and type(result['error']) is str and
+                    len(result['error']) <= 200, '面板命令结果无效')
+            if pending and result['requestId'] == pending.get('requestId'):
+                peer['panelResult'] = {**result, 'at': now}
+                peer['panelCommand'] = None
         requested = peer.get('requestCandidates', False)
         if 'candidates' in message:
             require(requested and message['enabled'] and message['permission'], '候选列表未请求或未授权')
@@ -500,6 +530,10 @@ def sync_peer(message, origin, task_file, event_file):
                                           [peer['commandResult']])[-MAX_RESULTS:]
                 # Status needs metadata only; keep large screenshot data once.
                 peer['commandResult'] = {k: v for k, v in peer['commandResult'].items() if k != 'result'}
+                if (type(peer.get('panelState')) is dict and
+                        len(json.dumps(data, ensure_ascii=False).encode('utf-8')) > MAX_BYTES - 32768):
+                    peer['panelState']['reviewOmitted'] = bool(peer['panelState'].get('review'))
+                    peer['panelState']['review'] = None
                 peer['commandSeen'] = (peer.get('commandSeen', []) +
                                        [reply['requestId']])[-MAX_SEEN:]
                 peer['command'] = None
@@ -513,12 +547,29 @@ def sync_peer(message, origin, task_file, event_file):
                         createRequest=None, createdTargets=[],
                         command=None, commandResult=None, pendingVerify=None,
                         commandResults=[], commandSeen=[])
+            peer['panelState'] = {'taskSummary': None, 'activity': [], 'downloads': [], 'review': None, 'at': now}
         # 单活动任务模型：其他任务的浏览器分配一律淘汰，避免失效任务长期占用标签。
         active_id, _ = active_task(task_file)
         data['tasks'] = {k: v for k, v in data['tasks'].items() if k == active_id}
         record = current_assignment(data, task_file)
         task_id, task = active_task(task_file)
         assignment = copy.deepcopy(record) if record and record['origin'] == origin else None
+        panel_command = peer.get('panelCommand')
+        if panel_command:
+            valid = (type(panel_command) is dict and
+                     type(panel_command.get('requestId')) is str and
+                     re.fullmatch('[0-9a-f]{32}', panel_command['requestId']) and
+                     panel_command.get('operation') in ('stop_task', 'capture_review', 'clear_activity', 'annotate_review', 'remove_review_annotation') and
+                     task is not None and panel_command.get('taskId') == task_id and
+                     (panel_command.get('operation') not in ('stop_task', 'capture_review') or
+                      (assignment is not None and not assignment.get('paused'))) and
+                     type(panel_command.get('expiresAt')) in (int, float) and now < panel_command['expiresAt'] <= now + 30 and
+                     message['enabled'] and message['permission'])
+            if not valid:
+                peer['panelResult'] = {'requestId': panel_command.get('requestId', '') if type(panel_command) is dict else '', 'status': 'error',
+                                       'error': '请求已过期或任务已变化，已下发的操作可能已执行', 'at': now}
+                peer['panelCommand'] = None
+                panel_command = None
         if assignment is not None:
             # WindowServer mapping evidence belongs to the host, not the observer.
             # Its read-only wire contract must not claim or inherit that attestation.
@@ -541,10 +592,12 @@ def sync_peer(message, origin, task_file, event_file):
             command.setdefault('deliveredAt', now)
             peer['command'] = command
         return {'ok': True, 'protocolVersion': 2, 'heartbeatAt': now,
+                'panelBridge': True,
                 'activeTaskId': task_id,
                 'requestCandidates': bool(peer.get('requestCandidates')),
                 'createRequest': copy.deepcopy(peer.get('createRequest')),
                 'command': copy.deepcopy(command),
+                'panelCommand': copy.deepcopy(panel_command),
                 'taskAssignment': ('permission_missing' if not message['permission'] else
                     'disabled' if not message['enabled'] else 'paused' if assignment and assignment.get('paused') else
                     'assigned' if assignment else

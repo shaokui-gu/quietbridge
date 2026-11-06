@@ -49,6 +49,8 @@ let createdReport = null;
 let lastCreateRequestId = null;
 let assignmentTitle = null;
 let commandReport = null;
+let panelReport = null;
+let panelBridge = false;
 let lastCommandId = null;
 let keepAlivePort = null;
 let keepAliveTimer;
@@ -338,13 +340,20 @@ async function sync() {
     });
     keepAlive(on && permission);
     const payload = { action: 'sync', enabled: on, permission, clientVersion: '0.3.0', capabilities: ['cdp_input', 'document_binding', 'background_popups'] };
+    if (panelBridge) {
+      // A command screenshot and a review image can each be large; send them on separate turns.
+      if (!commandReport?.result?.data) payload.panelState = await panelSnapshot();
+      if (panelReport) payload.panelResult = panelReport;
+    }
     if (assignmentTitle) payload.assignmentTitle = assignmentTitle;
     if (createdReport) payload.created = createdReport;
     if (commandReport) payload.commandResult = commandReport;
     let r = await native(payload);
+    panelBridge = r.panelBridge === true;
     // host 接受后才清除待回传证据；抛错时保留到下一轮。
     if (payload.created) createdReport = null;
     if (payload.commandResult) commandReport = null;
+    if (payload.panelResult) panelReport = null;
     if (revision !== enableRevision) return;
     if (r.protocolVersion !== 2 || !Number.isFinite(r.heartbeatAt)) throw new Error('host 协议不兼容');
     connection = { ...connection, status: 'connected', lastHeartbeatAt: r.heartbeatAt * 1000 };
@@ -376,12 +385,49 @@ async function sync() {
       // 只有本轮真正产生了新结果才立刻回传，避免重复下发导致空转。
       if (commandReport !== before) serial(sync);
     }
+    if (r.panelCommand && on && permission && await enabled() && await permitted()) {
+      await runPanelCommand(r.panelCommand);
+      serial(sync);
+    }
   } catch (error) {
     connection = { ...connection, status: 'host_unavailable',
       lastError: String(error?.message || '本地连接失败').slice(0, 500) };
     assignmentStatus = 'no_assignment';
     await clearObservation();
   } finally { schedule(); }
+}
+
+async function panelSnapshot() {
+  const s = await read();
+  const { activity = [], review = null, downloads = [], recentTask = null } =
+    await chrome.storage.session.get(['activity', 'review', 'downloads', 'recentTask']);
+  const taskSummary = s ? { taskId: s.taskId, url: s.url, canStop: true,
+    assignmentVersion: s.assignmentVersion, documentId: s.documentId || null } :
+    assignmentStatus === 'paused' && recentTask ? { ...recentTask, canStop: false } : null;
+  return { taskSummary, activity: taskSummary ? activity.filter(item => item.taskId === taskSummary.taskId) : [],
+    downloads: taskSummary ? downloads.filter(item => item.taskId === taskSummary.taskId) : [],
+    review: taskSummary && review?.taskId === taskSummary.taskId ? review : null };
+}
+
+async function runPanelCommand(command) {
+  const { lastPanelCommand } = await chrome.storage.session.get('lastPanelCommand');
+  if (lastPanelCommand?.requestId === command.requestId) {
+    panelReport = { requestId: command.requestId, status: 'error', error: '命令已下发但结果未知，未重复执行' };
+    return;
+  }
+  await chrome.storage.session.set({ lastPanelCommand: { requestId: command.requestId, at: Date.now() } });
+  try {
+    await control(async () => {
+      const current = await panelSnapshot();
+      if (current.taskSummary?.taskId !== command.taskId || command.expiresAt * 1000 <= Date.now()) throw new Error('任务已变化或请求已过期');
+      if (command.assignmentVersion != null && (current.taskSummary.assignmentVersion !== command.assignmentVersion ||
+          current.taskSummary.documentId !== command.documentId)) throw new Error('任务页面已变化，请刷新后重试');
+      await performPanelAction({ ...command.arguments, action: command.operation });
+    });
+    panelReport = { requestId: command.requestId, status: 'ok', error: '' };
+  } catch (error) {
+    panelReport = { requestId: command.requestId, status: 'error', error: String(error?.message || '操作失败').slice(0, 200) };
+  }
 }
 for (const [name, type] of Object.entries({ onBeforeNavigate: 'before', onCommitted: 'committed',
   onDOMContentLoaded: 'dom', onCompleted: 'completed', onErrorOccurred: 'error', onHistoryStateUpdated: 'history' })) {
@@ -427,6 +473,53 @@ chrome.tabs.onRemoved.addListener(tabId => {
     }
   });
 });
+async function performPanelAction(message) {
+  if (message.action === 'stop_task') {
+    const target = await read();
+    if (!target?.taskId || !target.token) throw new Error('当前没有可停止的浏览器任务');
+    await chrome.storage.session.set({ recentTask: { taskId: target.taskId, url: target.url } });
+    await clearObservation();
+    try { await native({ action: 'pause', taskId: target.taskId, token: target.token }); }
+    catch (error) {
+      await chrome.storage.local.set({ enabled: false, pendingEnable: null, disabledAt: Date.now() });
+      throw new Error(`未能确认任务暂停，观察已停用：${error.message}`);
+    }
+    await chrome.storage.local.set({ boundTarget: null });
+    assignmentStatus = 'paused';
+    syncLater();
+  } else if (message.action === 'clear_activity') {
+    const clear = activityQueue.then(() => chrome.storage.session.set({ activity: [] }));
+    activityQueue = clear.catch(() => {});
+    await clear;
+  } else if (message.action === 'capture_review') {
+    const target = await read();
+    if (!target?.taskId || !target.documentId) throw new Error('当前没有可截图的任务页面');
+    const command = { operation: 'screenshot', taskId: target.taskId, bindingId: target.bindingId,
+      assignmentVersion: target.assignmentVersion, tabId: target.tabId, browserWindowId: target.browserWindowId,
+      documentId: target.documentId, navigationEpoch: target.navigationEpoch, expiresAt: Date.now() / 1000 + 8 };
+    const image = await background.run(command, target);
+    await chrome.storage.session.set({ review: { taskId: target.taskId, documentId: target.documentId,
+      image: image.data, capturedAt: Date.now(), annotations: [] } });
+    await recordActivity(target, 'screenshot', 'completed').catch(() => {});
+  } else if (message.action === 'annotate_review' || message.action === 'remove_review_annotation') {
+    let target = await read();
+    const { review, recentTask } = await chrome.storage.session.get(['review', 'recentTask']);
+    if (!target && assignmentStatus === 'paused') target = recentTask;
+    if (!target?.taskId || review?.taskId !== target.taskId) throw new Error('截图所属任务已变化');
+    if (message.action === 'annotate_review') {
+      const box = message.box;
+      if (typeof message.note !== 'string' || !message.note.trim() || message.note.length > 200 || !box ||
+          !['x', 'y', 'width', 'height'].every(k => typeof box[k] === 'number' && Number.isFinite(box[k])) ||
+          box.x < 0 || box.y < 0 || box.width <= 0 || box.height <= 0 ||
+          box.x + box.width > 1.000001 || box.y + box.height > 1.000001) throw new Error('批注内容或选区无效');
+      review.annotations = [...review.annotations, { box, note: message.note.trim() }].slice(-20);
+    } else {
+      if (!Number.isInteger(message.index) || message.index < 0 || message.index >= review.annotations.length) throw new Error('批注不存在');
+      review.annotations.splice(message.index, 1);
+    }
+    await chrome.storage.session.set({ review });
+  } else throw new Error('不支持此操作');
+}
 chrome.runtime.onMessage.addListener((message, sender, respond) => {
   // popup.html 既可能以弹窗出现（无 tab），也可能被当成普通标签页打开（有 tab）。
   // 后者以前会掉进内容脚本分支，状态消息直接被丢弃，导致两种打开方式显示不一致。
@@ -462,71 +555,18 @@ chrome.runtime.onMessage.addListener((message, sender, respond) => {
         boundTarget: null });
       await clearObservation();
       syncLater();
-    } else if (message.action === 'stop_task') {
-      const target = await read();
-      if (!target?.taskId || !target.token) throw new Error('当前没有可停止的浏览器任务');
-      await chrome.storage.session.set({ recentTask: { taskId: target.taskId, url: target.url } });
-      await clearObservation();
-      try {
-        await native({ action: 'pause', taskId: target.taskId, token: target.token });
-      } catch (error) {
-        await chrome.storage.local.set({ enabled: false, pendingEnable: null, disabledAt: Date.now() });
-        throw new Error(`未能确认任务暂停，观察已停用：${error.message}`);
-      }
-      await chrome.storage.local.set({ boundTarget: null });
-      assignmentStatus = 'paused';
-      syncLater();
-    } else if (message.action === 'clear_activity') {
-      const clear = activityQueue.then(() => chrome.storage.session.set({ activity: [] }));
-      activityQueue = clear.catch(() => {});
-      await clear;
-    } else if (message.action === 'capture_review') {
-      const target = await read();
-      if (!target?.taskId || !target.documentId) throw new Error('当前没有可截图的任务页面');
-      const command = { operation: 'screenshot', taskId: target.taskId, bindingId: target.bindingId,
-        assignmentVersion: target.assignmentVersion, tabId: target.tabId, browserWindowId: target.browserWindowId,
-        documentId: target.documentId, navigationEpoch: target.navigationEpoch, expiresAt: Date.now() / 1000 + 8 };
-      const image = await background.run(command, target);
-      await chrome.storage.session.set({ review: { taskId: target.taskId, documentId: target.documentId,
-        image: image.data, capturedAt: Date.now(), annotations: [] } });
-      await recordActivity(target, 'screenshot', 'completed').catch(() => {});
-    } else if (message.action === 'annotate_review') {
-      let target = await read();
-      const { review, recentTask } = await chrome.storage.session.get(['review', 'recentTask']);
-      if (!target && assignmentStatus === 'paused') target = recentTask;
-      const box = message.box;
-      if (!target?.taskId || review?.taskId !== target.taskId || typeof message.note !== 'string' ||
-          !message.note.trim() || message.note.length > 200 || !box ||
-          !['x', 'y', 'width', 'height'].every(k => typeof box[k] === 'number' && Number.isFinite(box[k])) ||
-          box.x < 0 || box.y < 0 || box.width <= 0 || box.height <= 0 ||
-          box.x + box.width > 1.000001 || box.y + box.height > 1.000001) throw new Error('批注内容或选区无效');
-      review.annotations = [...review.annotations, { box, note: message.note.trim() }].slice(-20);
-      await chrome.storage.session.set({ review });
-    } else if (message.action === 'remove_review_annotation') {
-      let target = await read();
-      const { review, recentTask } = await chrome.storage.session.get(['review', 'recentTask']);
-      if (!target && assignmentStatus === 'paused') target = recentTask;
-      if (!target?.taskId || review?.taskId !== target.taskId || !Number.isInteger(message.index) ||
-          message.index < 0 || message.index >= review.annotations.length) throw new Error('批注不存在');
-      review.annotations.splice(message.index, 1);
-      await chrome.storage.session.set({ review });
+    } else if (['stop_task', 'clear_activity', 'capture_review', 'annotate_review', 'remove_review_annotation'].includes(message.action)) {
+      await performPanelAction(message);
     } else if (message.action !== 'status') throw new Error('不支持此操作');
     if (!await permitted()) {
       await chrome.storage.local.set({ enabled: false });
       await clearObservation();
     }
     const s = await read();
-    const { activity = [], review = null, downloads = [], recentTask = null } = await chrome.storage.session.get(['activity', 'review', 'downloads', 'recentTask']);
     const visible = s ? Object.fromEntries(Object.entries(s).filter(([k]) => !['token', 'bindingId', 'documentUrl'].includes(k))) : null;
-    const taskSummary = s ? { taskId: s.taskId, url: s.url, canStop: true } :
-      assignmentStatus === 'paused' && recentTask ? { ...recentTask, canStop: false } : null;
     return { globalPermission: await permitted() ? 'granted' : 'permission_missing',
       enabled: await enabled(), nativeConnection: { ...connection },
-      taskAssignment: assignmentStatus, state: visible,
-      taskSummary,
-      activity: taskSummary ? activity.filter(item => item.taskId === taskSummary.taskId) : [],
-      review: taskSummary && review?.taskId === taskSummary.taskId ? review : null,
-      downloads: taskSummary ? downloads.filter(item => item.taskId === taskSummary.taskId) : [] };
+      taskAssignment: assignmentStatus, state: visible };
   }).then(result => respond({ ok: true, ...result }), error => respond({ ok: false, error: error.message }));
   return true;
 });

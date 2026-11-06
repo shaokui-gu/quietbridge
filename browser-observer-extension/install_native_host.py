@@ -16,6 +16,7 @@ from pathlib import Path
 import re
 import secrets
 import shlex
+import subprocess
 import sys
 
 # 见 native_host.py：被 serve.py 导入时不得把 __pycache__ 落到扩展目录。
@@ -39,14 +40,25 @@ STATE_FILES = ('task-windows.json', 'browser-events.json')
 
 # 启动器会被 Chrome 长期直接执行，必须指向系统级解释器：不能用当前进程的
 # sys.executable（可能是 IDE/工具自带的临时 Python），否则工具一升级就失效。
-INTERPRETERS = ('/usr/bin/python3', '/opt/homebrew/bin/python3', '/usr/local/bin/python3')
+INTERPRETERS = ('/opt/homebrew/bin/python3', '/usr/local/bin/python3', '/usr/bin/python3')
 
 
 def pick_interpreter():
     for path in INTERPRETERS:
-        if os.access(path, os.X_OK):
-            return Path(path)
-    require(os.access(sys.executable, os.X_OK), '找不到可执行的 python3')
+        if not os.access(path, os.X_OK):
+            continue
+        if path == '/usr/bin/python3' and sys.platform == 'darwin':
+            tools = subprocess.run(['/usr/bin/xcode-select', '-p'], capture_output=True, timeout=5)
+            if tools.returncode:
+                continue
+        try:
+            result = subprocess.run([path, '-c', 'import sys; sys.exit(sys.version_info < (3, 9))'],
+                                    capture_output=True, timeout=5)
+            if result.returncode == 0:
+                return Path(path)
+        except (OSError, subprocess.TimeoutExpired):
+            continue
+    require(sys.version_info >= (3, 9) and os.access(sys.executable, os.X_OK), '需要可用的 Python 3.9+')
     return Path(sys.executable)
 
 

@@ -1,0 +1,28 @@
+#!/bin/bash
+set -euo pipefail
+user="$(/usr/bin/stat -f '%Su' /dev/console)"
+if [[ "$user" == "root" || "$user" == "loginwindow" || "$user" == "_mbsetupuser" ]]; then
+    echo '安装期间桌面用户已退出；请登录后重新安装。' >&2
+    exit 1
+fi
+python=""
+for candidate in /opt/homebrew/bin/python3 /usr/local/bin/python3 /usr/bin/python3; do
+    if [[ "$candidate" == /usr/bin/python3 ]] && ! /usr/bin/xcode-select -p >/dev/null 2>&1; then
+        continue
+    fi
+    if [[ -x "$candidate" ]] && /usr/bin/sudo -H -u "$user" "$candidate" -c 'import sys; sys.exit(sys.version_info < (3, 9))' 2>/dev/null; then
+        python="$candidate"
+        break
+    fi
+done
+if [[ -z "$python" ]]; then
+    echo '未找到 Python 3.9+；安装未完成。' >&2
+    exit 1
+fi
+support='/Library/Application Support/workbuddy-cua'
+# The PKG owns this immutable helper release. Never run a user-controlled
+# interpreter as root, or point MCP at the menu application's signing identity.
+helper="$(/usr/libexec/PlistBuddy -c 'Print :helper' "$support/installation.plist")"
+/usr/bin/sudo -H -u "$user" "$python" -B "$support/deploy.py" --helper "$helper"
+# Application launch is a separate, optional component in the native Installer
+# choices. Browser extension setup stays inside the app's control panel.

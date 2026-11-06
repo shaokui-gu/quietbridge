@@ -28,7 +28,6 @@
         <div class="status-row"><span class="row-icon permission-icon" aria-hidden="true">✓</span><div class="row-main"><div class="row-title">站点权限</div><div class="row-detail">普通 HTTP / HTTPS 站点</div></div><span id="permission" class="row-value">检查中</span></div>
         <div class="status-row"><span class="row-icon task-icon" aria-hidden="true">≡</span><div class="row-main"><div class="row-title">任务分配</div><div id="assignment-detail" class="row-detail">由原生端自动分配</div></div><span id="assignment" class="row-value">检查中</span></div>
       </div>
-      <div id="current-task" class="current-task" hidden><div class="task-heading">当前任务</div><div id="task-site" class="task-site"></div><div id="task-id" class="task-id"></div><button id="stop-task" class="button button-secondary task-stop" type="button">停止此任务的浏览器控制</button><p class="task-stop-note">已发出的操作可能已经执行；恢复需要重新分配目标。</p></div>
       <p id="error" class="error" role="alert" hidden></p>
     </section>
     <section class="information" aria-label="更多信息">
@@ -38,20 +37,6 @@
         <p>执行任务时，页面快照可能包含可交互元素的文字或标签；截图可能包含页面上显示的内容。诊断信息也可能包含页面错误文本。</p>
         <p>在已分配页面可执行快照、诊断、点击、填写、选择、滚动和导航，也可新建复用当前浏览器登录态的任务窗口；窗口不提供数据隔离。页面操作不等同于可信硬件输入，不执行桌面输入，不能绕过需要真实用户手势的控件。</p>
         <p>受限页面会暂停观察。停用观察不会撤销浏览器已授予的站点权限；撤销权限会立即清空观察。</p>
-      </div></details>
-      <details><summary><span>当前任务活动</span><span class="chevron" aria-hidden="true"></span></summary><div class="details-content">
-        <p>仅保留本次浏览器会话中的操作类型和结果。</p><ol id="activity" class="activity"><li>暂无活动记录</li></ol><button id="clear-activity" class="button button-secondary" type="button">清除活动记录</button>
-      </div></details>
-      <details><summary><span>候选下载</span><span class="chevron" aria-hidden="true"></span></summary><div class="details-content">
-        <p>来自当前任务标签的下载事件；保存位置和最终归属请在浏览器下载记录中确认。</p><ol id="downloads" class="activity"><li>暂无候选下载</li></ol>
-      </div></details>
-      <details><summary><span>任务截图与批注</span><span class="chevron" aria-hidden="true"></span></summary><div class="details-content">
-        <button id="capture-review" class="button button-secondary" type="button">截取当前任务页面</button>
-        <div id="review-panel" hidden><canvas id="review-canvas" aria-label="任务页面截图，拖动选择批注区域"></canvas>
-          <label for="review-note">批注内容</label><textarea id="review-note" maxlength="200" rows="2"></textarea>
-          <div class="review-actions"><button id="save-review" class="button button-primary" type="button">添加批注</button><button id="export-review" class="button button-secondary" type="button">导出截图</button></div>
-          <ol id="review-notes" class="activity"></ol>
-        </div>
       </div></details>
       <details><summary><span>诊断信息</span><span class="chevron" aria-hidden="true"></span></summary><div class="details-content diagnostic">
         <div class="diagnostic-label">扩展 ID</div><code id="extid">—</code>

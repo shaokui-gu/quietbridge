@@ -3,6 +3,15 @@ import AppKit
 import Foundation
 import Darwin
 
+@MainActor private final class MenuBarApplicationDelegate: NSObject, NSApplicationDelegate {
+    let panel = MenuBarPanel()
+
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
+        panel.show()
+        return false
+    }
+}
+
 @main enum CuaNativeMain {
     @MainActor static func main() {
         signal(SIGPIPE, SIG_IGN)
@@ -36,11 +45,7 @@ import Darwin
                 return
             }
             if arguments.first == "--menubar" {
-                let app = NSApplication.shared
-                app.setActivationPolicy(.accessory)
-                let panel = MenuBarPanel()
-                panel.start()
-                withExtendedLifetime(panel) { app.run() }
+                runMenuBar()
                 return
             }
             if arguments.first == "--ensure-shared" {
@@ -57,14 +62,11 @@ import Darwin
                 withExtendedLifetime(server) { app.run() }
                 return
             }
-            // Opened from Finder or `open`: no stdio channel and no arguments.
-            // Show the resident control panel instead of failing as a proxy.
-            if arguments.isEmpty, Self.launchedWithoutStdioChannel() {
-                let app = NSApplication.shared
-                app.setActivationPolicy(.accessory)
-                let panel = MenuBarPanel()
-                panel.start()
-                withExtendedLifetime(panel) { app.run() }
+            // Finder may pass a process serial number and does not guarantee
+            // the stdin state used by command-line bridge clients.
+            let finderArguments = arguments.allSatisfy { $0.hasPrefix("-psn_") }
+            if finderArguments && (Bundle.main.bundleIdentifier == "com.workbuddy.cua.menubar" || Self.launchedWithoutStdioChannel()) {
+                runMenuBar()
                 return
             }
             let configuration = try HelperConfiguration(arguments: arguments)
@@ -79,6 +81,15 @@ import Darwin
             if let data = "workbuddy-cua-native: \(diagnostic)\n".data(using: .utf8) { try? FileHandle.standardError.write(contentsOf: data) }
             exit(1)
         }
+    }
+
+    @MainActor private static func runMenuBar() {
+        let app = NSApplication.shared
+        app.setActivationPolicy(.accessory)
+        let delegate = MenuBarApplicationDelegate()
+        app.delegate = delegate
+        delegate.panel.start()
+        withExtendedLifetime(delegate) { app.run() }
     }
 
     /// The bridge talks to this process over a pipe; Finder and `open` hand it

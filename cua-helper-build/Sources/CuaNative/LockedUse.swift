@@ -264,9 +264,10 @@ final class LockedUseAuthorizationServer: @unchecked Sendable {
         let team = values["teamIdentifier"] as? String
         guard protocolVersion == 3 else { return "protocol=\(protocolVersion.map(String.init) ?? "nil")" }
         guard optIn == true else { return "optIn=\(optIn.map(String.init) ?? "nil")" }
-        guard enabled == true else { return "enabled=\(enabled.map(String.init) ?? "nil")" }
         guard bundleID == lockedUsePluginIdentifier else { return "bundleID=\(bundleID ?? "nil")" }
         guard team == lockedUseTeamIdentifier else { return "team=\(team ?? "nil")" }
+        guard values["phase"] as? String == "committed" else { return "installation-incomplete" }
+        guard enabled == true else { return enabled == false ? "disabled" : "enabled=nil" }
         return "ok"
     }
 

@@ -24,6 +24,8 @@ WorkBuddy ⇄ MCP(stdio/JSON-RPC) ⇄ server.py ⇄ workbuddy-cua-native ⇄ 共
 
 ## 固定浏览器目标与后台操作
 
+菜单栏中的“浏览器任务”展开同一面板，可查看任务、活动和候选下载，停止当前浏览器控制，截取任务页面并添加或导出批注。截图可能包含页面可见内容；候选下载的归属与保存位置仍需在浏览器下载记录中确认。扩展弹窗保留站点授权、连接状态和诊断。升级时需重新加载扩展并更新原生宿主，旧宿主可继续处理已有浏览器任务，但不会同步菜单栏详情。
+
 列出窗口只返回列表，不改变已选目标。缓存目标关闭时返回 `TARGET_LOST`；没有目标且存在多个窗口时返回 `TARGET_REQUIRED`，需要显式选择。已绑定任务仍校验原窗口、进程身份与连接，不会按当前焦点或窗口排序换目标。
 
 Chrome 页面操作优先使用已授权扩展，保持同一任务、浏览器窗口 ID 和标签 ID：先 `cua_browser_events(action="candidates", taskId=...)`，等待扩展刷新后再次查询，用返回的 `browserWindowId/tabId` 调用 `assign`，随后执行 `command(operation="snapshot")` 并查询 `result`。点击使用该快照中的 `ref`；每次动作后再读取快照确认页面变化。`nativeConnection=connected` 仅证明宿主可达，`paired=false` 表示尚未完成标签分配，不应改用重复开窗恢复。

@@ -168,5 +168,82 @@ class ReadbackVerificationTests(unittest.TestCase):
         self.assertFalse(installer.policy_matches(actual, expected))
 
 
+class MaintenanceTests(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.root = Path(self.temporary.name).resolve()
+        self.state = self.root / 'state'
+        self.state.mkdir()
+        self.bundle = self.root / 'installed.bundle'
+        (self.bundle / 'Contents').mkdir(parents=True)
+        (self.bundle / 'Contents/version').write_text('old')
+        self.source = self.root / 'source.bundle'
+        (self.source / 'Contents').mkdir(parents=True)
+        (self.source / 'Contents/version').write_text('new')
+        (self.source / 'Contents/Info.plist').write_bytes(plistlib.dumps({'CUADenyOnly': False, 'CFBundleShortVersionString': '0.4.0', 'CFBundleVersion': '8'}))
+        self.original = self.state / 'original.plist'
+        self.original.write_bytes(plistlib.dumps({'class': 'rule', 'rule': ['use-login-window-ui']}))
+        self.state_file = self.state / 'installation.plist'
+        self.database = installer.candidate_policy(self.original.read_bytes())
+        self.metadata = {'version': 2, 'phase': 'committed', 'enabled': True,
+                         'denyOnly': False, 'protocolVersion': 3, 'experimentalOptIn': True,
+                         'policyTopology': 'direct-login-window-ui',
+                         'bundleIdentifier': installer.PLUGIN_IDENTIFIER,
+                         'teamIdentifier': installer.TEAM_IDENTIFIER, 'actualPolicies': self.database}
+        installer.atomic_plist(self.state_file, self.metadata)
+        mocks = [patch.multiple(installer, STATE_DIRECTORY=self.state, STATE_FILE=self.state_file,
+                                ORIGINAL_RIGHT_FILE=self.original, INSTALLED_BUNDLE=self.bundle),
+                 patch.object(installer, 'require_root'), patch.object(installer, 'require_root_owned'),
+                 patch.object(installer, 'verify_bundle', return_value=''),
+                 patch.object(installer.subprocess, 'run'),
+                 patch.object(installer, 'authorization_read', side_effect=lambda right=installer.RIGHT: plistlib.dumps(self.database[right])),
+                 patch.object(installer, 'right_exists', side_effect=lambda right: right in self.database)]
+        for mock in mocks:
+            mock.start()
+            self.addCleanup(mock.stop)
+
+    def test_upgrade_preserves_original_policy_backup(self):
+        original = self.original.read_bytes()
+        with patch.object(installer, 'authorization_write') as write:
+            installer.upgrade(self.source)
+        write.assert_not_called()
+        self.assertEqual(self.original.read_bytes(), original)
+        self.assertEqual((self.bundle / 'Contents/version').read_text(), 'new')
+        metadata = plistlib.loads(self.state_file.read_bytes())
+        self.assertEqual(metadata['phase'], 'committed')
+        self.assertTrue(metadata['enabled'])
+        self.assertEqual(metadata['actualPolicies'], self.metadata['actualPolicies'])
+
+    def test_failed_upgrade_restores_binary_and_receipt(self):
+        original, receipt = self.original.read_bytes(), self.state_file.read_bytes()
+        with patch.object(installer, 'verify_bundle', side_effect=['', '', RuntimeError('signature failure')]):
+            with self.assertRaisesRegex(RuntimeError, 'signature failure'):
+                installer.upgrade(self.source)
+        self.assertEqual((self.bundle / 'Contents/version').read_text(), 'old')
+        self.assertEqual(self.state_file.read_bytes(), receipt)
+        self.assertEqual(self.original.read_bytes(), original)
+
+    def test_foreign_policy_and_incomplete_install_cannot_be_overwritten(self):
+        self.database[installer.RIGHT] = {'class': 'rule', 'rule': ['foreign']}
+        with self.assertRaisesRegex(RuntimeError, '其他修改'):
+            installer.upgrade(self.source)
+        self.metadata['phase'] = 'rollback-needed'
+        installer.atomic_plist(self.state_file, self.metadata)
+        with self.assertRaisesRegex(RuntimeError, '需要恢复'):
+            installer.upgrade(self.source)
+        self.assertEqual((self.bundle / 'Contents/version').read_text(), 'old')
+
+    def test_enable_requires_a_valid_grant_mode_installation(self):
+        self.metadata['enabled'] = False
+        installer.atomic_plist(self.state_file, self.metadata)
+        installer.enable()
+        self.assertTrue(plistlib.loads(self.state_file.read_bytes())['enabled'])
+        self.metadata['denyOnly'] = True
+        installer.atomic_plist(self.state_file, self.metadata)
+        with self.assertRaisesRegex(RuntimeError, '不支持启用'):
+            installer.enable()
+
+
 if __name__ == "__main__":
     unittest.main()

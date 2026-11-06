@@ -1,0 +1,11 @@
+#!/bin/bash
+# This scripts-only component runs after the app component, only when selected.
+set -euo pipefail
+user="$(/usr/bin/stat -f '%Su' /dev/console)"
+if [[ "$user" == "root" || "$user" == "loginwindow" || "$user" == "_mbsetupuser" ]]; then
+    exit 0
+fi
+uid="$(/usr/bin/id -u "$user")"
+if ! /bin/launchctl asuser "$uid" /usr/bin/sudo -H -u "$user" /usr/bin/open -a /Applications/workbuddy-cua.app; then
+    echo '应用已安装；请从应用程序文件夹打开 Workbuddy CUA。' >&2
+fi

@@ -360,9 +360,92 @@ def uninstall():
     return status()
 
 
+def require_root_owned(path):
+    checked_path(path)
+    info = path.stat()
+    if info.st_uid != 0 or info.st_mode & 0o022:
+        raise ValueError("插件恢复文件归属或权限不安全: " + str(path))
+
+
+def maintenance_record():
+    """Only maintain a committed, recognised policy; never replace its backup."""
+    require_root("维护插件")
+    for path in (STATE_DIRECTORY, STATE_FILE, ORIGINAL_RIGHT_FILE, INSTALLED_BUNDLE):
+        require_root_owned(path)
+    metadata = plistlib.loads(STATE_FILE.read_bytes())
+    if (metadata.get("version") != 2 or metadata.get("phase") != "committed"
+            or metadata.get("bundleIdentifier") != PLUGIN_IDENTIFIER
+            or metadata.get("teamIdentifier") != TEAM_IDENTIFIER
+            or metadata.get("protocolVersion") != 3
+            or metadata.get("policyTopology") != "direct-login-window-ui"):
+        raise RuntimeError("安装记录需要恢复；请查看状态并使用恢复/卸载，不覆盖原始备份")
+    original = plistlib.loads(ORIGINAL_RIGHT_FILE.read_bytes())
+    expected = metadata.get("actualPolicies", {})
+    intended = candidate_policy(plistlib.dumps(original))
+    for right in (REMOTE_RIGHT, RIGHT):
+        if (not expected.get(right) or not policy_matches(expected[right], intended[right])
+                or not policy_matches(plistlib.loads(authorization_read(right)), expected[right])):
+            raise RuntimeError("授权规则已有其他修改；拒绝维护: " + right)
+    if right_exists(STOCK_RIGHT):
+        raise RuntimeError("发现历史授权结构；请先恢复原规则")
+    return metadata
+
+
+def upgrade(bundle=None):
+    metadata = maintenance_record()
+    source = checked_path(bundle or SOURCE_BUNDLE)
+    signature = verify_bundle(source)
+    info = plistlib.loads((source / "Contents/Info.plist").read_bytes())
+    if info.get("CUADenyOnly", False) is not metadata.get("denyOnly", False):
+        raise RuntimeError("升级不能更改安装模式；请先恢复/卸载后再安装")
+    staging = checked_path(STATE_DIRECTORY / "plugin-upgrade-next.bundle")
+    previous = checked_path(STATE_DIRECTORY / "plugin-upgrade-previous.bundle")
+    if staging.exists() or previous.exists():
+        raise RuntimeError("存在未完成升级；请使用恢复/卸载")
+    shutil.copytree(source, staging, symlinks=False)
+    try:
+        subprocess.run(["/usr/sbin/chown", "-R", "root:wheel", str(staging)], check=True)
+        subprocess.run(["/bin/chmod", "-R", "a+rX,go-w", str(staging)], check=True)
+        verify_bundle(staging)
+        pending = dict(metadata, enabled=False, phase="plugin-upgrading")
+        atomic_plist(STATE_FILE, pending, 0o644)
+        INSTALLED_BUNDLE.rename(previous)
+        staging.rename(INSTALLED_BUNDLE)
+        verify_bundle(INSTALLED_BUNDLE)
+        updated = dict(metadata, pluginVersion=info.get("CFBundleShortVersionString", ""),
+                       pluginBuild=info.get("CFBundleVersion", ""),
+                       upgradedAt=datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                       signature=[line for line in signature.splitlines()
+                                  if line.startswith(("Authority=", "TeamIdentifier="))])
+        atomic_plist(STATE_FILE, updated, 0o644)
+    except Exception:
+        if previous.exists():
+            if INSTALLED_BUNDLE.exists():
+                shutil.rmtree(INSTALLED_BUNDLE)
+            previous.rename(INSTALLED_BUNDLE)
+        atomic_plist(STATE_FILE, metadata, 0o644)
+        raise
+    finally:
+        if staging.exists():
+            shutil.rmtree(staging)
+    if previous.exists():
+        shutil.rmtree(previous)
+    return status()
+
+
+def enable():
+    metadata = maintenance_record()
+    verify_bundle(INSTALLED_BUNDLE)
+    if metadata.get("denyOnly") or metadata.get("experimentalOptIn") is not True:
+        raise RuntimeError("该安装不支持启用自动锁屏授权")
+    metadata["enabled"] = True
+    atomic_plist(STATE_FILE, metadata, 0o644)
+    return status()
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("action", choices=["status", "build", "plan", "install", "uninstall"])
+    parser.add_argument("action", choices=["status", "build", "plan", "install", "upgrade", "enable", "uninstall"])
     parser.add_argument("--bundle", type=Path)
     parser.add_argument("--deny-only", action="store_true",
                         help="仅安装签名的拒绝自动解锁版本，用于验证原生锁屏")
@@ -382,6 +465,10 @@ def main():
             result = {"bundle": str(bundle), "signature": verify_bundle(bundle)}
         elif args.action == "install":
             result = install(args.bundle, experimental=args.experimental, deny_only=args.deny_only)
+        elif args.action == "upgrade":
+            result = upgrade(args.bundle)
+        elif args.action == "enable":
+            result = enable()
         else:
             result = uninstall()
         print(json.dumps(result, ensure_ascii=False, indent=2, default=str))
