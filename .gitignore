@@ -39,3 +39,6 @@ cua-mcp-bridge/shots/
 # 本机记忆与编辑器
 .workbuddy/
 .DS_Store
+
+# 本机构建产物（安装包与打包中间目录）
+dist/
