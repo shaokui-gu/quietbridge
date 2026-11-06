@@ -1,16 +1,66 @@
 <!doctype html>
-<html lang="zh-CN"><head><meta charset="utf-8"><title>WorkbuddyExtension</title><link rel="stylesheet" href="popup.css"></head>
-<body><h1>WorkbuddyExtension</h1>
-<p>一次授权普通 HTTP/HTTPS 全站。任务和目标由可信原生端内部派发，无需填写任务 ID、逐任务配对或逐站授权。</p>
-<p>仅观察已分配标签的脱敏 URL（无凭据、查询和片段）、readyState、布局布尔值及元素计数。不读取 cookies、input 值或正文。</p>
-<p><strong>能力边界</strong>：可为任务新建专用窗口（不抢前台、复用当前配置文件的登录态，不做数据隔离）；可在已分配页面执行快照、诊断、点击、填写、选择、滚动与导航。<strong>这些是页面内事件，不等同可信硬件输入</strong>；需要真实用户手势的控件（文件选择、部分支付）不会被绕过。不执行桌面输入。</p>
-<div><button id="enable">一次授权并启用</button><button id="disable">停用观察</button><button id="refresh">刷新状态</button></div>
-<p>全站权限 globalPermission：<strong id="permission">正在检查</strong></p>
-<p>原生连接 nativeConnection：<strong id="connection">正在检查</strong></p>
-<p>任务分配 taskAssignment：<strong id="assignment">正在检查</strong></p>
-<p>扩展 ID extensionId：<code id="extid">—</code></p>
-<p>未明确目标时保持 needs_target_selection，不接管当前标签。浏览器标签与系统窗口的自动映射尚未实现；browserWindowId 不是 CGWindowID，mappingVerified 始终 false，不授权桌面输入。</p>
-<p>允许同一已绑定标签跨普通 HTTP(S) 站点导航；受限页暂停。撤销权限立即清空观察，重新授权后由内部重新分配。停用不撤销 Chrome 已授予权限。</p>
-<p>contentReady 始终 unknown（null）；生命周期及可选任务 CSS 条件不代表业务就绪，不作为 wait_ready 成功依据。</p>
-<pre id="state">无任务分配</pre><p id="error" role="alert"></p>
-<script src="popup.js"></script></body></html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>workbuddy-cua Browser Extension</title>
+  <link rel="stylesheet" href="popup.css">
+</head>
+<body>
+  <header class="header">
+    <div class="brand">
+      <span class="brand-mark" aria-hidden="true"><span class="browser-mark"></span></span>
+      <div><div class="brand-name">workbuddy-cua</div><div class="brand-subtitle">浏览器扩展</div></div>
+    </div>
+    <button id="refresh" class="icon-button" type="button" aria-label="刷新状态" title="刷新状态">↻</button>
+  </header>
+  <main>
+    <section class="overview" aria-labelledby="overview-title">
+      <div class="overview-top"><span class="eyebrow">浏览器控制</span><span id="status-badge" class="badge"><span class="status-dot"></span><span id="status-label">检查中</span></span></div>
+      <h1 id="overview-title">正在检查状态</h1>
+      <p id="status-description" class="overview-description">正在连接扩展...</p>
+      <div class="actions"><button id="enable" class="button button-primary" type="button" disabled>授权并启用</button><button id="disable" class="button button-secondary" type="button" hidden>停用观察</button></div>
+    </section>
+    <section class="section" aria-labelledby="status-heading">
+      <div class="section-heading"><h2 id="status-heading">运行状态</h2><span>自动更新</span></div>
+      <div class="status-list">
+        <div class="status-row"><span class="row-icon connection-icon" aria-hidden="true">↗</span><div class="row-main"><div class="row-title">原生连接</div><div id="heartbeat" class="row-detail">正在检查连接</div></div><span id="connection" class="row-value">检查中</span></div>
+        <div class="status-row"><span class="row-icon permission-icon" aria-hidden="true">✓</span><div class="row-main"><div class="row-title">站点权限</div><div class="row-detail">普通 HTTP / HTTPS 站点</div></div><span id="permission" class="row-value">检查中</span></div>
+        <div class="status-row"><span class="row-icon task-icon" aria-hidden="true">≡</span><div class="row-main"><div class="row-title">任务分配</div><div id="assignment-detail" class="row-detail">由原生端自动分配</div></div><span id="assignment" class="row-value">检查中</span></div>
+      </div>
+      <div id="current-task" class="current-task" hidden><div class="task-heading">当前任务</div><div id="task-site" class="task-site"></div><div id="task-id" class="task-id"></div><button id="stop-task" class="button button-secondary task-stop" type="button">停止此任务的浏览器控制</button><p class="task-stop-note">已发出的操作可能已经执行；恢复需要重新分配目标。</p></div>
+      <p id="error" class="error" role="alert" hidden></p>
+    </section>
+    <section class="information" aria-label="更多信息">
+      <details><summary><span>权限与能力说明</span><span class="chevron" aria-hidden="true"></span></summary><div class="details-content">
+        <p>授权覆盖普通 HTTP / HTTPS 站点。任务和目标由可信原生端分配，未指定目标时不会接管当前标签。</p>
+        <p>后台观察状态包含脱敏 URL、页面生命周期、布局布尔值和元素计数，不包含 cookies、输入框值或正文。</p>
+        <p>执行任务时，页面快照可能包含可交互元素的文字或标签；截图可能包含页面上显示的内容。诊断信息也可能包含页面错误文本。</p>
+        <p>在已分配页面可执行快照、诊断、点击、填写、选择、滚动和导航，也可新建复用当前浏览器登录态的任务窗口；窗口不提供数据隔离。页面操作不等同于可信硬件输入，不执行桌面输入，不能绕过需要真实用户手势的控件。</p>
+        <p>受限页面会暂停观察。停用观察不会撤销浏览器已授予的站点权限；撤销权限会立即清空观察。</p>
+      </div></details>
+      <details><summary><span>当前任务活动</span><span class="chevron" aria-hidden="true"></span></summary><div class="details-content">
+        <p>仅保留本次浏览器会话中的操作类型和结果。</p><ol id="activity" class="activity"><li>暂无活动记录</li></ol><button id="clear-activity" class="button button-secondary" type="button">清除活动记录</button>
+      </div></details>
+      <details><summary><span>候选下载</span><span class="chevron" aria-hidden="true"></span></summary><div class="details-content">
+        <p>来自当前任务标签的下载事件；保存位置和最终归属请在浏览器下载记录中确认。</p><ol id="downloads" class="activity"><li>暂无候选下载</li></ol>
+      </div></details>
+      <details><summary><span>任务截图与批注</span><span class="chevron" aria-hidden="true"></span></summary><div class="details-content">
+        <button id="capture-review" class="button button-secondary" type="button">截取当前任务页面</button>
+        <div id="review-panel" hidden><canvas id="review-canvas" aria-label="任务页面截图，拖动选择批注区域"></canvas>
+          <label for="review-note">批注内容</label><textarea id="review-note" maxlength="200" rows="2"></textarea>
+          <div class="review-actions"><button id="save-review" class="button button-primary" type="button">添加批注</button><button id="export-review" class="button button-secondary" type="button">导出截图</button></div>
+          <ol id="review-notes" class="activity"></ol>
+        </div>
+      </div></details>
+      <details><summary><span>诊断信息</span><span class="chevron" aria-hidden="true"></span></summary><div class="details-content diagnostic">
+        <div class="diagnostic-label">扩展 ID</div><code id="extid">—</code>
+        <div class="diagnostic-label">观察状态</div><pre id="state">无任务分配</pre>
+        <p>浏览器窗口尚未自动映射到系统窗口，mappingVerified 始终为 false。contentReady 始终为 unknown，不作为业务就绪的依据。</p>
+      </div></details>
+    </section>
+  </main>
+  <footer><span class="footer-dot"></span>仅处理已分配的任务页面</footer>
+  <script src="popup.js"></script>
+</body>
+</html>

@@ -52,6 +52,17 @@ let commandReport = null;
 let lastCommandId = null;
 let keepAlivePort = null;
 let keepAliveTimer;
+let activityQueue = Promise.resolve();
+function recordActivity(state, operation, outcome) {
+  if (!state?.taskId) return;
+  const job = activityQueue.then(async () => {
+    const { activity = [] } = await chrome.storage.session.get('activity');
+    const entry = { taskId: state.taskId, operation, outcome, site: originOf(state.url), at: Date.now() };
+    await chrome.storage.session.set({ activity: [entry, ...activity].slice(0, 100) });
+  });
+  activityQueue = job.catch(() => {});
+  return job;
+}
 function keepAlive(on) {
   clearInterval(keepAliveTimer);
   if (!on) {
@@ -93,10 +104,12 @@ async function runCommand(command, state) {
     if (!result) throw new Error('页面未返回结果');
     commandReport = { requestId: command.requestId, status: 'ok', result };
     connection = { ...connection, backgroundStatus: 'ready', lastActionError: null };
+    await recordActivity(state, command.operation, result.performed === false ? 'not_performed' : 'completed').catch(() => {});
   } catch (error) {
     commandReport = { requestId: command.requestId, status: 'error',
       error: String(error?.message || '命令执行失败').slice(0, 200) };
     connection = { ...connection, backgroundStatus: 'waiting', lastActionError: commandReport.error };
+    await recordActivity(state, command.operation, 'failed').catch(() => {});
   }
 }
 const serial = fn => {
@@ -108,11 +121,41 @@ const read = async () => (await chrome.storage.session.get('observer')).observer
 const save = observer => chrome.storage.session.set({ observer });
 const permitted = async () => !permissionRevoked && await chrome.permissions.contains({ origins: ORIGINS });
 const enabled = async () => (await chrome.storage.local.get('enabled')).enabled === true;
+let downloadQueue = Promise.resolve();
+function recordDownload(source, method, params) {
+  downloadQueue = downloadQueue.then(async () => {
+    if (!Number.isInteger(source?.tabId) || !params || typeof params.guid !== 'string' || params.guid.length > 128) return;
+    const state = await read();
+    if (!state || state.paused || state.tabId !== source.tabId || !await enabled() || !await permitted()) return;
+    const { downloads = [] } = await chrome.storage.session.get('downloads');
+    if (method === 'Page.downloadWillBegin') {
+      if (typeof params.frameId !== 'string' || typeof params.suggestedFilename !== 'string') return;
+      const [frame, tree] = await Promise.all([
+        chrome.webNavigation.getFrame({ tabId: state.tabId, frameId: 0 }),
+        chrome.debugger.sendCommand({ tabId: state.tabId }, 'Page.getFrameTree', {})
+      ]);
+      const current = await read();
+      if (frame?.documentId !== state.documentId || current?.bindingId !== state.bindingId ||
+          current?.documentId !== state.documentId) return;
+      const contains = node => node?.frame?.id === params.frameId || (node?.childFrames || []).some(contains);
+      if (!contains(tree?.frameTree)) return;
+      const item = { taskId: state.taskId, guid: params.guid,
+        filename: params.suggestedFilename.slice(0, 255), state: 'started', at: Date.now() };
+      await chrome.storage.session.set({ downloads: [item, ...downloads.filter(d => d.guid !== item.guid)].slice(0, 50) });
+      await recordActivity(state, 'download', 'started').catch(() => {});
+    } else if (['inProgress', 'completed', 'canceled'].includes(params.state)) {
+      const item = downloads.find(d => d.guid === params.guid && d.taskId === state.taskId);
+      if (!item) return;
+      item.state = params.state;
+      await chrome.storage.session.set({ downloads });
+    }
+  }).catch(() => {});
+}
 const background = new BackgroundBrowser(chrome, async s => {
   const current = await read();
-  return await enabled() && await permitted() && current?.bindingId === s?.bindingId &&
+  return await enabled() && await permitted() && !current?.paused && current?.bindingId === s?.bindingId &&
     current?.documentId === s?.documentId;
-});
+}, recordDownload);
 async function native(message) {
   let timeout;
   try {
@@ -390,7 +433,7 @@ chrome.runtime.onMessage.addListener((message, sender, respond) => {
   // 一律按 URL 认定是扩展自己的页面，而不是看有没有 tab。
   const fromPopup = sender.id === chrome.runtime.id && typeof sender.url === 'string' &&
     sender.url.startsWith(chrome.runtime.getURL('popup.html'));
-  if (fromPopup && message?.action === 'disable') enableRevision++;
+  if (fromPopup && ['disable', 'stop_task'].includes(message?.action)) enableRevision++;
   (sender.tab && !fromPopup ? serial : control)(async () => {
     if (sender.id !== chrome.runtime.id || !message || typeof message !== 'object') throw new Error('消息来源无效');
     if (sender.tab && !fromPopup) {
@@ -419,16 +462,71 @@ chrome.runtime.onMessage.addListener((message, sender, respond) => {
         boundTarget: null });
       await clearObservation();
       syncLater();
+    } else if (message.action === 'stop_task') {
+      const target = await read();
+      if (!target?.taskId || !target.token) throw new Error('当前没有可停止的浏览器任务');
+      await chrome.storage.session.set({ recentTask: { taskId: target.taskId, url: target.url } });
+      await clearObservation();
+      try {
+        await native({ action: 'pause', taskId: target.taskId, token: target.token });
+      } catch (error) {
+        await chrome.storage.local.set({ enabled: false, pendingEnable: null, disabledAt: Date.now() });
+        throw new Error(`未能确认任务暂停，观察已停用：${error.message}`);
+      }
+      await chrome.storage.local.set({ boundTarget: null });
+      assignmentStatus = 'paused';
+      syncLater();
+    } else if (message.action === 'clear_activity') {
+      const clear = activityQueue.then(() => chrome.storage.session.set({ activity: [] }));
+      activityQueue = clear.catch(() => {});
+      await clear;
+    } else if (message.action === 'capture_review') {
+      const target = await read();
+      if (!target?.taskId || !target.documentId) throw new Error('当前没有可截图的任务页面');
+      const command = { operation: 'screenshot', taskId: target.taskId, bindingId: target.bindingId,
+        assignmentVersion: target.assignmentVersion, tabId: target.tabId, browserWindowId: target.browserWindowId,
+        documentId: target.documentId, navigationEpoch: target.navigationEpoch, expiresAt: Date.now() / 1000 + 8 };
+      const image = await background.run(command, target);
+      await chrome.storage.session.set({ review: { taskId: target.taskId, documentId: target.documentId,
+        image: image.data, capturedAt: Date.now(), annotations: [] } });
+      await recordActivity(target, 'screenshot', 'completed').catch(() => {});
+    } else if (message.action === 'annotate_review') {
+      let target = await read();
+      const { review, recentTask } = await chrome.storage.session.get(['review', 'recentTask']);
+      if (!target && assignmentStatus === 'paused') target = recentTask;
+      const box = message.box;
+      if (!target?.taskId || review?.taskId !== target.taskId || typeof message.note !== 'string' ||
+          !message.note.trim() || message.note.length > 200 || !box ||
+          !['x', 'y', 'width', 'height'].every(k => typeof box[k] === 'number' && Number.isFinite(box[k])) ||
+          box.x < 0 || box.y < 0 || box.width <= 0 || box.height <= 0 ||
+          box.x + box.width > 1.000001 || box.y + box.height > 1.000001) throw new Error('批注内容或选区无效');
+      review.annotations = [...review.annotations, { box, note: message.note.trim() }].slice(-20);
+      await chrome.storage.session.set({ review });
+    } else if (message.action === 'remove_review_annotation') {
+      let target = await read();
+      const { review, recentTask } = await chrome.storage.session.get(['review', 'recentTask']);
+      if (!target && assignmentStatus === 'paused') target = recentTask;
+      if (!target?.taskId || review?.taskId !== target.taskId || !Number.isInteger(message.index) ||
+          message.index < 0 || message.index >= review.annotations.length) throw new Error('批注不存在');
+      review.annotations.splice(message.index, 1);
+      await chrome.storage.session.set({ review });
     } else if (message.action !== 'status') throw new Error('不支持此操作');
     if (!await permitted()) {
       await chrome.storage.local.set({ enabled: false });
       await clearObservation();
     }
     const s = await read();
+    const { activity = [], review = null, downloads = [], recentTask = null } = await chrome.storage.session.get(['activity', 'review', 'downloads', 'recentTask']);
     const visible = s ? Object.fromEntries(Object.entries(s).filter(([k]) => !['token', 'bindingId', 'documentUrl'].includes(k))) : null;
+    const taskSummary = s ? { taskId: s.taskId, url: s.url, canStop: true } :
+      assignmentStatus === 'paused' && recentTask ? { ...recentTask, canStop: false } : null;
     return { globalPermission: await permitted() ? 'granted' : 'permission_missing',
       enabled: await enabled(), nativeConnection: { ...connection },
-      taskAssignment: assignmentStatus, state: visible };
+      taskAssignment: assignmentStatus, state: visible,
+      taskSummary,
+      activity: taskSummary ? activity.filter(item => item.taskId === taskSummary.taskId) : [],
+      review: taskSummary && review?.taskId === taskSummary.taskId ? review : null,
+      downloads: taskSummary ? downloads.filter(item => item.taskId === taskSummary.taskId) : [] };
   }).then(result => respond({ ok: true, ...result }), error => respond({ ok: false, error: error.message }));
   return true;
 });

@@ -1,6 +1,6 @@
 {
   "manifest_version": 3,
-  "name": "WorkbuddyExtension",
+  "name": "workbuddy-cua Browser Extension",
   "version": "0.3.0",
   "minimum_chrome_version": "106",
   "description": "固定任务标签的后台浏览器控制：CDP 输入、文档绑定与后台弹窗；不回退桌面键鼠。",

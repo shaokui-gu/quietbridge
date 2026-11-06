@@ -4,12 +4,17 @@ import { installPopupGuard } from './popup-guard.mjs';
 // Only browser-scoped input is exposed here. There is deliberately no OS input,
 // tab activation, window focusing, debugger takeover, or foreground fallback.
 export class BackgroundBrowser {
-  constructor(chrome, authorized = async () => true) {
+  constructor(chrome, authorized = async () => true, onDownload = () => {}) {
     this.chrome = chrome;
     this.authorized = authorized;
     this.attached = new Map();
     this.detached = new Set();
     this.guards = new Map();
+    chrome.debugger?.onEvent?.addListener((source, method, params) => {
+      if (method === 'Page.downloadWillBegin' || method === 'Page.downloadProgress') {
+        onDownload(source, method, params);
+      }
+    });
     chrome.debugger?.onDetach.addListener(({ tabId }) => {
       if (this.attached.has(tabId)) this.detached.add(tabId);
       this.attached.delete(tabId);
@@ -57,6 +62,8 @@ export class BackgroundBrowser {
     if (this.attached.has(s.tabId)) return;
     await this.chrome.debugger.attach({ tabId: s.tabId }, '1.3');
     this.attached.set(s.tabId, s.bindingId);
+    await this.check(s, command);
+    await this.chrome.debugger.sendCommand({ tabId: s.tabId }, 'Page.enable', {});
     await this.check(s, command);
   }
 
@@ -178,13 +185,15 @@ export class BackgroundBrowser {
     await this.attach(s, command);
     if (op === 'screenshot') {
       const { cssVisualViewport: v } = await this.send(s, command, 'Page.getLayoutMetrics', {});
-      const scale = Math.min(1, 1200 / v.clientWidth, 900 / v.clientHeight);
-      const { data } = await this.send(s, command, 'Page.captureScreenshot', { format: 'jpeg', quality: 40,
-        fromSurface: true, captureBeyondViewport: false,
-        clip: { x: v.pageX, y: v.pageY, width: v.clientWidth, height: v.clientHeight, scale } });
-      await this.check(s, command);
-      if (!data || data.length > 200000) throw new Error('截图超出大小限制，请使用 DOM 快照');
-      return { mimeType: 'image/jpeg', data, tabId: s.tabId, documentId: s.documentId };
+      const scale = Math.min(1, 1600 / v.clientWidth, 1200 / v.clientHeight);
+      for (const [quality, factor] of [[75, 1], [55, 1], [45, 0.75]]) {
+        const { data } = await this.send(s, command, 'Page.captureScreenshot', { format: 'jpeg', quality,
+          fromSurface: true, captureBeyondViewport: false,
+          clip: { x: v.pageX, y: v.pageY, width: v.clientWidth, height: v.clientHeight, scale: scale * factor } });
+        await this.check(s, command);
+        if (data && data.length <= 500000) return { mimeType: 'image/jpeg', data, tabId: s.tabId, documentId: s.documentId };
+      }
+      throw new Error('截图超出大小限制，请使用 DOM 快照');
     }
     if (op === 'keypress') {
       const keys = { Enter: 13, Tab: 9, Escape: 27, ArrowDown: 40, ArrowUp: 38,

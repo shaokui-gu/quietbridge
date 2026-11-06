@@ -459,7 +459,7 @@ def sync_peer(message, origin, task_file, event_file):
                         outcome = reply['result']
                         require(type(outcome) is dict and set(outcome) == {'mimeType', 'data', 'tabId', 'documentId'} and
                                 outcome['mimeType'] == 'image/jpeg' and type(outcome['data']) is str and
-                                0 < len(outcome['data']) <= 200000 and re.fullmatch(r'[A-Za-z0-9+/]+={0,2}', outcome['data']) and
+                                0 < len(outcome['data']) <= 500000 and re.fullmatch(r'[A-Za-z0-9+/]+={0,2}', outcome['data']) and
                                 outcome['tabId'] == pending['tabId'] and outcome['documentId'] == pending['documentId'], '截图身份或数据错误')
                         # Keep one image; do not grow the JSON store with old screenshots.
                         for previous in peer.get('commandResults', []):
@@ -498,6 +498,8 @@ def sync_peer(message, origin, task_file, event_file):
                                              'error': error, 'at': now}
                 peer['commandResults'] = (peer.get('commandResults', []) +
                                           [peer['commandResult']])[-MAX_RESULTS:]
+                # Status needs metadata only; keep large screenshot data once.
+                peer['commandResult'] = {k: v for k, v in peer['commandResult'].items() if k != 'result'}
                 peer['commandSeen'] = (peer.get('commandSeen', []) +
                                        [reply['requestId']])[-MAX_SEEN:]
                 peer['command'] = None
@@ -870,6 +872,7 @@ def dispatch(message, origin, allowed_origins, task_file=TASK_FILE, event_file=E
         return {'ok': True, 'protocolVersion': 2, 'heartbeatAt': time.time()}
     shapes = {'status': {'action', 'taskId'},
               'unbind': {'action', 'taskId', 'token'},
+              'pause': {'action', 'taskId', 'token'},
               'event': {'action', 'taskId', 'token', 'event'}}
     require(type(action) is str and action in shapes and set(message) == shapes[action], '请求字段不合法')
     task_id = message['taskId']
@@ -888,6 +891,16 @@ def dispatch(message, origin, allowed_origins, task_file=TASK_FILE, event_file=E
                 record['origin'] == origin and secrets.compare_digest(token, record['token']), '任务配对凭据无效')
         if action == 'unbind':
             del records[task_id]
+        elif action == 'pause':
+            record['paused'] = True
+            peer = data.setdefault('peer', {})
+            command = peer.get('command')
+            if command and command.get('taskId') == task_id:
+                peer['command'] = None
+                peer['commandCanceled'] = {'commandId': command['requestId'], 'taskId': task_id,
+                                           'delivered': bool(command.get('delivered'))}
+                if command.get('delivered') and command.get('operation') not in ('snapshot', 'diagnostics', 'screenshot'):
+                    peer['pendingVerify'] = {'commandId': command['requestId'], 'taskId': task_id}
         else:
             event = validate_event(message['event'])
             require(event['tabId'] == record['tabId'] and event['browserWindowId'] == record['browserWindowId'], '事件不属于任务配对标签')
@@ -953,7 +966,7 @@ def make_tool(task_file, validate_task=None):
         require(set(args) == {'action', 'taskId'} and args['action'] == 'status', '状态查询需要 taskId')
         return json.dumps(status(args['taskId'], task_file=task_file()), ensure_ascii=False)
     return {'name': 'cua_browser_events', 'description': '通过已授权扩展观察及操作固定浏览器标签。优先 candidates（可带当前 taskId；轮询后再次查询），再以真实 browserWindowId/tabId 显式 assign；ID 不能用 CGWindowID 代替。绑定后持续复用同一标签，不按前台焦点换目标。create_target 仅用于尚无窗口的活动任务，可带 url，focused=false；同一任务重复申请复用原请求或结果，不因超时另开窗口。command 下发限定操作（snapshot/click/fill/select/scroll/navigate/diagnostics，单飞，8 秒过期），result 轮询（pending/ok/error/expired/canceled/unknown，不重放，附 latencyMs），cancel 如实报告 mayHaveExecuted。动作执行过之后必须先用 snapshot 复核才能继续动作。performed 不代表业务成功，浏览器分配不授权桌面输入或 wait_ready 判定。'
-                                                          '前提：Chrome 已加载 WorkbuddyExtension 并授予站点权限、原生宿主已登记（可在 cua_permissions 或安装页核对）。后台网页任务仅走此通道，扩展未就绪时等待，禁止回落 AX 或桌面输入。snapshot 返回 snapshotId，click/fill/select/scroll 必须传该标识；screenshot 直接截取该标签。tabs 列出任务归属标签，select_tab 只改逻辑目标，不激活标签或窗口。keypress 只支持页面按键。',
+                                                          '前提：Chrome 已加载 workbuddy-cua Browser Extension 并授予站点权限、原生宿主已登记（可在 cua_permissions 或安装页核对）。后台网页任务仅走此通道，扩展未就绪时等待，禁止回落 AX 或桌面输入。snapshot 返回 snapshotId，click/fill/select/scroll 必须传该标识；screenshot 直接截取该标签。tabs 列出任务归属标签，select_tab 只改逻辑目标，不激活标签或窗口。keypress 只支持页面按键。',
             'inputSchema': {'type': 'object', 'properties': {'action': {'type': 'string', 'enum': ['status', 'candidates', 'create_target', 'command', 'result', 'cancel', 'annotate', 'annotations', 'verify_mapping', 'assign', 'tabs', 'select_tab']},
                 'taskId': {'type': 'string'}, 'browserWindowId': {'type': 'integer'}, 'tabId': {'type': 'integer'},
                 'operation': {'type': 'string', 'enum': list(OPERATIONS)},

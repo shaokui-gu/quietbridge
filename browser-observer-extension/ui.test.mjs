@@ -85,13 +85,15 @@ test('content uses viewport geometry, rechecks moved targets and drops reference
   const context = {
     location: { protocol: 'https:', origin: 'https://example.org', pathname: '/latest' },
     document: { body: node, readyState: 'complete', getElementsByTagName: () => ({ length: 1 }),
-      querySelectorAll: () => included ? [node] : [], elementFromPoint: () => node },
+      querySelectorAll: selector => selector === 'iframe,frame' ? [] : included ? [node] : [], elementFromPoint: () => node },
     innerWidth: 1280, innerHeight: 800,
     getComputedStyle: () => ({ display: 'block', visibility: 'visible', opacity: '1' }),
     chrome: { runtime: { sendMessage: async () => {} } },
     addEventListener() {}, removeEventListener() {}, setTimeout() { return 1; }, clearTimeout() {},
     MutationObserver: class { observe() {} disconnect() {} }
   };
+  node.ownerDocument = context.document;
+  context.document.defaultView = context;
   vm.createContext(context);
   vm.runInContext(await readFile(new URL('./content.js', import.meta.url), 'utf8'), context);
   const config = { navigationEpoch: 1, bindingId: 'a'.repeat(32), authorizedOrigin: 'https://example.org', selector: '' };
@@ -145,14 +147,19 @@ test('popup 只由按钮手势一次请求全站权限，无用户任务配对',
   const messages = [];
   const permissions = [];
   let granted = true;
-  const elements = Object.fromEntries(['permission', 'connection', 'assignment', 'state', 'error', 'extid', 'enable', 'disable', 'refresh']
-    .map(id => [id, { value: '', checked: false, textContent: '', addEventListener(type, fn) { this.click = fn; } }]));
+  const elements = Object.fromEntries(['permission', 'connection', 'assignment', 'state', 'error', 'extid', 'enable', 'disable', 'refresh',
+    'heartbeat', 'assignment-detail', 'status-label', 'status-badge', 'overview-title', 'status-description',
+    'current-task', 'task-site', 'task-id', 'stop-task', 'activity', 'clear-activity', 'downloads',
+    'capture-review', 'review-panel', 'review-canvas', 'review-note', 'save-review', 'export-review', 'review-notes']
+    .map(id => [id, { value: '', checked: false, textContent: '', children: [],
+      replaceChildren() { this.children = []; }, appendChild(child) { this.children.push(child); },
+      addEventListener(type, fn) { this.click = fn; } }]));
   let globalPermission = 'permission_missing';
   let lastError = '';
   const writes = [];
   let finishWrite;
   const context = { URL, Date, crypto: { randomUUID: () => 'ui-nonce' },
-    document: { visibilityState: 'visible', getElementById(id) { return elements[id]; } },
+    document: { visibilityState: 'visible', getElementById(id) { return elements[id]; }, createElement() { return { textContent: '' }; } },
     // 浏览器一定有定时器；测试里给空实现，避免轮询在 node 里真的跑起来。
     setInterval() { return 1; }, clearInterval() {},
     chrome: { storage: { local: { set(value) { writes.push(value); return new Promise(resolve => { finishWrite = resolve; }); } } },
@@ -192,7 +199,7 @@ test('popup 只由按钮手势一次请求全站权限，无用户任务配对',
   await elements.enable.click();
   assert.equal(permissions.length, 2, '已有授权一次点击直达 enable，不再请求');
   assert.equal(messages.filter(m => m.action === 'enable').length, count + 1);
-  assert.match(elements.permission.textContent, /已启用/);
+  assert.equal(elements.permission.textContent, '已授权');
   assert.equal(elements.error.textContent, lastError);
   assert.equal(elements.extid.textContent, 'kbnonjkmdohkdjmfmafhjakkadkjjlno');
   // forbidden 必须点明是注册 origin 不含当前扩展 ID。
@@ -204,7 +211,7 @@ test('popup 只由按钮手势一次请求全站权限，无用户任务配对',
 
 test('MV3 无静态站点授权、网页通信入口和自动内容注入', async () => {
   const m = JSON.parse(await readFile(new URL('./manifest.json', import.meta.url), 'utf8'));
-  assert.equal(m.name, 'WorkbuddyExtension');
+  assert.equal(m.name, 'workbuddy-cua Browser Extension');
   assert.equal(m.manifest_version, 3);
   assert.deepEqual(m.optional_host_permissions, ['http://*/*', 'https://*/*']);
   for (const key of ['host_permissions', 'externally_connectable', 'content_scripts']) assert.equal(key in m, false);
