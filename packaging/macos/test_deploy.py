@@ -85,6 +85,12 @@ class DeploymentTests(unittest.TestCase):
     def install(self, service):
         return deploy.deploy(self.home, self.helper, self.app, self.support, service)
 
+    def test_old_visible_app_path_remains_a_recognised_connection(self):
+        self.assertEqual(deploy.APP.name, 'Workbuddy CUA.app')
+        self.assertEqual(deploy.LEGACY_APP.name, 'workbuddy-cua.app')
+        entry = {'args': [str(deploy.LEGACY_APP / 'Contents/Resources/bridge/server.py')]}
+        self.assertTrue(deploy.owned(entry, self.home))
+
     def test_success_preserves_settings_and_uses_independent_helper(self):
         service = FakeService()
         outcome = self.install(service)

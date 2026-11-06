@@ -27,6 +27,11 @@ under `/Library/Application Support/WorkBuddyCUAHelper/releases/`. The plug-in's
 strict identifier/team checks remain enabled. Both apps carry the same version.
 Bundle relocation is disabled.
 
+The user-visible bundle is installed as `/Applications/Workbuddy CUA.app`. During
+an upgrade, the preinstall check verifies the old `workbuddy-cua.app` bundle's
+identifier and Developer ID signature before moving it to the new visible name.
+The helper bundle and executable names remain unchanged.
+
 `deploy.py` runs as the desktop user. It stages and verifies the menu app, bridge
 and extension, checks the deployed MCP initialize response, and backs up changed
 user files with mode 0600 before switching. It preserves unrelated MCP servers,

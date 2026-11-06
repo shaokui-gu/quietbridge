@@ -6,6 +6,6 @@ if [[ "$user" == "root" || "$user" == "loginwindow" || "$user" == "_mbsetupuser"
     exit 0
 fi
 uid="$(/usr/bin/id -u "$user")"
-if ! /bin/launchctl asuser "$uid" /usr/bin/sudo -H -u "$user" /usr/bin/open -a /Applications/workbuddy-cua.app; then
+if ! /bin/launchctl asuser "$uid" /usr/bin/sudo -H -u "$user" /usr/bin/open -a "/Applications/Workbuddy CUA.app"; then
     echo '应用已安装；请从应用程序文件夹打开 Workbuddy CUA。' >&2
 fi

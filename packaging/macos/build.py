@@ -15,6 +15,7 @@ import xml.etree.ElementTree as ET
 ROOT = Path(__file__).resolve().parents[2]
 IDENTIFIER = "com.workbuddy.cua.menubar"
 LAUNCH_IDENTIFIER = IDENTIFIER + ".launch"
+APPLICATION_PATH = "Applications/Workbuddy CUA.app"
 
 
 def run(*args):
@@ -120,7 +121,7 @@ def main():
     work = ROOT / "dist" / ("package-" + args.version)
     work.mkdir(parents=True, exist_ok=False)
     payload = work / "root"
-    app = payload / "Applications/workbuddy-cua.app"
+    app = payload / APPLICATION_PATH
     contents = app / "Contents"
     (contents / "MacOS").mkdir(parents=True)
     shutil.copy2(release, contents / "MacOS/workbuddy-cua-native")
@@ -213,7 +214,7 @@ def main():
         "--sign", args.identity, app)
     run("/usr/bin/codesign", "--verify", "--strict", app)
     components = [{
-        "RootRelativeBundlePath": "Applications/workbuddy-cua.app",
+        "RootRelativeBundlePath": APPLICATION_PATH,
         "BundleIsRelocatable": False, "BundleIsVersionChecked": True,
         "BundleHasStrictIdentifier": True, "BundleOverwriteAction": "upgrade",
     }, {

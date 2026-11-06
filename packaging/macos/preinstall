@@ -21,3 +21,24 @@ if [[ -z "$python" ]]; then
     exit 1
 fi
 /usr/bin/sudo -H -u "$user" "$python" -B - --check < "$(dirname "$0")/deploy.py"
+# Migrate the old user-visible bundle name before the new payload is unpacked.
+# The project, bundle identifier and executable keep their existing names.
+legacy='/Applications/workbuddy-cua.app'
+current='/Applications/Workbuddy CUA.app'
+if [[ -L "$legacy" || -L "$current" ]]; then
+    echo '应用程序路径不能是符号链接。' >&2
+    exit 1
+fi
+if [[ -e "$legacy" && -e "$current" ]]; then
+    echo '同时发现新旧应用目录；请先移除旧的 workbuddy-cua.app。' >&2
+    exit 1
+fi
+if [[ -e "$legacy" ]]; then
+    identifier="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$legacy/Contents/Info.plist")"
+    if [[ "$identifier" != 'com.workbuddy.cua.menubar' ]] || ! /usr/bin/codesign --verify --strict -R \
+        '=anchor apple generic and identifier "com.workbuddy.cua.menubar" and certificate leaf[subject.OU] = "62RNP54C47"' "$legacy"; then
+        echo '旧应用签名或标识无法验证；未移动应用目录。' >&2
+        exit 1
+    fi
+    /bin/mv "$legacy" "$current"
+fi

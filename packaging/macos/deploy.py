@@ -27,7 +27,8 @@ import tempfile
 import time
 
 LABEL = 'com.workbuddy.cua.menubar'
-APP = Path('/Applications/workbuddy-cua.app')
+APP = Path('/Applications/Workbuddy CUA.app')
+LEGACY_APP = Path('/Applications/workbuddy-cua.app')
 SUPPORT = Path('/Library/Application Support/workbuddy-cua')
 PUBLIC = Path('/Library/Application Support/WorkBuddyCUAHelper/releases')
 TEAM = '62RNP54C47'
@@ -92,7 +93,8 @@ def owned(entry, home):
         if not isinstance(arg, str):
             continue
         path = Path(arg)
-        if (path == APP / 'Contents/Resources/bridge/server.py' or
+        if (path in (APP / 'Contents/Resources/bridge/server.py',
+                     LEGACY_APP / 'Contents/Resources/bridge/server.py') or
                 (path.name == 'server.py' and runtime in path.parents)):
             return True
         # Recognise source installs created by install.py without baking one
@@ -145,7 +147,8 @@ def preflight(home):
         value = plistlib.loads(previous_agent)
         args = value.get('ProgramArguments', [])
         if (value.get('Label') != LABEL or not isinstance(args, list) or not args or
-                not (Path(args[0]) == APP / 'Contents/MacOS/workbuddy-cua-native' or
+                not (Path(args[0]) in (APP / 'Contents/MacOS/workbuddy-cua-native',
+                                       LEGACY_APP / 'Contents/MacOS/workbuddy-cua-native') or
                      runtime / 'releases' in Path(args[0]).parents)):
             raise ValueError('登录启动项被其他组件占用；未覆盖')
     for journal in sorted((runtime / 'transactions').glob('*/journal.json')):
@@ -272,7 +275,9 @@ class MenuBarService:
             known_arguments = (args in (str(executable), str(executable) + ' --menubar') or
                                re.fullmatch(re.escape(str(executable)) + r' -psn_[0-9_]+', args))
             if (owner.stdout.strip() != str(os.getuid()) or
-                    not (executable == APP / 'Contents/MacOS/workbuddy-cua-native' or releases in executable.parents) or
+                    not (executable in (APP / 'Contents/MacOS/workbuddy-cua-native',
+                                        LEGACY_APP / 'Contents/MacOS/workbuddy-cua-native') or
+                         releases in executable.parents) or
                     not known_arguments):
                 raise RuntimeError('状态端口被其他程序占用；未终止该进程')
             try:
