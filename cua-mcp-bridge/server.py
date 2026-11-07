@@ -11,6 +11,7 @@ Requires Python 3.9+ (system /usr/bin/python3). No third-party packages.
 """
 
 import collections
+import base64
 import json
 import os
 import urllib.request
@@ -28,7 +29,8 @@ from pathlib import Path
 from contextlib import contextmanager
 from urllib.parse import urlsplit
 import ipaddress
-from browser_events import application_session, config_dir, make_tool as make_browser_events_tool
+from browser_events import application_session, config_dir, read_file, make_tool as make_browser_events_tool
+from host_lifecycle import stop_reason as host_stop_reason
 from recovery import GUIDANCE as RECOVERY_GUIDANCE, policy as recovery_policy
 from task_lifecycle import TaskOwner, lease_live
 
@@ -57,6 +59,10 @@ HELPER_PATH = os.environ.get("CUA_HELPER_PATH", DEFAULT_HELPER)
 SERVER_NAME = "workbuddy-cua"
 SERVER_VERSION = "1.2.0"
 DEFAULT_PROTOCOL = "2024-11-05"
+LOGO_PATH = Path(__file__).with_name('assets') / 'logo-64.png'
+TOOL_ICONS = ([{'src': 'data:image/png;base64,' + base64.b64encode(LOGO_PATH.read_bytes()).decode('ascii'),
+                'mimeType': 'image/png', 'sizes': ['64x64']}]
+              if LOGO_PATH.is_file() else [])
 
 AGENT_INSTRUCTIONS = """Workbuddy CUA 用于保持用户正常使用电脑的后台界面操作。所有界面操作必须遵守：
 1. 不抢焦点：保持用户的前台应用、键盘窗口、物理鼠标和当前 Space。禁止调用 activate、AXRaise、置前窗口、切换 Space 或全局 HID 输入来促成操作；也禁止先抢焦点再自动恢复。无法在后台完成时报告阻塞并等待，不更换自动化通道绕过。
@@ -67,6 +73,7 @@ AGENT_INSTRUCTIONS = """Workbuddy CUA 用于保持用户正常使用电脑的后
 6. 串行派发并读回核实。dispatched/performed 不代表成功；点击回执中的 focusPreserved=false 或 null 时暂停后续输入并核实原因，不能直接重复点击或自动恢复焦点。FOCUS_STATE_UNKNOWN、FOREGROUND_REQUIRED、共享或窗口投递错误均不得通过激活窗口绕过。超时或执行状态未知时先观察或查询既有命令，不重放副作用。结束时 cua_task(action=end, confirm=true) 释放共享租约。"""
 AGENT_INSTRUCTIONS += "\n7. " + RECOVERY_GUIDANCE
 AGENT_INSTRUCTIONS += "\n8. 任务取消、连接断开或退出时释放本任务的共享、保护和绑定；120 秒没有实际任务操作也会中断，ping、权限/任务状态查询和扩展心跳不续期。长任务持续操作可正常续期；等待用户时先 end。TASK_INTERRUPTED/TASK_CANCELLED 后不得复活旧任务或重放输入，先核实既有结果，用户要求继续时 begin 并显式绑定新任务。TARGET_MISMATCH 只说明目标不一致，不证明旧任务已失效；先查看状态，不自动结束或接管其他任务。"
+AGENT_INSTRUCTIONS += " Workbuddy 安装的 FinalStop/SessionEnd 回调直接撤销该会话本轮持有的任务，共享与保护不等待连接器回收；宿主未提供回调时保留 120 秒空闲兜底。"
 
 def shots_directory():
     """Screenshots must land somewhere the signed app bundle never owns."""
@@ -761,6 +768,16 @@ def reap_task_lease():
         interrupt_task('idle_timeout')
 
 
+def pending_host_stop():
+    if not os.path.lexists(TASK_FILE):
+        return None
+    data = read_file(TASK_FILE, {})
+    record = data.get('tasks', {}).get(data.get('activeTaskId'))
+    if record and TASK_OWNER.owns(record) and record['state'] not in ('ended', 'interrupted'):
+        return host_stop_reason(record, Path(TASK_FILE).parent)
+    return None
+
+
 def renew_task_lease(name, args):
     relevant = name in TASK_TARGET_TOOLS or (name == 'cua_windows' and args.get('action') in ('share', 'unshare')) or (
         name == 'cua_browser_events' and args.get('action') not in ('status', 'candidates', 'annotations'))
@@ -788,9 +805,22 @@ def start_task_watch():
         return
     def watch():
         while not TASK_WATCH_STOP.wait(0.5):
+            try:
+                reason = pending_host_stop()
+            except Exception as exc:
+                log('host lifecycle watchdog: %s' % type(exc).__name__)
+                reason = None
+            if reason:
+                # Cancellation must also reach an in-flight operation while it
+                # owns TOOL_LOCK. The native wait loop observes this event.
+                REQUEST_CANCELLED.cua_reason = reason
+                REQUEST_CANCELLED.set()
             if TOOL_LOCK.acquire(blocking=False):
                 try:
-                    reap_task_lease()
+                    if reason:
+                        interrupt_task(reason)
+                    else:
+                        reap_task_lease()
                 except Exception as exc:
                     log('task lease watchdog: %s' % type(exc).__name__)
                 finally:
@@ -2786,7 +2816,8 @@ def handle(msg, cancel_event=None):
             "result": {
                 "protocolVersion": client_version,
                 "capabilities": {"tools": {"listChanged": False}},
-                "serverInfo": {"name": SERVER_NAME, "version": SERVER_VERSION},
+                "serverInfo": {"name": SERVER_NAME, "title": "Workbuddy CUA", "version": SERVER_VERSION,
+                               "icons": TOOL_ICONS},
                 "instructions": AGENT_INSTRUCTIONS,
             },
         }
@@ -2800,6 +2831,7 @@ def handle(msg, cancel_event=None):
     if method == "tools/list":
         public = [
             dict({"name": t["name"], "description": t["description"], "inputSchema": t["inputSchema"]},
+                 icons=TOOL_ICONS,
                  **({"annotations": t["annotations"]} if "annotations" in t else {}))
             for t in TOOLS
             if not (READ_ONLY and not t["readOnly"])
@@ -2812,7 +2844,7 @@ def handle(msg, cancel_event=None):
         try:
             result = call_tool(params.get("name"), params.get("arguments") or {})
             if REQUEST_CANCELLED.is_set():
-                interrupt_task('client_cancelled')
+                interrupt_task(getattr(REQUEST_CANCELLED, 'cua_reason', 'client_cancelled'))
         finally:
             REQUEST_CANCELLED = previous
         return {"jsonrpc": "2.0", "id": rid, "result": result}

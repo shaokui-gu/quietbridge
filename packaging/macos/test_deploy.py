@@ -99,6 +99,49 @@ class MenuBarServiceTests(unittest.TestCase):
         self.assertFalse(self.service.owns_process(binary, self.owner, str(other)))
 
 
+class LifecycleHookPlanTests(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.home = Path(temporary.name).resolve() / 'home with spaces'
+        (self.home / '.workbuddy').mkdir(parents=True)
+        self.settings = self.home / '.workbuddy/settings.json'
+        self.connector = self.home / 'Library/Application Support/workbuddy-cua/connector/connector.py'
+        self.config = json.dumps({'mcpServers': {'workbuddy-cua': {'args': ['-B', str(self.connector)], 'env': {}}}}).encode()
+
+    def test_merge_is_idempotent_and_preserves_unrelated_hooks_and_settings(self):
+        foreign = {'matcher': 'Read', 'hooks': [{'type': 'command', 'command': 'existing-hook'}]}
+        self.settings.write_text(json.dumps({'custom': 7, 'hooks': {'PostToolUse': [foreign],
+            'Stop': [{'hooks': [{'type': 'command', 'command': 'keep-stop'}]}]}}))
+        path, original, rendered = deploy.lifecycle_plan(self.home, self.connector, self.config)
+        self.assertEqual(path, self.settings)
+        self.assertEqual(original, self.settings.read_bytes())
+        result = json.loads(rendered)
+        self.assertEqual(result['custom'], 7)
+        self.assertEqual(result['hooks']['PostToolUse'][0], foreign)
+        self.assertEqual(result['hooks']['Stop'][0]['hooks'][0]['command'], 'keep-stop')
+        for event in ['PostToolUse', 'FinalStop', 'SessionEnd']:
+            command = result['hooks'][event][-1]['hooks'][0]['command']
+            parts = deploy.shlex.split(command)
+            self.assertEqual(parts[2], str(self.connector.with_name('host_lifecycle.py')))
+            self.assertEqual(parts[-2], '--config-dir')
+        self.settings.write_bytes(rendered)
+        self.assertEqual(deploy.lifecycle_plan(self.home, self.connector, self.config)[2], rendered)
+
+    def test_existing_diagnostics_config_path_is_used(self):
+        data = json.loads(self.config)
+        data['mcpServers']['workbuddy-cua']['env']['CUA_CONFIG_DIR'] = str(self.home / 'custom runtime')
+        result = json.loads(deploy.lifecycle_plan(self.home, self.connector, json.dumps(data).encode())[2])
+        command = result['hooks']['FinalStop'][0]['hooks'][0]['command']
+        self.assertEqual(deploy.shlex.split(command)[-1], str(self.home / 'custom runtime'))
+
+    def test_invalid_settings_are_rejected_without_replacement(self):
+        self.settings.write_text('{"hooks": []}')
+        before = self.settings.read_bytes()
+        with self.assertRaises(ValueError): deploy.lifecycle_plan(self.home, self.connector, self.config)
+        self.assertEqual(self.settings.read_bytes(), before)
+
+
 class DeploymentTests(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
@@ -119,6 +162,7 @@ class DeploymentTests(unittest.TestCase):
         (bridge / 'server.py').write_text('import json; print(json.dumps({"result":{"serverInfo":{"name":"workbuddy-cua"}}}))')
         (bridge / 'connector.py').write_bytes((ROOT / 'cua-mcp-bridge/connector.py').read_bytes())
         (bridge / 'stdio_transport.py').write_bytes((ROOT / 'cua-mcp-bridge/stdio_transport.py').read_bytes())
+        (bridge / 'host_lifecycle.py').write_bytes((ROOT / 'cua-mcp-bridge/host_lifecycle.py').read_bytes())
         self.support = self.root / 'support'
         extension = self.support / 'extension/extension-stage'
         extension.mkdir(parents=True)
@@ -194,6 +238,10 @@ class DeploymentTests(unittest.TestCase):
         self.assertFalse(outcome['startupVerified'])
         self.assertEqual(service.starts, 0)
         self.assertEqual(service.stops, 1)
+        settings = json.loads((self.home / '.workbuddy/settings.json').read_text())
+        self.assertEqual(set(settings['hooks']), {'PostToolUse', 'FinalStop', 'SessionEnd'})
+        self.assertEqual((self.runtime / 'connector/host_lifecycle.py').read_bytes(),
+                         (ROOT / 'cua-mcp-bridge/host_lifecycle.py').read_bytes())
         self.assertFalse(plistlib.loads(self.agent.read_bytes())['RunAtLoad'])
         self.assertEqual(json.loads(Path(outcome['journal']).read_bytes())['phase'], 'committed')
         self.assertEqual(self.config.stat().st_mode & 0o777, 0o600)

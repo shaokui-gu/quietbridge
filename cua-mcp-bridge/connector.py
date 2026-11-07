@@ -64,7 +64,7 @@ class Connector:
                 raise ValueError('bridge is outside installed releases')
             read_owned(path)
             previous_env = os.environ.get('CUA_HELPER_PATH')
-            previous_modules = {name: sys.modules.pop(name, None) for name in ('browser_events', 'recovery', 'task_lifecycle')}
+            previous_modules = {name: sys.modules.pop(name, None) for name in ('browser_events', 'recovery', 'task_lifecycle', 'host_lifecycle')}
             sys.path.insert(0, str(path.parent))
             try:
                 os.environ['CUA_HELPER_PATH'] = value['helper']

@@ -138,8 +138,9 @@ def main():
     }))
     bridge = resources / "bridge"
     bridge.mkdir()
-    for name in ("server.py", "browser_events.py", "recovery.py", "connector.py", "task_lifecycle.py", "stdio_transport.py"):
+    for name in ("server.py", "browser_events.py", "recovery.py", "connector.py", "task_lifecycle.py", "stdio_transport.py", "host_lifecycle.py"):
         shutil.copy2(ROOT / "cua-mcp-bridge" / name, bridge / name)
+    shutil.copytree(ROOT / 'cua-mcp-bridge/assets', bridge / 'assets')
     support = payload / "Library/Application Support/workbuddy-cua"
     support.mkdir(parents=True)
     # Same executable, separate signing identities. The authorization plug-in

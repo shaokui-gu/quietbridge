@@ -20,6 +20,7 @@ import platform
 import re
 import shutil
 import signal
+import shlex
 import stat
 import subprocess
 import sys
@@ -134,6 +135,52 @@ def config_plan(home, bridge, helper, stable=False):
     entry.update(command=sys.executable, args=['-B', str(bridge)], env=env)
     servers[key] = entry
     return config, original, (json.dumps(data, ensure_ascii=False, indent=2) + '\n').encode()
+
+
+def lifecycle_plan(home, connector, config):
+    """Merge supported Workbuddy hooks without replacing the person's hooks."""
+    settings = checked(home / '.workbuddy/settings.json')
+    original = read(settings)
+    data = json.loads(original) if original else {}
+    if not isinstance(data, dict) or not isinstance(data.get('hooks', {}), dict):
+        raise ValueError('settings.json hooks 格式无法识别；未修改')
+    entry = next(value for value in json.loads(config)['mcpServers'].values()
+                 if str(connector) in value.get('args', []))
+    runtime = Path(entry.get('env', {}).get('CUA_CONFIG_DIR') or
+                   home / 'Library/Application Support/WorkbuddyExtension/cua-helper-config')
+    if not runtime.is_absolute():
+        raise ValueError('CUA_CONFIG_DIR 必须是绝对路径')
+    script = connector.with_name('host_lifecycle.py')
+    command = ' '.join(shlex.quote(str(part)) for part in
+                       (sys.executable, '-B', script, '--config-dir', runtime))
+    hooks = data.setdefault('hooks', {})
+    for event in ('PostToolUse', 'FinalStop', 'SessionEnd'):
+        groups = hooks.get(event, [])
+        if not isinstance(groups, list):
+            raise ValueError('settings.json hook 事件必须是数组')
+        retained = []
+        for group in groups:
+            if not isinstance(group, dict) or not isinstance(group.get('hooks'), list):
+                raise ValueError('settings.json hook 组格式无法识别')
+            remaining = []
+            for hook in group['hooks']:
+                if not isinstance(hook, dict):
+                    raise ValueError('settings.json hook 格式无法识别')
+                try:
+                    parts = shlex.split(hook.get('command', ''))
+                except ValueError:
+                    parts = []
+                ours = hook.get('type') == 'command' and len(parts) >= 3 and parts[1:3] == ['-B', str(script)]
+                if not ours:
+                    remaining.append(hook)
+            if remaining:
+                retained.append(dict(group, hooks=remaining))
+        group = {'hooks': [{'type': 'command', 'command': command, 'timeout': 5}]}
+        if event == 'PostToolUse':
+            group['matcher'] = r'^(?:mcp__)?(?:workbuddy-cua|cua)__cua_task$'
+        retained.append(group)
+        hooks[event] = retained
+    return settings, original, (json.dumps(data, ensure_ascii=False, indent=2) + '\n').encode()
 
 
 def preflight(home):
@@ -481,6 +528,7 @@ def deploy(home, helper, app=APP, support=SUPPORT, service=None):
     bridge = menu_app / 'Contents/Resources/bridge/server.py'
     connector = checked(runtime / 'connector/connector.py')
     config, original, rendered = config_plan(home, connector, helper, stable=True)
+    settings, old_settings, rendered_settings = lifecycle_plan(home, connector, rendered)
     handshake(bridge, helper)
     extension = checked(runtime / 'extension/extension-stage')
     sys.path.insert(0, str(release / 'extension'))
@@ -503,7 +551,10 @@ def deploy(home, helper, app=APP, support=SUPPORT, service=None):
     files = [(config, original, rendered, 0o600),
              (connector, read(connector), (bridge.parent / 'connector.py').read_bytes(), 0o600),
              (connector.with_name('stdio_transport.py'), read(connector.with_name('stdio_transport.py')),
-              (bridge.parent / 'stdio_transport.py').read_bytes(), 0o600)]
+              (bridge.parent / 'stdio_transport.py').read_bytes(), 0o600),
+             (connector.with_name('host_lifecycle.py'), read(connector.with_name('host_lifecycle.py')),
+              (bridge.parent / 'host_lifecycle.py').read_bytes(), 0o600),
+             (settings, old_settings, rendered_settings, 0o600)]
     for source, target in ((release / 'extension/native_host.py', Path(plan['hostPath'])),
                            (release / 'extension/browser_events.py', Path(plan['bridgePath']))):
         files.append((target, read(target), source.read_bytes(), 0o600))
@@ -564,6 +615,8 @@ def deploy(home, helper, app=APP, support=SUPPORT, service=None):
         cleanup['error'] = type(error).__name__
         running_legacy = None
     transaction.values['legacyCleanup'] = cleanup
+    transaction.values['lifecycleHooks'] = {'installed': True,
+        'events': ['PostToolUse', 'FinalStop', 'SessionEnd'], 'settings': str(settings)}
     previous_servers = json.loads(original).get('mcpServers', {}) if original else {}
     previous_entry = next((v for k, v in previous_servers.items() if k in ('workbuddy-cua', 'cua') and owned(v, home)), None)
     stable_before = previous_entry is not None and str(connector) in previous_entry.get('args', [])
