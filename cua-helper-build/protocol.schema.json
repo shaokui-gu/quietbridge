@@ -8,6 +8,24 @@
       "type": "object",
       "properties": {
         "id": {"type": "string"},
+        "method": {"const": "windowIdentity"},
+        "params": {
+          "type": "object",
+          "properties": {
+            "appHandle": {"type": "string", "minLength": 1},
+            "windowId": {"type": "integer", "minimum": 1, "maximum": 4294967295}
+          },
+          "required": ["appHandle", "windowId"],
+          "additionalProperties": false
+        }
+      },
+      "required": ["id", "method", "params"],
+      "additionalProperties": false
+    },
+    {
+      "type": "object",
+      "properties": {
+        "id": {"type": "string"},
         "method": {"const": "visualState"},
         "params": {
           "type": "object",
@@ -249,7 +267,7 @@
           "properties": {
             "action": {
               "type": "string",
-              "enum": ["hold", "release", "status"]
+              "enum": ["hold", "release", "status", "renew"]
             },
             "appHandle": {
               "type": "string",

@@ -62,7 +62,8 @@ export class BackgroundBrowser {
     if (this.attached.has(s.tabId)) return;
     await this.chrome.debugger.attach({ tabId: s.tabId }, '1.3');
     this.attached.set(s.tabId, s.bindingId);
-    await this.check(s, command);
+    try { await this.check(s, command); }
+    catch (error) { await this.release(s.tabId, s.taskId); throw error; }
     await this.chrome.debugger.sendCommand({ tabId: s.tabId }, 'Page.enable', {});
     await this.check(s, command);
   }
@@ -70,7 +71,24 @@ export class BackgroundBrowser {
   async send(s, command, method, params) {
     await this.check(s, command);
     if (!this.attached.has(s.tabId)) throw new Error('BACKGROUND_UNAVAILABLE：调试连接已断开');
-    return this.chrome.debugger.sendCommand({ tabId: s.tabId }, method, params);
+    let timer;
+    try {
+      return await Promise.race([
+        this.chrome.debugger.sendCommand({ tabId: s.tabId }, method, params),
+        new Promise((_, reject) => {
+          timer = setTimeout(() => {
+            // A missing input acknowledgement has an unknown outcome. Suspend
+            // and detach before accepting any further command; never replay it.
+            this.detached.add(s.tabId);
+            this.attached.delete(s.tabId);
+            const guard = this.guards.get(s.tabId);
+            if (guard) guard.scriptId = null;
+            this.chrome.debugger.detach({ tabId: s.tabId }).catch(() => {});
+            reject(new Error(`BACKGROUND_COMMAND_TIMEOUT：${method} 未回执，结果未知，未重放；请重新分配原标签并观察`));
+          }, Math.max(1, Math.min(3000, command.expiresAt * 1000 - Date.now())));
+        })
+      ]);
+    } finally { clearTimeout(timer); }
   }
 
   async release(tabId, taskId) {
@@ -98,14 +116,44 @@ export class BackgroundBrowser {
     this.detached.delete(s.tabId);
   }
 
-  async protectCreatedTab(tabId, windowId, taskId) {
-    const tab = await this.chrome.tabs.get(tabId);
-    if (tab.windowId !== windowId || tab.url !== 'about:blank') throw new Error('新标签身份已变化，未导航');
-    await this.chrome.debugger.attach({ tabId }, '1.3');
-    this.attached.set(tabId, taskId);
-    const { identifier } = await this.chrome.debugger.sendCommand({ tabId },
-      'Page.addScriptToEvaluateOnNewDocument', { source: `(${installPopupGuard.toString()})(${JSON.stringify(taskId)})` });
-    this.guards.set(tabId, { taskId, scriptId: identifier });
+  async protectCreatedTab(tabId, windowId, taskId, check = async () => {}) {
+    const verifyIdentity = async () => {
+      await check();
+      const tab = await this.chrome.tabs.get(tabId);
+      if (tab.windowId !== windowId || (tab.url && tab.url !== 'about:blank') ||
+          (tab.pendingUrl && tab.pendingUrl !== 'about:blank')) throw new Error('新标签身份已变化，未导航');
+    };
+    await verifyIdentity();
+    try {
+      await this.chrome.debugger.attach({ tabId }, '1.3');
+      this.attached.set(tabId, taskId);
+      await verifyIdentity();
+      await this.chrome.debugger.sendCommand({ tabId }, 'Page.enable', {});
+      const verifyBlank = async (wait = false) => {
+        const deadline = Date.now() + 1000;
+        while (true) {
+          await verifyIdentity();
+          // HTTP(S) host permissions do not reveal about:blank in tabs.get.
+          // Attest the exact created tab's main frame through the already
+          // authorized debugger instead of requiring broader tabs permission.
+          const { frameTree } = await this.chrome.debugger.sendCommand({ tabId }, 'Page.getFrameTree', {});
+          await verifyIdentity();
+          const frame = frameTree?.frame;
+          if (frame?.url && frame.url !== 'about:blank') throw new Error('新标签文档已变化，未导航');
+          if (frame?.url === 'about:blank' && typeof frame.id === 'string' && frame.id) return frame;
+          if (!wait || Date.now() >= deadline) throw new Error('新标签空白文档未就绪，未导航');
+          await new Promise(resolve => setTimeout(resolve, 50));
+        }
+      };
+      const initial = await verifyBlank(true);
+      const { identifier } = await this.chrome.debugger.sendCommand({ tabId },
+        'Page.addScriptToEvaluateOnNewDocument', { source: `(${installPopupGuard.toString()})(${JSON.stringify(taskId)})` });
+      this.guards.set(tabId, { taskId, scriptId: identifier });
+      const current = await verifyBlank();
+      if (current.id !== initial.id || (initial.loaderId && current.loaderId !== initial.loaderId)) {
+        throw new Error('新标签文档已替换，未导航');
+      }
+    } catch (error) { await this.release(tabId, taskId); throw error; }
   }
 
   async protect(s, command) {
@@ -175,6 +223,9 @@ export class BackgroundBrowser {
     const op = command.operation, params = command.params || {};
     if (op === 'snapshot') return this.script(s, command, c => globalThis.__cuaSnapshot?.(c));
     if (op === 'diagnostics') return this.script(s, command, c => globalThis.__cuaDiagnostics?.(c));
+    // Wheel input may wait for a hidden window's compositor indefinitely.
+    // Scroll the verified document/element directly, without focus or OS input.
+    if (op === 'scroll') return this.script(s, command, (c, a) => globalThis.__cuaScroll?.(c, a), [params]);
     if (op === 'navigate') {
       const u = new URL(params.url);
       if (!safeUrl(u.href) || u.username || u.password) throw new Error('导航地址不合法');
@@ -223,10 +274,7 @@ export class BackgroundBrowser {
       return { performed: true, verified, observed: { route: 'cdp', length: (params.value ?? '').length } };
     }
     const point = { x: prepared.x, y: prepared.y };
-    if (op === 'scroll') {
-      await this.send(s, command, 'Input.dispatchMouseEvent', { type: 'mouseWheel', ...point,
-        deltaX: 0, deltaY: -(params.deltaY ?? 0) * 40 });
-    } else if (op === 'click') {
+    if (op === 'click') {
       await this.send(s, command, 'Input.dispatchMouseEvent', { type: 'mouseMoved', ...point });
       const hit = await this.script(s, command, (c, a, p) => globalThis.__cuaPointMatches?.(c, a, p), [params, point]);
       if (!hit) throw new Error('STALE_SNAPSHOT：悬停后目标移动或被遮挡，未点击');

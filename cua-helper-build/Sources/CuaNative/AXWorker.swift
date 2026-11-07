@@ -208,13 +208,29 @@ actor AXWorker {
     static var actionResult: JSONValue { .object(["dispatched": .bool(true), "verified": .bool(false)]) }
     static func clickResult(route: String, action: String? = nil, frontBefore: Int32? = nil,
                             frontAfterAction: Int32? = nil, restorationAttempted: Bool = false,
-                            restorationAccepted: Bool? = nil) -> JSONValue {
+                            restorationAccepted: Bool? = nil, frontWindowBefore: UInt32? = nil,
+                            frontWindowAfterAction: UInt32? = nil) -> JSONValue {
         .object(["dispatched": .bool(true), "verified": .bool(false), "route": .string(route),
                  "axAction": action.map(JSONValue.string) ?? .null,
                  "frontPidBefore": frontBefore.map { .number(Double($0)) } ?? .null,
                  "frontPidAfterAction": frontAfterAction.map { .number(Double($0)) } ?? .null,
+                 "frontWindowIdBefore": frontWindowBefore.map { .number(Double($0)) } ?? .null,
+                 "frontWindowIdAfterAction": frontWindowAfterAction.map { .number(Double($0)) } ?? .null,
+                 "focusPreserved": foregroundUnchanged(beforePID: frontBefore, beforeWindow: frontWindowBefore,
+                    afterPID: frontAfterAction, afterWindow: frontWindowAfterAction).map(JSONValue.bool) ?? .null,
                  "focusRestorationAttempted": .bool(restorationAttempted),
                  "focusRestorationAccepted": restorationAccepted.map(JSONValue.bool) ?? .null])
+    }
+
+    static func shouldUseAccessibilityClick(frontPID: Int32?, targetPID: Int32,
+                                            frontWindowID: UInt32?, targetWindowID: UInt32?) -> Bool {
+        frontPID == targetPID && frontWindowID != nil && frontWindowID == targetWindowID
+    }
+
+    static func foregroundUnchanged(beforePID: Int32?, beforeWindow: UInt32?,
+                                    afterPID: Int32?, afterWindow: UInt32?) -> Bool? {
+        guard let beforePID, let beforeWindow, let afterPID, let afterWindow else { return nil }
+        return beforePID == afterPID && beforeWindow == afterWindow
     }
 
     // Only observation failures allow a fresh read. Input failures can follow
@@ -278,6 +294,16 @@ actor AXWorker {
             return .launch(ApplicationLaunch(handle: handle, application: app, authorization: authorization))
         }
         let identity = try validateIdentity(handle)
+        if method == "windowIdentity" {
+            // Host-only attestation for any desktop application. Handles retain
+            // their original process generation; never resolve a replacement PID.
+            let window = try NativePlatform.ownedWindow(identity.pid, params.windowID())
+            _ = try validateIdentity(handle)
+            return .result(.object(["pid": .number(Double(identity.pid)), "windowId": .number(Double(window.windowID)),
+                "processIdentity": .object(["pid": .number(Double(identity.pid)),
+                    "startedSeconds": .string(String(identity.startedSeconds)),
+                    "startedMicroseconds": .string(String(identity.startedMicroseconds))])]))
+        }
         if method == "listWindows" {
             let windows = NativePlatform.windows().filter { $0.pid == identity.pid }
             // Remove closed window scopes using the current WindowServer identity set.
@@ -387,6 +413,20 @@ actor AXWorker {
             }
             try ax().perform(selected, action)
         case "click", "hover":
+            let frontBefore = method == "click" ? NativePlatform.frontPID() : nil
+            let frontWindowBefore: UInt32?
+            if method == "click" {
+                guard let frontBefore else {
+                    throw NativeFailure(code: "FOCUS_STATE_UNKNOWN", message: "无法确认当前前台应用，按保留焦点策略拒绝点击")
+                }
+                do { frontWindowBefore = try ax().focusedWindowID(frontBefore) }
+                catch { throw NativeFailure(code: "FOCUS_STATE_UNKNOWN", message: "无法读取当前键盘窗口，按保留焦点策略拒绝点击") }
+                guard frontWindowBefore != nil else {
+                    throw NativeFailure(code: "FOCUS_STATE_UNKNOWN", message: "当前键盘窗口未知，按保留焦点策略拒绝点击")
+                }
+            } else {
+                frontWindowBefore = nil
+            }
             let holdMs = params.contains("holdMs") ? try params.integer("holdMs", in: 0...maxClickHoldMs) : nil
             let button = try params.optionalString("mouseButton") ?? "left"
             let count = params.contains("clickCount") ? try params.integer("clickCount", in: 1...2) : 1
@@ -414,26 +454,34 @@ actor AXWorker {
                     let names = try ax().actions(selected)
                     let action: String? = holdMs != nil || !modifiers.isEmpty ? nil : button == "right" && names.contains("AXShowMenu") ? "AXShowMenu"
                         : (button == "left" && count == 1 ? (names.contains("AXPress") ? "AXPress" : names.contains("AXPick") ? "AXPick" : nil) : nil)
-                    if let action {
+                    if let action, Self.shouldUseAccessibilityClick(frontPID: frontBefore, targetPID: identity.pid,
+                                                                    frontWindowID: frontWindowBefore,
+                                                                    targetWindowID: ownerWindow?.windowID) {
                         // Keep the preview alive for the accessibility path too: it used to
                         // return before anything told the panel to track the target window.
                         if let win = ownerWindow {
                             let previewPID = identity.pid, previewWindow = win.windowID
                             Task { @MainActor in SpacePreview.shared.track(pid: previewPID, windowID: previewWindow) }
                         }
-                        let frontBefore = NativePlatform.frontPID()
                         OperationTrace.current?.mark("pointer.axAction.begin", fields: ["axAction": .string(action)])
                         try ax().perform(selected, action)
                         let frontAfterAction = NativePlatform.frontPID()
-                        // Application activation can surface a different window; focus changes
-                        // are reported rather than automatically activating an unrelated window.
+                        let frontWindowAfterAction = frontAfterAction.flatMap { try? ax().focusedWindowID($0) } ?? nil
+                        // Report any focus change; do not restore it because the user may have
+                        // switched apps concurrently while the click was being dispatched.
                         OperationTrace.current?.mark("pointer.focus", fields: [
                             "frontPidBefore": frontBefore.map { .number(Double($0)) } ?? .null,
                             "frontPidAfterAction": frontAfterAction.map { .number(Double($0)) } ?? .null,
+                            "frontWindowIdBefore": frontWindowBefore.map { .number(Double($0)) } ?? .null,
+                            "frontWindowIdAfterAction": frontWindowAfterAction.map { .number(Double($0)) } ?? .null,
+                            "focusPreserved": Self.foregroundUnchanged(beforePID: frontBefore, beforeWindow: frontWindowBefore,
+                                afterPID: frontAfterAction, afterWindow: frontWindowAfterAction).map(JSONValue.bool) ?? .null,
                             "focusRestorationAttempted": .bool(false)])
                         var result = Self.clickResult(route: "accessibility", action: action,
                             frontBefore: frontBefore, frontAfterAction: frontAfterAction,
-                            restorationAttempted: false, restorationAccepted: nil).object ?? [:]
+                            restorationAttempted: false, restorationAccepted: nil,
+                            frontWindowBefore: frontWindowBefore,
+                            frontWindowAfterAction: frontWindowAfterAction).object ?? [:]
                         if let win = ownerWindow, let frame = elementBounds {
                             result["pointer"] = OperationTrace.geometry(
                                 route: WindowRoute(owner: identity, windowID: win.windowID, bounds: win.bounds),
@@ -441,6 +489,12 @@ actor AXWorker {
                                                    y: frame.y + frame.height / 2 - win.bounds.y))
                         }
                         return .result(.object(result))
+                    }
+                    if action != nil {
+                        OperationTrace.current?.mark("pointer.axAction.skipped", fields: [
+                            "reason": .string("background-target-requires-window-routed-input"),
+                            "targetPid": .number(Double(identity.pid)),
+                            "frontPid": frontBefore.map { .number(Double($0)) } ?? .null])
                     }
                     try ax().requireEnabled(selected)
                 }
@@ -477,10 +531,22 @@ actor AXWorker {
                 }
                 return .hover(route, point)
             }
-            let frontBefore = NativePlatform.frontPID()
             try await inputs().1.click(in: route, at: point, button: button, count: count, modifiers: modifiers, holdMs: holdMs)
+            let frontAfterAction = NativePlatform.frontPID()
+            let frontWindowAfterAction = frontAfterAction.flatMap { try? ax().focusedWindowID($0) } ?? nil
+            OperationTrace.current?.mark("pointer.focus", fields: [
+                "route": .string("window-pointer"),
+                "frontPidBefore": frontBefore.map { .number(Double($0)) } ?? .null,
+                "frontPidAfterAction": frontAfterAction.map { .number(Double($0)) } ?? .null,
+                "frontWindowIdBefore": frontWindowBefore.map { .number(Double($0)) } ?? .null,
+                "frontWindowIdAfterAction": frontWindowAfterAction.map { .number(Double($0)) } ?? .null,
+                "focusPreserved": Self.foregroundUnchanged(beforePID: frontBefore, beforeWindow: frontWindowBefore,
+                    afterPID: frontAfterAction, afterWindow: frontWindowAfterAction).map(JSONValue.bool) ?? .null,
+                "focusRestorationAttempted": .bool(false)])
             var result = Self.clickResult(route: "window-pointer", frontBefore: frontBefore,
-                                         frontAfterAction: NativePlatform.frontPID()).object ?? [:]
+                                         frontAfterAction: frontAfterAction,
+                                         frontWindowBefore: frontWindowBefore,
+                                         frontWindowAfterAction: frontWindowAfterAction).object ?? [:]
             result["pointer"] = pointer
             return .result(.object(result))
         case "scroll", "drag":

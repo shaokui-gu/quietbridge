@@ -1,5 +1,5 @@
 // In-memory capability switches for one menu-bar process.
-// Absence of that process means "unchanged": callers keep their existing behavior.
+// Workers require the menu application's live session; its absence disables all work.
 import Foundation
 
 struct CapabilitySwitches: Equatable, Sendable {
@@ -77,13 +77,24 @@ final class CapabilityControl: @unchecked Sendable {
     static let shared = CapabilityControl()
     private let lock = NSLock()
     private var switches = CapabilitySwitches()
+    private var permissions: DesktopPermissionStatus?
 
-    func snapshot() -> [String: Bool] { lock.withLock { switches.snapshot } }
-    func preferences() -> [String: Bool] { lock.withLock { switches.preferences } }
+    // Unknown and revoked permissions close the API as well as the visual switch.
+    // Keep the person's choices so a refresh never re-enables a manual opt-out.
+    private func filtered(_ values: [String: Bool]) -> [String: Bool] {
+        values.merging(Dictionary(uniqueKeysWithValues: CapabilitySwitches.keys.compactMap { key in
+            let required = DesktopPermission.required(for: key)
+            guard !required.isEmpty else { return nil }
+            return (key, values[key] == true && required.allSatisfy { permissions?.granted($0) == true })
+        })) { _, gated in gated }
+    }
+    func updatePermissions(_ value: DesktopPermissionStatus?) { lock.withLock { permissions = value } }
+    func snapshot() -> [String: Bool] { lock.withLock { filtered(switches.snapshot) } }
+    func preferences() -> [String: Bool] { lock.withLock { filtered(switches.preferences) } }
     func set(_ key: String, _ value: Bool) -> [String: Bool]? {
         lock.withLock {
             guard switches.set(key, value) else { return nil }
-            return switches.snapshot
+            return filtered(switches.snapshot)
         }
     }
 }

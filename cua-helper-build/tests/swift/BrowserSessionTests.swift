@@ -173,7 +173,13 @@ import Testing
         let latch = CancellationLatch()
         let id = try #require(manager.handle(action: "prepare", cancellation: latch)["sessionId"].string)
         _ = try manager.handle(action: "start", sessionID: id, confirm: true, cancellation: latch)
-        try await Task.sleep(for: .milliseconds(30))
+        // Other AppKit tests can occupy MainActor before the timeout task starts.
+        // Wait for the transition rather than assuming a 30ms scheduling order.
+        for _ in 0..<100 {
+            try await Task.sleep(for: .milliseconds(10))
+            if case .array(let sessions) = try manager.handle(action: "list", cancellation: latch)["sessions"],
+               sessions.first?["state"] == .string("launchUncertain") { break }
+        }
         guard case .array(let uncertain) = try manager.handle(action: "list", cancellation: latch)["sessions"] else { return }
         #expect(uncertain[0]["state"] == .string("launchUncertain"))
         #expect(uncertain[0]["dispatched"] == .bool(true))

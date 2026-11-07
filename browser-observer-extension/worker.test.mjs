@@ -48,7 +48,7 @@ test('真实 worker 入口：握手、默认无任务、内部派发、隔离、
             if (blockSync) { const wait = blockSync; blockSync = null; await wait; }
             if (!m.enabled || !m.permission) assignment = null;
             if (m.candidates) requestCandidates = false;
-            return { ok: true, protocolVersion: 2, heartbeatAt: Date.now() / 1000, requestCandidates,
+            return { ok: true, protocolVersion: 2, applicationSession: 'test-app-session', heartbeatAt: Date.now() / 1000, requestCandidates,
               taskAssignment: assignment ? 'assigned' : 'no_assignment', assignment: structuredClone(assignment) };
           }
           if (m.action === 'event') {
@@ -57,7 +57,7 @@ test('真实 worker 入口：握手、默认无任务、内部派发、隔离、
             assignment.event = structuredClone(m.event);
           }
           if (m.action === 'unbind') assignment = null;
-          return { ok: true };
+          return { ok: true, applicationSession: 'test-app-session' };
         } },
       alarms: { create() {}, onAlarm: listener() },
       webNavigation: { ...nav, async getFrame() { return frame; } },
@@ -170,7 +170,7 @@ test('真实 worker 入口：握手、默认无任务、内部派发、隔离、
   assert.equal(stored.url, null);
   await send({ action: 'disable' });
   assert.equal(stored, null);
-  assert.ok([...timers.values()].every(t => t.ms === 5000));
+  assert.ok([...timers.values()].every(t => t.ms === 1000));
   // 网页无法触发 chrome.permissions.request；能自动化的只有「把授权页送到用户眼前」。
   chrome.tabs.opened.length = 0;
   permission = false;
@@ -200,6 +200,7 @@ async function lifecycleHarness() {
   let state = null;
   const session = {};
   const ports = [];
+  const nativePorts = [];
   let nativeHandler = async () => ({ ok: true, protocolVersion: 2, heartbeatAt: 1, taskAssignment: 'no_assignment' });
   const calls = [];
   const nav = Object.fromEntries(['onBeforeNavigate', 'onCommitted', 'onDOMContentLoaded',
@@ -223,8 +224,10 @@ async function lifecycleHarness() {
       onInstalled: listener(),
       connectNative(host) {
         ports.push(host);
-        return { postMessage() {}, disconnect() {},
+        const port = { postMessage() {}, disconnect() { this.disconnected = true; },
           onMessage: listener(), onDisconnect: listener() };
+        nativePorts.push(port);
+        return port;
       },
       async sendNativeMessage(host, message) {
         calls.push(structuredClone(message));
@@ -235,7 +238,7 @@ async function lifecycleHarness() {
             tabId: a.tabId, browserWindowId: a.browserWindowId, documentId: 'doc-1',
             navigationEpoch: state?.navigationEpoch ?? 1, expiresAt: Date.now() / 1000 + 30, ...reply.command };
         }
-        return reply;
+        return { applicationSession: 'test-app-session', ...reply };
       } },
     webNavigation: { ...nav, async getFrame() {
       return { documentId: 'doc-1', frameId: 0, url: 'https://example.org/path' };
@@ -243,7 +246,9 @@ async function lifecycleHarness() {
     tabs: { onRemoved: listener(),
       async get(id) { return { id, windowId: 2, url: 'https://example.org/path' }; },
       async update(id, props) { return { id, windowId: 2, url: props.url }; } },
-    debugger: { onDetach: listener(), async attach() {}, async detach() {}, async sendCommand() { return { identifier: 'script-1' }; } },
+    debugger: { onDetach: listener(), async attach() {}, async detach() {}, async sendCommand(target, method) {
+      return method === 'Page.getFrameTree' ? { frameTree: { frame: { id: 'initial-frame', url: 'about:blank' } } } : { identifier: 'script-1' };
+    } },
     scripting: { async executeScript() {} },
     alarms: { create() {}, onAlarm: listener() }
   };
@@ -255,14 +260,21 @@ async function lifecycleHarness() {
   };
   boot();
   const flush = async () => {
-    await vm.runInContext('controls', context);
-    await vm.runInContext('queue', context);
-    await vm.runInContext('controls', context);
+    for (let i = 0; i < 100; i++) {
+      const pendingControls = vm.runInContext('controls', context);
+      const pendingQueue = vm.runInContext('queue', context);
+      await pendingControls;
+      await pendingQueue;
+      if (pendingControls === vm.runInContext('controls', context) &&
+          pendingQueue === vm.runInContext('queue', context)) return;
+    }
+    throw new Error('worker queues did not drain');
   };
   await flush();
   return { local, chrome, calls, flush, async restart() { boot(); await flush(); },
     get state() { return state; },
     get ports() { return ports; },
+    get nativePorts() { return nativePorts; },
     set permission(value) { permission = value; },
     set native(value) { nativeHandler = value; },
     intent(nonce = 'first', issuedAt = Date.now()) {
@@ -391,7 +403,10 @@ test('内部创建请求只执行一次，创建证据只回传一次', async ()
   const created = [], navigated = [], protection = [];
   h.chrome.tabs.get = async id => ({ id, windowId: 41, url: 'about:blank' });
   h.chrome.tabs.update = async (id, options) => { navigated.push({ id, options }); return { id, windowId: 41, ...options }; };
-  h.chrome.debugger.sendCommand = async (target, method) => { protection.push({ target, method }); return { identifier: 'script-1' }; };
+  h.chrome.debugger.sendCommand = async (target, method) => {
+    protection.push({ target, method });
+    return method === 'Page.getFrameTree' ? { frameTree: { frame: { id: 'initial-frame', url: 'about:blank' } } } : { identifier: 'script-1' };
+  };
   h.chrome.windows = { async create(options) {
     created.push(structuredClone(options));
     return { id: 41, tabs: [{ id: 42, windowId: 41 }] };
@@ -413,15 +428,77 @@ test('内部创建请求只执行一次，创建证据只回传一次', async ()
   assert.equal(created[0].url, 'about:blank');
   assert.equal(navigated[0].id, 42);
   assert.equal(navigated[0].options.url, 'https://example.org/');
-  assert.equal(protection[0].method, 'Page.addScriptToEvaluateOnNewDocument');
+  assert.ok(protection.some(p => p.method === 'Page.addScriptToEvaluateOnNewDocument'));
   assert.equal(created[0].focused, false, '创建专用窗口不得抢占前台');
   const reports = syncs.filter(m => m.created);
   assert.equal(reports.length, 1);
-  assert.deepEqual(reports[0].created, { requestId, browserWindowId: 41, tabId: 42 });
+  assert.deepEqual(reports[0].created, { requestId, browserWindowId: 41, tabId: 42, navigationState: 'issued' });
   h.chrome.alarms.onAlarm.fn({ name: 'observer-sync' });
   await h.flush();
   assert.equal(created.length, 1, '同一请求不得重复建窗');
   assert.equal(syncs.filter(m => m.created).length, 1, '证据不得重复回传');
+});
+
+test('新窗口初始文档延迟就绪后导航，并进入所有窗口的 HTTP 候选', async () => {
+  const h = await lifecycleHarness();
+  h.permission = true;
+  let frames = 0, created = 0, navigated = false, accepted = false;
+  const reports = [];
+  const request = { requestId: 'd'.repeat(32), taskId: 'task', url: 'https://example.org/new' };
+  h.chrome.windows = { async create() { created++; return { id: 41, tabs: [{ id: 42 }] }; } };
+  h.chrome.tabs.get = async id => ({ id, windowId: 41, ...(navigated ? { url: request.url } : {}) });
+  const send = h.chrome.debugger.sendCommand;
+  h.chrome.debugger.sendCommand = async (...args) => args[1] === 'Page.getFrameTree' ?
+    (++frames < 3 ? {} : { frameTree: { frame: { id: 'initial-frame', url: 'about:blank' } } }) : send(...args);
+  h.chrome.tabs.update = async id => { assert.equal(id, 42); navigated = true; };
+  h.chrome.tabs.query = async options => {
+    assert.deepEqual({ ...options }, {}, '枚举全部窗口，不按焦点或当前窗口过滤');
+    return [{ id: 1, windowId: 2, url: 'https://example.org/old' },
+      { id: 42, windowId: 41, url: navigated ? request.url : 'about:blank' }];
+  };
+  h.native = async message => {
+    if (message.created) { accepted = true; reports.push(message.created); }
+    return { ok: true, protocolVersion: 2, heartbeatAt: 1, activeTaskId: 'task',
+      requestCandidates: message.action === 'sync' && accepted && !message.candidates,
+      createRequest: accepted ? null : request };
+  };
+  await h.send({ action: 'enable' });
+  await h.flush();
+  assert.equal(created, 1);
+  assert.equal(navigated, true);
+  assert.equal(reports[0].navigationState, 'issued');
+  const candidates = h.calls.find(m => m.candidates)?.candidates;
+  assert.ok(candidates.some(c => c.tabId === 42 && c.browserWindowId === 41));
+});
+
+test('导航准备失败与下发结果未知均持久回传，重启不重建或重放导航', async () => {
+  for (const failure of ['preparation', 'navigation']) {
+    const h = await lifecycleHarness();
+    h.permission = true;
+    let created = 0, updates = 0, reportsAccepted = false;
+    const reports = [];
+    const request = { requestId: 'e'.repeat(32), taskId: 'task', url: 'https://example.org/' };
+    h.chrome.windows = { async create() { created++; return { id: 41, tabs: [{ id: 42 }] }; } };
+    h.chrome.tabs.get = async id => ({ id, windowId: 41, url: 'about:blank' });
+    h.chrome.debugger.attach = async () => { if (failure === 'preparation') throw new Error('debugger unavailable'); };
+    h.chrome.tabs.update = async () => { updates++; throw new Error('navigation response lost'); };
+    h.native = async message => {
+      if (message.created) {
+        reports.push(structuredClone(message.created));
+        if (!reportsAccepted) throw new Error('host response lost');
+      }
+      return { ok: true, protocolVersion: 2, heartbeatAt: 1, activeTaskId: 'task', createRequest: request };
+    };
+    await h.send({ action: 'enable' });
+    await h.flush();
+    assert.equal(reports[0].navigationState, failure === 'preparation' ? 'failed' : 'unknown');
+    assert.match(reports[0].navigationError, failure === 'preparation' ? /debugger unavailable/ : /response lost/);
+    reportsAccepted = true;
+    await h.restart();
+    assert.equal(created, 1);
+    assert.equal(updates, failure === 'preparation' ? 0 : 1);
+    assert.deepEqual(reports.at(-1), reports[0]);
+  }
 });
 
 test('创建失败保留待回传状态且下一次请求不被静默吞掉', async () => {
@@ -688,6 +765,63 @@ test('启用后打开长期端口保活，停用后不再保持', async () => {
   await h.send({ action: 'disable' });
   await h.flush();
   assert.equal(h.ports.length, 1, '停用不得反复新建端口');
+});
+
+test('应用退出清除任务并断开调试，重新打开应用不恢复旧任务', async () => {
+  const h = await lifecycleHarness();
+  h.permission = true;
+  const assignment = { taskId: 'task', token: 'b'.repeat(64), bindingId: 'c'.repeat(32),
+    assignmentVersion: 1, globalOrigins: true, selector: '', tabId: 7, browserWindowId: 2,
+    mappingVerified: false };
+  let delivered = false;
+  const detached = [];
+  h.chrome.debugger.detach = async target => { detached.push(target.tabId); };
+  h.chrome.debugger.sendCommand = async (_target, method) => method === 'Page.captureScreenshot' ? { data: 'ZmFrZQ==' } :
+    method === 'Page.getLayoutMetrics' ? { cssVisualViewport: { pageX: 0, pageY: 0, clientWidth: 800, clientHeight: 600 } } : {};
+  h.native = async message => {
+    if (message.action !== 'sync') return { ok: true };
+    const command = delivered ? {} : { command: { requestId: 'f'.repeat(32), taskId: 'task', operation: 'screenshot' } };
+    delivered = true;
+    return { ok: true, protocolVersion: 2, heartbeatAt: 1, taskAssignment: 'assigned', assignment, ...command };
+  };
+  await h.send({ action: 'enable' });
+  await h.flush();
+  assert.equal(h.state?.taskId, 'task');
+  assert.equal(h.calls.find(m => m.commandResult)?.commandResult.status, 'ok', JSON.stringify(h.calls));
+  h.native = async () => ({ ok: false, code: 'APP_NOT_RUNNING', error: 'Workbuddy CUA 已退出，请先打开应用' });
+  const port = h.nativePorts[0];
+  port.onMessage.fn({ ok: false, code: 'APP_NOT_RUNNING' });
+  await h.flush();
+  assert.equal(h.state, null);
+  assert.equal(port.disconnected, true);
+  assert.deepEqual(detached, [7]);
+  assert.equal((await h.send({ action: 'status' })).nativeConnection.status, 'application_stopped');
+  h.native = async () => ({ ok: true, protocolVersion: 2, applicationSession: 'new-app-session', heartbeatAt: 2,
+    taskAssignment: 'no_assignment' });
+  h.chrome.alarms.onAlarm.fn({ name: 'observer-sync' });
+  await h.flush();
+  assert.equal(h.state, null);
+  assert.equal((await h.send({ action: 'status' })).nativeConnection.status, 'connected');
+});
+
+test('建窗过程中应用退出时停止导航并清理刚建立的调试连接', async () => {
+  const h = await lifecycleHarness();
+  h.permission = true;
+  let stopped = false;
+  const actions = [];
+  h.chrome.windows = { async create() { actions.push('create'); return { id: 2, tabs: [{ id: 7 }] }; } };
+  h.chrome.tabs.get = async () => ({ id: 7, windowId: 2, url: 'about:blank' });
+  h.chrome.tabs.update = async () => { actions.push('navigate'); };
+  h.chrome.debugger.attach = async () => { stopped = true; actions.push('attach'); };
+  h.chrome.debugger.detach = async () => { actions.push('detach'); };
+  h.native = async message => stopped ? { ok: false, code: 'APP_NOT_RUNNING', error: '应用已退出' } :
+    message.action === 'sync' ? { ok: true, protocolVersion: 2, heartbeatAt: 1, taskAssignment: 'no_assignment',
+      createRequest: { requestId: 'f'.repeat(32), taskId: 'task', url: 'https://example.org/path' } } : { ok: true };
+  await h.send({ action: 'enable' });
+  await h.flush();
+  assert.deepEqual(actions, ['create', 'attach', 'detach']);
+  assert.equal(h.state, null);
+  assert.equal((await h.send({ action: 'status' })).nativeConnection.status, 'application_stopped');
 });
 
 test('观察状态丢失后仍按持久绑定记录解绑，避免留下死目标', async () => {

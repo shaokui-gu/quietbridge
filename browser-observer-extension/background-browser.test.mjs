@@ -23,6 +23,7 @@ function harness() {
       async detach(target) { calls.push(['detach', target]); },
       async sendCommand(target, method, params) {
         calls.push([method, target, params]);
+        if (method === 'Page.getFrameTree') return { frameTree: { frame: { id: 'initial-frame', url: 'about:blank' } } };
         if (method === 'Page.getLayoutMetrics') return { cssVisualViewport: { pageX: 0, pageY: 0, clientWidth: 1600, clientHeight: 1000 } };
         if (method === 'Page.captureScreenshot') return { data: 'ZmFrZQ==' };
         return { identifier: 'script' };
@@ -45,6 +46,67 @@ function harness() {
     popup(url) { popupUrls = Array.isArray(url) ? url : [url]; } };
 }
 
+test('created-tab protection rejects moved or independently navigating tabs before attachment', async () => {
+  for (const tab of [{ windowId: 99, url: 'about:blank' },
+    { windowId: 2, url: 'about:blank', pendingUrl: 'https://other.example/' },
+    { windowId: 2, url: 'https://other.example/' }]) {
+    const h = harness();
+    h.chrome.tabs.get = async () => tab;
+    await assert.rejects(h.browser.protectCreatedTab(11, 2, 'task'), /身份已变化/);
+    assert.equal(h.calls.some(c => c[0] === 'attach'), false);
+  }
+});
+
+test('created blank tab can be verified when HTTP-only permission hides its URL metadata', async () => {
+  const h = harness();
+  h.chrome.tabs.get = async id => ({ id, windowId: 2 });
+  const send = h.chrome.debugger.sendCommand;
+  h.chrome.debugger.sendCommand = async (...args) => args[1] === 'Page.getFrameTree' ?
+    { frameTree: { frame: { id: 'initial-frame', url: 'about:blank' } } } : send(...args);
+  await h.browser.protectCreatedTab(11, 2, 'task');
+  assert.equal(h.browser.guards.get(11)?.taskId, 'task');
+  assert.equal(h.calls.some(c => c[0] === 'Page.addScriptToEvaluateOnNewDocument'), true);
+});
+
+test('hidden tab metadata never permits overwriting a nonblank CDP document', async () => {
+  for (const url of ['https://other.example/', 'chrome://newtab/', 'data:text/plain,changed']) {
+    const h = harness();
+    h.chrome.tabs.get = async id => ({ id, windowId: 2 });
+    const send = h.chrome.debugger.sendCommand;
+    h.chrome.debugger.sendCommand = async (...args) => args[1] === 'Page.getFrameTree' ?
+      { frameTree: { frame: { id: 'frame', url } } } : send(...args);
+    await assert.rejects(h.browser.protectCreatedTab(11, 2, 'task'), /文档已变化/);
+    assert.equal(h.calls.some(c => c[0] === 'Page.addScriptToEvaluateOnNewDocument'), false);
+    assert.equal(h.calls.some(c => c[0] === 'detach'), true);
+  }
+});
+
+test('replacing the blank document during preload invalidates creation protection', async () => {
+  const h = harness();
+  h.chrome.tabs.get = async id => ({ id, windowId: 2 });
+  let frameReads = 0;
+  const send = h.chrome.debugger.sendCommand;
+  h.chrome.debugger.sendCommand = async (...args) => args[1] === 'Page.getFrameTree' ?
+    { frameTree: { frame: { id: 'frame', loaderId: ++frameReads === 1 ? 'original' : 'replacement', url: 'about:blank' } } } : send(...args);
+  await assert.rejects(h.browser.protectCreatedTab(11, 2, 'task'), /文档已替换/);
+  assert.equal(h.browser.guards.size, 0);
+});
+
+test('a tab that changes during popup preload is released without being navigated', async () => {
+  const h = harness();
+  let moved = false;
+  h.chrome.tabs.get = async () => ({ windowId: moved ? 99 : 2, url: 'about:blank' });
+  const send = h.chrome.debugger.sendCommand;
+  h.chrome.debugger.sendCommand = async (...args) => {
+    const result = await send(...args);
+    if (args[1] === 'Page.addScriptToEvaluateOnNewDocument') moved = true;
+    return result;
+  };
+  await assert.rejects(h.browser.protectCreatedTab(11, 2, 'task'), /身份已变化/);
+  assert.equal(h.calls.some(c => c[0] === 'detach'), true);
+  assert.equal(h.browser.guards.size, 0);
+});
+
 test('background pointer uses the bound tab; it never activates a tab/window or uses screen coordinates', async () => {
   const h = harness();
   const result = await h.browser.run(h.command('click', { ref: 1, snapshotId: 'snap' }), h.state);
@@ -53,6 +115,30 @@ test('background pointer uses the bound tab; it never activates a tab/window or 
   assert.ok(inputs.every(c => c[1].tabId === 7 && c[2].x === 100 && c[2].y === 80));
   assert.equal(result.verified, false);
   assert.equal(h.calls.some(c => c[0] === 'update'), false);
+});
+
+test('background scrolling uses the verified document without waiting for wheel acknowledgements', async () => {
+  const h = harness();
+  const result = await h.browser.run(h.command('scroll', { snapshotId: 'snap', deltaY: -6 }), h.state);
+  assert.ok(result);
+  assert.ok(h.calls.some(c => c[0] === 'script' && c[1].func?.toString().includes('__cuaScroll')));
+  assert.equal(h.calls.some(c => c[0].startsWith('Input.')), false);
+  assert.equal(h.calls.some(c => c[0] === 'update'), false);
+});
+
+test('an unacknowledged CDP command detaches, suspends and never replays input', async t => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const h = harness();
+  const send = h.chrome.debugger.sendCommand;
+  h.chrome.debugger.sendCommand = async (...args) => args[1] === 'Input.insertText' ? new Promise(() => {}) : send(...args);
+  const pending = h.browser.run(h.command('fill', { snapshotId: 'snap', ref: 1, value: 'once' }), h.state);
+  const rejected = assert.rejects(pending, /BACKGROUND_COMMAND_TIMEOUT.*Input.insertText/);
+  await new Promise(resolve => setImmediate(resolve));
+  t.mock.timers.tick(3001);
+  await rejected;
+  assert.equal(h.calls.filter(c => c[0] === 'detach').length, 1);
+  assert.ok(h.browser.detached.has(7));
+  await assert.rejects(h.browser.run(h.command('screenshot'), h.state), /BACKGROUND_UNAVAILABLE/);
 });
 
 test('same URL with a replacement document, moved tab, expired command and revoked permission stop before input', async () => {

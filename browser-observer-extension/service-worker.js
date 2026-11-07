@@ -51,12 +51,13 @@ let assignmentTitle = null;
 let commandReport = null;
 let panelReport = null;
 let panelBridge = false;
+let applicationSession = null;
 let lastCommandId = null;
 let keepAlivePort = null;
 let keepAliveTimer;
 let activityQueue = Promise.resolve();
 function recordActivity(state, operation, outcome) {
-  if (!state?.taskId) return;
+  if (!state?.taskId) return Promise.resolve();
   const job = activityQueue.then(async () => {
     const { activity = [] } = await chrome.storage.session.get('activity');
     const entry = { taskId: state.taskId, operation, outcome, site: originOf(state.url), at: Date.now() };
@@ -75,14 +76,17 @@ function keepAlive(on) {
   if (!keepAlivePort) {
     try {
       keepAlivePort = chrome.runtime.connectNative(HOST);
-      keepAlivePort.onMessage.addListener(() => {});
+      keepAlivePort.onMessage.addListener(result => {
+        if (result?.code === 'APP_NOT_RUNNING' || (applicationSession &&
+            result?.applicationSession && result.applicationSession !== applicationSession)) applicationStopped();
+      });
       keepAlivePort.onDisconnect.addListener(() => { keepAlivePort = null; });
     } catch { keepAlivePort = null; }
   }
   // 周期性 ping 重置 worker 空闲计时，避免命令排队等到下一次 alarm。
   keepAliveTimer = setInterval(() => {
     try { keepAlivePort?.postMessage({ action: 'ping' }); } catch { keepAlivePort = null; }
-  }, 20000);
+  }, 1000);
 }
 async function runCommand(command, state) {
   if (!command || typeof command.requestId !== 'string' || lastCommandId === command.requestId) return;
@@ -156,8 +160,27 @@ function recordDownload(source, method, params) {
 const background = new BackgroundBrowser(chrome, async s => {
   const current = await read();
   return await enabled() && await permitted() && !current?.paused && current?.bindingId === s?.bindingId &&
-    current?.documentId === s?.documentId;
+    current?.documentId === s?.documentId && await runtimeAvailable();
 }, recordDownload);
+function applicationStopped() {
+  if (applicationSession) enableRevision++;
+  applicationSession = null;
+  connection = { ...connection, status: 'application_stopped', lastError: 'Workbuddy CUA 已退出，请先打开应用' };
+  assignmentStatus = 'no_assignment';
+  createdReport = commandReport = panelReport = null;
+  panelBridge = false;
+  keepAlive(false);
+  control(() => clearObservation());
+}
+async function runtimeAvailable() {
+  const session = applicationSession;
+  if (!session) return false;
+  try {
+    if ((await native({ action: 'ping' })).applicationSession === session && applicationSession === session) return true;
+  } catch {}
+  applicationStopped();
+  return false;
+}
 async function native(message) {
   let timeout;
   try {
@@ -165,7 +188,12 @@ async function native(message) {
       chrome.runtime.sendNativeMessage(HOST, message),
       new Promise((_, reject) => { timeout = setTimeout(() => reject(new Error('本地 host 超时')), 10000); })
     ]);
-    if (!result?.ok) throw new Error(result?.error || '本地请求被拒绝');
+    if (!result?.ok) {
+      const error = new Error(result?.error || '本地请求被拒绝');
+      error.code = result?.code;
+      if (error.code === 'APP_NOT_RUNNING') applicationStopped();
+      throw error;
+    }
     return result;
   } finally { clearTimeout(timeout); }
 }
@@ -176,7 +204,8 @@ function wire(s) {
   return Object.fromEntries(keys.map(k => [k, s[k]]));
 }
 async function publish(s) {
-  if (!await permitted() || !await enabled()) { await clearObservation(); return; }
+  const session = applicationSession;
+  if (!session || !await permitted() || !await enabled()) { await clearObservation(); return; }
   await save(s);
   try {
     await native({ action: 'event', taskId: s.taskId, token: s.token, event: wire(s) });
@@ -184,7 +213,7 @@ async function publish(s) {
   } catch {
     s.nativeError = '未同步：本地 host 不可用或内部任务分配已失效';
   }
-  if (await permitted() && await enabled()) await save(s);
+  if (applicationSession === session && await permitted() && await enabled()) await save(s);
   else await clearObservation();
 }
 async function stop(s) {
@@ -211,10 +240,11 @@ async function suspend(s) {
   await publish(pause(s, Date.now()));
 }
 async function inject(s) {
-  if (!s?.url || !s.documentId || s.pending || s.paused || !await enabled() || !await permitted()) return;
+  if (!s?.url || !s.documentId || s.pending || s.paused || !await enabled() || !await permitted() || !await runtimeAvailable()) return;
   try {
     await chrome.scripting.executeScript({ target: { tabId: s.tabId,
       documentIds: [s.documentId] }, files: ['content.js'], injectImmediately: true });
+    if (!await runtimeAvailable()) return;
     await chrome.scripting.executeScript({ target: { tabId: s.tabId,
       documentIds: [s.documentId] }, func: config => globalThis.__cuaObserver?.(config),
       args: [{ navigationEpoch: s.navigationEpoch, bindingId: s.bindingId,
@@ -281,17 +311,41 @@ async function acceptAssignment(a) {
 }
 function schedule() {
   clearTimeout(timer);
-  timer = setTimeout(() => { serial(sync); }, 5000);
+  timer = setTimeout(() => { serial(sync); }, 1000);
 }
 async function finishCreatedTarget(request, result) {
   const { lastCreatedTarget, managedTabs = [] } = await chrome.storage.session.get(['lastCreatedTarget', 'managedTabs']);
-  if (!request.url || lastCreatedTarget?.navigationIssued) return;
-  await chrome.storage.session.set({ managedTabs: [...new Set([...managedTabs, result.tabId])], managedTaskId: request.taskId });
-  await background.protectCreatedTab(result.tabId, result.browserWindowId, request.taskId);
-  if (!await enabled() || !await permitted()) throw new Error('授权已撤销，新窗口保持空白');
-  // An unknown navigation result must never be replayed after worker restart.
-  await chrome.storage.session.set({ lastCreatedTarget: { ...lastCreatedTarget, navigationIssued: true } });
-  await chrome.tabs.update(result.tabId, { url: request.url });
+  if (result.navigationState) return result;
+  const complete = async (navigationState, error) => {
+    const report = { ...result, navigationState };
+    if (error) report.navigationError = String(error.message || error).slice(0, 200);
+    const latest = (await chrome.storage.session.get('lastCreatedTarget')).lastCreatedTarget;
+    await chrome.storage.session.set({ lastCreatedTarget: { ...latest, result: report } });
+    return report;
+  };
+  if (!request.url) return complete('not_requested');
+  if (lastCreatedTarget?.navigationIssued) return complete('unknown', '导航已下发但结果未知，未重放');
+  const session = applicationSession;
+  const check = async () => {
+    if (!session || applicationSession !== session || !await enabled() || !await permitted() ||
+        !await runtimeAvailable() || applicationSession !== session) throw new Error('应用已退出或授权已撤销，新窗口保持空白');
+  };
+  let issued = false;
+  try {
+    await chrome.storage.session.set({ managedTabs: [...new Set([...managedTabs, result.tabId])], managedTaskId: request.taskId });
+    await check();
+    await background.protectCreatedTab(result.tabId, result.browserWindowId, request.taskId, check);
+    await check();
+    // Persist before dispatch: an unknown navigation result must never be replayed.
+    await chrome.storage.session.set({ lastCreatedTarget: { ...lastCreatedTarget, navigationIssued: true } });
+    issued = true;
+    await check();
+    await chrome.tabs.update(result.tabId, { url: request.url });
+    return await complete('issued');
+  } catch (error) {
+    await background.release(result.tabId, request.taskId);
+    return complete(issued ? 'unknown' : 'failed', error);
+  }
 }
 async function createWindow(request) {
   if (!request || typeof request.requestId !== 'string' || !request.requestId ||
@@ -300,8 +354,7 @@ async function createWindow(request) {
   lastCreateRequestId = request.requestId;
   if (lastCreatedTarget?.requestId === request.requestId) {
     if (lastCreatedTarget.result) {
-      createdReport = lastCreatedTarget.result;
-      await finishCreatedTarget(request, lastCreatedTarget.result);
+      createdReport = await finishCreatedTarget(request, lastCreatedTarget.result);
       return true;
     }
     throw new Error('窗口创建已下发但结果未知，未重复建窗');
@@ -311,6 +364,7 @@ async function createWindow(request) {
     requestId: request.requestId, at: Date.now()
   } });
   const options = { focused: false, url: 'about:blank' };
+  if (!await enabled() || !await permitted() || !await runtimeAvailable()) throw new Error('应用已退出或授权已撤销，未创建窗口');
   const win = await chrome.windows.create(options);
   const tab = win && Array.isArray(win.tabs) ? win.tabs[0] : null;
   if (!win || !Number.isInteger(win.id) || !tab || !Number.isInteger(tab.id)) {
@@ -322,8 +376,7 @@ async function createWindow(request) {
   } });
   // Record the created identity before any further await. Failures must never
   // create another window. Only navigate after early popup protection is ready.
-  createdReport = result;
-  await finishCreatedTarget(request, result);
+  createdReport = await finishCreatedTarget(request, result);
   return true;
 }
 async function sync() {
@@ -339,7 +392,7 @@ async function sync() {
       return { permission, on, revision: enableRevision };
     });
     keepAlive(on && permission);
-    const payload = { action: 'sync', enabled: on, permission, clientVersion: '0.3.0', capabilities: ['cdp_input', 'document_binding', 'background_popups'] };
+    const payload = { action: 'sync', enabled: on, permission, applicationSession, clientVersion: '0.3.4', capabilities: ['cdp_input', 'document_binding', 'background_popups'] };
     if (panelBridge) {
       // A command screenshot and a review image can each be large; send them on separate turns.
       if (!commandReport?.result?.data) payload.panelState = await panelSnapshot();
@@ -356,6 +409,12 @@ async function sync() {
     if (payload.panelResult) panelReport = null;
     if (revision !== enableRevision) return;
     if (r.protocolVersion !== 2 || !Number.isFinite(r.heartbeatAt)) throw new Error('host 协议不兼容');
+    if (typeof r.applicationSession !== 'string' || !r.applicationSession) throw new Error('请更新 Workbuddy CUA 本地应用');
+    if (r.sessionReset || (applicationSession && applicationSession !== r.applicationSession)) {
+      createdReport = commandReport = panelReport = null;
+      await clearObservation();
+    }
+    applicationSession = r.applicationSession;
     connection = { ...connection, status: 'connected', lastHeartbeatAt: r.heartbeatAt * 1000 };
     delete connection.lastError;
     if (r.requestCandidates && on && permission) {
@@ -364,7 +423,7 @@ async function sync() {
       const candidates = tabs.map(t => ({ tabId: t.id, browserWindowId: t.windowId, url: safeUrl(t.url) }))
         .filter(t => t.url && Number.isInteger(t.tabId) && Number.isInteger(t.browserWindowId)).slice(0, 1000);
       if (!await permitted() || !await enabled()) { await clearObservation(); return; }
-      r = await native({ action: 'sync', enabled: on, permission, candidates });
+      r = await native({ action: 'sync', enabled: on, permission, applicationSession, candidates });
     }
     if (revision !== enableRevision) return;
     assignmentStatus = r.taskAssignment;
@@ -390,7 +449,9 @@ async function sync() {
       serial(sync);
     }
   } catch (error) {
-    connection = { ...connection, status: 'host_unavailable',
+    applicationSession = null;
+    keepAlive(false);
+    connection = { ...connection, status: error?.code === 'APP_NOT_RUNNING' ? 'application_stopped' : 'host_unavailable',
       lastError: String(error?.message || '本地连接失败').slice(0, 500) };
     assignmentStatus = 'no_assignment';
     await clearObservation();
@@ -418,6 +479,7 @@ async function runPanelCommand(command) {
   await chrome.storage.session.set({ lastPanelCommand: { requestId: command.requestId, at: Date.now() } });
   try {
     await control(async () => {
+      if (!await runtimeAvailable()) throw new Error('Workbuddy CUA 已退出，请先打开应用');
       const current = await panelSnapshot();
       if (current.taskSummary?.taskId !== command.taskId || command.expiresAt * 1000 <= Date.now()) throw new Error('任务已变化或请求已过期');
       if (command.assignmentVersion != null && (current.taskSummary.assignmentVersion !== command.assignmentVersion ||

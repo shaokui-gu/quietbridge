@@ -42,6 +42,12 @@ DERIVED_ORIGIN = 'chrome-extension://' + DERIVED_ID + '/'
 
 class BrowserEventsTests(unittest.TestCase):
     def setUp(self):
+        session = mock.patch.object(events, 'application_session', return_value='test-app-session')
+        session.start()
+        self.addCleanup(session.stop)
+        controls = mock.patch.object(server, 'control_snapshot', return_value={'master': True, 'browser': True})
+        controls.start()
+        self.addCleanup(controls.stop)
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.base = Path(self.temp.name).resolve()
@@ -103,6 +109,29 @@ class BrowserEventsTests(unittest.TestCase):
         self.request({'action': 'unbind', 'taskId': 'task', 'token': token})
         self.assertFalse(events.status('task', **self.paths)['paired'])
 
+    def test_application_exit_rejects_browser_control_and_old_session_cannot_resume(self):
+        token = self.assign()
+        event = self.event()
+        before = self.store.read_bytes()
+        with mock.patch.object(events, 'application_session', return_value=None):
+            self.assertEqual(self.request({'action': 'ping'})['code'], 'APP_NOT_RUNNING')
+            self.assertEqual(self.request({'action': 'sync', 'enabled': True, 'permission': True})['code'], 'APP_NOT_RUNNING')
+            with self.assertRaises(ValueError):
+                events.internal_action({'action': 'command', 'taskId': 'task', 'operation': 'snapshot'}, **self.paths)
+        self.assertEqual(self.store.read_bytes(), before)
+        with mock.patch.object(events, 'application_session', return_value='new-app-session'):
+            self.assertFalse(events.status('task', **self.paths)['paired'])
+            with self.assertRaisesRegex(ValueError, 'APP_SESSION_EXPIRED'):
+                self.request({'action': 'event', 'taskId': 'task', 'token': token, 'event': event})
+            reply = self.sync(applicationSession='test-app-session',
+                              created={'requestId': 'f' * 32, 'tabId': 7, 'browserWindowId': 2},
+                              commandResult={'requestId': 'f' * 32, 'status': 'error', 'error': 'late result'})
+            self.assertTrue(reply['sessionReset'])
+            self.assertIsNone(reply.get('assignment'))
+            data = events.read_file(self.store)
+            self.assertEqual(data['peer']['applicationSession'], 'new-app-session')
+            self.assertEqual(data['tasks'], {})
+
     def test_create_target_works_before_binding(self):
         # 建窗必须发生在绑定之前，因此不能用 sessionId 作为前置条件。
         self.await_window()
@@ -151,6 +180,45 @@ class BrowserEventsTests(unittest.TestCase):
         self.assertEqual(result['targetEvidence']['mode'], 'created')
         self.assertEqual(result['targetEvidence']['createdRequestId'], request['requestId'])
         self.assertEqual(self.sync()['assignment']['targetEvidence']['mode'], 'created')
+
+    def test_created_navigation_outcome_is_visible_and_does_not_authorize_blank_assignment(self):
+        for navigation in ('issued', 'failed', 'unknown', 'not_requested'):
+            with self.subTest(navigation=navigation):
+                self.await_window()
+                self.sync(enabled=False)
+                self.sync()
+                request = events.internal_action({'action': 'create_target', 'taskId': 'task',
+                                                  'url': 'https://example.org/'}, **self.paths)
+                created = {'requestId': request['requestId'], 'browserWindowId': 2, 'tabId': 7,
+                           'navigationState': navigation}
+                if navigation in ('failed', 'unknown'):
+                    created['navigationError'] = 'test navigation error'
+                self.sync(created=created)
+                result = events.internal_action({'action': 'create_target', 'taskId': 'task'}, **self.paths)
+                self.assertEqual(result['navigationState'], navigation)
+                self.assertFalse(result['requested'])
+                self.assertEqual(result.get('navigationError'), created.get('navigationError'))
+                self.assertEqual(result['nextAction'], 'candidates_then_assign' if navigation == 'issued' else 'inspect_created_tab')
+                self.bind_native_window()
+                status = events.status('task', **self.paths)
+                self.assertEqual(status['createdTarget']['navigationState'], navigation)
+                self.assertEqual(status['createdTarget'].get('navigationError'), created.get('navigationError'))
+                events.internal_action({'action': 'candidates'}, **self.paths)
+                self.sync(candidates=[])
+                with self.assertRaisesRegex(ValueError, '缺少扩展目标证据'):
+                    events.internal_action({'action': 'assign', 'taskId': 'task', 'tabId': 7,
+                                            'browserWindowId': 2}, **self.paths)
+
+    def test_created_navigation_report_rejects_invalid_fields(self):
+        self.await_window()
+        self.sync()
+        request = events.internal_action({'action': 'create_target', 'taskId': 'task'}, **self.paths)
+        created = {'requestId': request['requestId'], 'browserWindowId': 2, 'tabId': 7}
+        for extra in ({'navigationState': 'loaded'}, {'navigationError': 'missing state'},
+                      {'navigationState': 'issued', 'navigationError': 'invalid success'},
+                      {'navigationState': 'failed', 'navigationError': 'x' * 201}):
+            with self.subTest(extra=extra), self.assertRaises(ValueError):
+                self.sync(created=created | extra)
 
     def test_selected_window_is_not_reported_as_created(self):
         self.prepare_assignment()
@@ -315,10 +383,35 @@ class BrowserEventsTests(unittest.TestCase):
         self.assertTrue(reply['result']['performed'])
         self.assertFalse(reply['result']['verified'])
 
+    def test_scroll_requires_named_direction_and_normalizes_before_extension(self):
+        for args, expected in (({'direction': 'down'}, -6), ({'direction': 'up', 'lines': 3}, 3),
+                               ({'direction': 'down', 'lines': 10}, -10)):
+            with self.subTest(args=args):
+                params = events.command_params({'snapshotId': 'snap', **args}, 'scroll')
+                self.assertEqual(params, {'snapshotId': 'snap', 'deltaY': expected})
+        for args in ({}, {'lines': 6}, {'deltaY': -6}, {'deltaY': 6}, {'direction': 'left'},
+                     {'direction': 'down', 'deltaY': -6}, {'direction': 'down', 'lines': 0},
+                     {'direction': 'down', 'lines': True}, {'direction': 'down', 'lines': 11}):
+            with self.subTest(args=args), self.assertRaises(ValueError):
+                events.command_params({'snapshotId': 'snap', **args}, 'scroll')
+
+        schema = events.make_tool(lambda: self.tasks)['inputSchema']
+        self.assertNotIn('deltaY', schema['properties'])
+        scroll_shapes = [shape for shape in schema['oneOf'] if shape['properties'].get('operation') == {'const': 'scroll'}]
+        self.assertEqual(len(scroll_shapes), 1)
+        self.assertIn('direction', scroll_shapes[0]['required'])
+
+    def test_scroll_named_direction_reaches_extension_as_downward_delta(self):
+        self.prepare_command()
+        events.internal_action({'action': 'command', 'taskId': 'task', 'operation': 'scroll',
+                                'snapshotId': 'snap-1', 'direction': 'down', 'lines': 6}, **self.paths)
+        self.assertEqual(self.sync()['command']['params'], {'snapshotId': 'snap-1', 'deltaY': -6})
+
     def test_malformed_action_result_is_rejected(self):
         self.prepare_command()
         queued = events.internal_action({'action': 'command', 'taskId': 'task',
-                                         'operation': 'scroll', 'snapshotId': 'snap-1', 'deltaY': -3}, **self.paths)
+                                         'operation': 'scroll', 'snapshotId': 'snap-1',
+                                         'direction': 'down', 'lines': 3}, **self.paths)
         with self.assertRaises(ValueError):
             self.sync(commandResult={'requestId': queued['commandId'], 'status': 'ok',
                                      'result': {'performed': True, 'verified': True,
@@ -800,6 +893,9 @@ class BrowserEventsTests(unittest.TestCase):
         (config / 'task-windows.json').write_text(json.dumps(
             {'version': 1, 'tasks': {}, 'activeTaskId': None}))
         shutil.copy2(Path(events.__file__), bridge / 'browser_events.py')
+        # Subprocess fixtures must not depend on the real installed application.
+        with (bridge / 'browser_events.py').open('a') as stream:
+            stream.write('\n\ndef application_session(runtime=None):\n    return None\n')
         for name in ('native_host.py', 'install_native_host.py', 'manifest.json'):
             shutil.copy2(EXT / name, ext / name)
         (ext / 'native-host-config.json').write_text(json.dumps({'allowed_origins': [ORIGIN]}))
@@ -825,11 +921,10 @@ class BrowserEventsTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         replies = io.BytesIO(result.stdout)
         reply = host.read_message(replies)
-        self.assertTrue(reply['ok'], reply)
-        self.assertEqual(reply['protocolVersion'], 2)
-        self.assertEqual(reply['taskAssignment'], 'no_assignment')
+        self.assertFalse(reply['ok'], reply)
+        self.assertEqual(reply['code'], 'APP_NOT_RUNNING')
         self.assertEqual(replies.read(), b'')
-        self.assertTrue((moved / 'cua-helper-config' / 'browser-events.json').exists())
+        self.assertFalse((moved / 'cua-helper-config' / 'browser-events.json').exists())
         self.assertEqual(list(moved.rglob('__pycache__')), [])
 
     def test_installer_plans_runtime_dir_outside_documents(self):
@@ -1075,7 +1170,7 @@ class BrowserEventsTests(unittest.TestCase):
                 mock.patch.object(server, 'call_helper', return_value={}) as helper, \
                 mock.patch.object(events, 'internal_action', wraps=events.internal_action) as dispatch:
             # 隔离 event store，但经过实际注册工具和 server 原生任务核验回调。
-            dispatch.side_effect = lambda a, task_file: original(a, task_file, self.store)
+            dispatch.side_effect = lambda a, task_file, **options: original(a, task_file, self.store, **options)
             response = server.call_tool('cua_browser_events', args)
             self.assertFalse(response.get('isError'), response)
             self.assertTrue(json.loads(response['content'][0]['text'])['assigned'])
@@ -1104,6 +1199,86 @@ class BrowserEventsTests(unittest.TestCase):
         data['activeTaskId'] = 'other'
         self.tasks.write_text(json.dumps(data))
         self.assertIsNone(self.sync()['assignment'])
+
+    def stale_assignment_candidate(self):
+        self.prepare_assignment()
+        with events.event_store(self.store) as data:
+            data['tasks'] = {}
+            data['peer']['candidatesAt'] -= 35
+        return {'action': 'assign', 'taskId': 'task', 'tabId': 7, 'browserWindowId': 2}
+
+    def test_assign_refreshes_expired_evidence_without_requiring_another_model_turn(self):
+        args = self.stale_assignment_candidate()
+        candidate = {'tabId': 7, 'browserWindowId': 2, 'url': 'https://example.org/path'}
+        def extension_sync(_):
+            self.assertTrue(events.read_file(self.store)['peer']['requestCandidates'])
+            self.sync(candidates=[candidate])
+        with mock.patch.object(events.time, 'sleep', side_effect=extension_sync) as wait, \
+                mock.patch.object(events.time, 'monotonic', return_value=0):
+            result = events.internal_action(args, **self.paths)
+        self.assertTrue(result['assigned'])
+        self.assertTrue(result['candidateRefreshed'])
+        self.assertLess(result['candidateAgeMs'], 1000)
+        wait.assert_called_once()
+
+    def test_assign_does_not_wait_when_candidate_evidence_is_fresh(self):
+        self.prepare_assignment()
+        with mock.patch.object(events.time, 'sleep') as wait:
+            result = events.internal_action({'action': 'assign', 'taskId': 'task',
+                                            'tabId': 7, 'browserWindowId': 2}, **self.paths)
+        self.assertTrue(result['assigned'])
+        self.assertFalse(result['candidateRefreshed'])
+        wait.assert_not_called()
+
+    def test_candidate_refresh_rejects_closed_moved_or_navigated_target(self):
+        for candidates in ([], [{'tabId': 7, 'browserWindowId': 3, 'url': 'https://example.org/path'}],
+                           [{'tabId': 7, 'browserWindowId': 2, 'url': 'https://other.example/path'}]):
+            with self.subTest(candidates=candidates):
+                args = self.stale_assignment_candidate()
+                with mock.patch.object(events.time, 'sleep', side_effect=lambda _: self.sync(candidates=candidates)), \
+                        mock.patch.object(events.time, 'monotonic', return_value=0), self.assertRaises(ValueError):
+                    events.internal_action(args, **self.paths)
+                self.assertEqual(events.read_file(self.store)['tasks'], {})
+
+    def test_candidate_refresh_times_out_without_assigning_or_replaying_actions(self):
+        args = self.stale_assignment_candidate()
+        with mock.patch.object(events.time, 'monotonic', side_effect=[0, 4]), \
+                mock.patch.object(events.time, 'sleep') as wait, \
+                self.assertRaisesRegex(ValueError, 'CANDIDATE_REFRESH_TIMEOUT'):
+            events.internal_action(args, **self.paths)
+        wait.assert_not_called()
+        self.assertEqual(events.read_file(self.store)['tasks'], {})
+
+    def test_candidate_refresh_rechecks_permission_and_native_binding(self):
+        candidate = {'tabId': 7, 'browserWindowId': 2, 'url': 'https://example.org/path'}
+        for change in ('permission', 'target', 'session'):
+            with self.subTest(change=change):
+                args = self.stale_assignment_candidate()
+                def changed(_):
+                    self.sync(candidates=[candidate])
+                    if change == 'target':
+                        data = events.read_file(self.tasks)
+                        data['tasks']['task']['windowId'] = 901
+                        self.tasks.write_text(json.dumps(data))
+                    else:
+                        with events.event_store(self.store) as data:
+                            data['peer'].update({'permission': False} if change == 'permission' else
+                                                {'applicationSession': 'another-session'})
+                with mock.patch.object(events.time, 'sleep', side_effect=changed), \
+                        mock.patch.object(events.time, 'monotonic', return_value=0), self.assertRaises(ValueError):
+                    events.internal_action(args, **self.paths)
+                self.assertEqual(events.read_file(self.store)['tasks'], {})
+
+    def test_native_revalidation_failure_after_candidate_refresh_prevents_assignment(self):
+        args = self.stale_assignment_candidate()
+        candidate = {'tabId': 7, 'browserWindowId': 2, 'url': 'https://example.org/path'}
+        validate = mock.Mock(side_effect=ValueError('native target no longer valid'))
+        with mock.patch.object(events.time, 'sleep', side_effect=lambda _: self.sync(candidates=[candidate])), \
+                mock.patch.object(events.time, 'monotonic', return_value=0), \
+                self.assertRaisesRegex(ValueError, 'native target no longer valid'):
+            events.internal_action(args, revalidate=validate, **self.paths)
+        validate.assert_called_once_with('task')
+        self.assertEqual(events.read_file(self.store)['tasks'], {})
 
     def test_default_no_task_and_native_multi_frame_truncation(self):
         self.tasks.unlink()
@@ -1216,8 +1391,8 @@ class BrowserEventsTests(unittest.TestCase):
                               env={'HOME': str(self.base), 'PATH': '/usr/bin:/bin'})
         self.assertEqual(live.returncode, 0, live.stderr)
         reply = host.read_message(io.BytesIO(live.stdout))
-        self.assertTrue(reply['ok'], reply)
-        self.assertEqual(reply['taskAssignment'], 'no_assignment')
+        self.assertFalse(reply['ok'], reply)
+        self.assertEqual(reply['code'], 'APP_NOT_RUNNING')
         # 重复部署幂等。
         again = json.loads(run().stdout)
         self.assertEqual(again['mode'], '已更新')

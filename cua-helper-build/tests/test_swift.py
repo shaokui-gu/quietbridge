@@ -1,6 +1,8 @@
 """Run Swift Testing with the selected Apple toolchain's runtime search paths."""
 import subprocess
 import sys
+import os
+import tempfile
 from pathlib import Path
 
 
@@ -20,7 +22,8 @@ def main():
         if (runtime / "lib_TestingInterop.dylib").is_file():
             command += ["-Xlinker", "-rpath", "-Xlinker", str(runtime)]
     command += sys.argv[1:]
-    raise SystemExit(subprocess.call(command))
+    with tempfile.TemporaryDirectory(prefix='cua-swift-diagnostics-', dir='/private/tmp') as diagnostics:
+        raise SystemExit(subprocess.call(command, env=dict(os.environ, CUA_DIAGNOSTICS_DIR=diagnostics)))
 
 
 if __name__ == "__main__":

@@ -7,22 +7,55 @@ struct InstalledApplication: Sendable, Equatable {
     let executablePath: String
     let name: String
     let bundleID: String?
+    var localizedNames: [String] = []
 
-    static func read(_ url: URL) -> InstalledApplication? {
+    static func read(_ url: URL, preferredLanguages: [String] = Locale.preferredLanguages) -> InstalledApplication? {
         let url = url.resolvingSymlinksInPath()
         guard url.pathExtension.lowercased() == "app",
               let info = CFBundleCopyInfoDictionaryInDirectory(url as CFURL) as? [String: Any],
               let executableName = info["CFBundleExecutable"] as? String, !executableName.isEmpty,
               let bundle = CFBundleCreate(nil, url as CFURL),
               let executable = CFBundleCopyAuxiliaryExecutableURL(bundle, executableName as CFString) else { return nil }
-        let name = info["CFBundleDisplayName"] as? String
+        let baseName = info["CFBundleDisplayName"] as? String
             ?? info["CFBundleName"] as? String
             ?? url.deletingPathExtension().lastPathComponent
+        let localized = localizedInfo(url, developmentRegion: info["CFBundleDevelopmentRegion"] as? String ?? "en",
+                                      preferredLanguages: preferredLanguages)
+        let name = localized["CFBundleDisplayName"] as? String ?? localized["CFBundleName"] as? String ?? baseName
         return InstalledApplication(path: url.path, executablePath: (executable as URL).resolvingSymlinksInPath().path,
-                                    name: name, bundleID: info["CFBundleIdentifier"] as? String)
+                                    name: name, bundleID: info["CFBundleIdentifier"] as? String,
+                                    localizedNames: [baseName, info["CFBundleName"] as? String].compactMap { $0 })
+    }
+    private static func localizedInfo(_ url: URL, developmentRegion: String, preferredLanguages: [String]) -> [String: Any] {
+        func plist(_ file: URL) -> [String: Any]? {
+            guard let size = try? file.resourceValues(forKeys: [.fileSizeKey]).fileSize, size <= 1024 * 1024,
+                  let data = try? Data(contentsOf: file),
+                  let value = try? PropertyListSerialization.propertyList(from: data, options: [], format: nil)
+                    as? [String: Any] else { return nil }
+            return value
+        }
+        let resources = url.appendingPathComponent("Contents/Resources")
+        // Recent system apps ship InfoPlist.loctable. Foundation can return an
+        // empty localizedInfoDictionary for these bundles in a helper process.
+        if let table = plist(resources.appendingPathComponent("InfoPlist.loctable")) {
+            let languages = Array(Set(table.keys.filter { $0 != "LocProvenance" && table[$0] is [String: Any] } + [developmentRegion]))
+            for language in Bundle.preferredLocalizations(from: languages.sorted(), forPreferences: preferredLanguages) {
+                if let names = table[language] as? [String: Any] { return names }
+                if language == developmentRegion { return [:] }
+            }
+        }
+        let directories = (try? FileManager.default.contentsOfDirectory(at: resources, includingPropertiesForKeys: nil,
+                                                                       options: .skipsHiddenFiles)) ?? []
+        let languages = Array(Set(directories.filter { $0.pathExtension == "lproj" }
+            .map { $0.deletingPathExtension().lastPathComponent } + [developmentRegion]))
+        for language in Bundle.preferredLocalizations(from: languages, forPreferences: preferredLanguages) {
+            if let names = plist(resources.appendingPathComponent(language + ".lproj/InfoPlist.strings")) { return names }
+            if language == developmentRegion { return [:] }
+        }
+        return Bundle(url: url)?.localizedInfoDictionary ?? [:]
     }
     func matches(_ query: String, exact: Bool) -> Bool {
-        let values = [name, URL(fileURLWithPath: path).deletingPathExtension().lastPathComponent, bundleID ?? "", path]
+        let values = [name, URL(fileURLWithPath: path).deletingPathExtension().lastPathComponent, bundleID ?? "", path] + localizedNames
         return values.contains { exact ? $0.caseInsensitiveCompare(query) == .orderedSame : $0.localizedCaseInsensitiveContains(query) }
     }
     func json(catalog: ApplicationCatalogSnapshot) -> JSONValue {

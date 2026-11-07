@@ -6,7 +6,7 @@ import Darwin
 
 struct OperationTrace: Sendable {
     @TaskLocal static var current: OperationTrace?
-    static let methods: Set<String> = ["click", "hover", "scroll", "drag", "getState", "screenshot", "visualState", "listWindows", "preview"]
+    static let methods: Set<String> = ["click", "hover", "scroll", "drag", "getState", "screenshot", "visualState", "listWindows", "windowIdentity", "browserSession", "preview"]
     private static let log = OperationLog()
     let requestID: String
     let method: String

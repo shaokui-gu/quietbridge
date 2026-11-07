@@ -12,6 +12,9 @@ import server
 
 class OperationLogTests(unittest.TestCase):
     def setUp(self):
+        controls = mock.patch.object(server, "control_snapshot", return_value={"master": True})
+        controls.start()
+        self.addCleanup(controls.stop)
         self.directory = tempfile.TemporaryDirectory()
         self.addCleanup(self.directory.cleanup)
         self.root = Path(self.directory.name)
@@ -42,6 +45,11 @@ class OperationLogTests(unittest.TestCase):
         for value in (None, [], "invalid", 1):
             self.assertEqual(server.diagnostic_fields(value), {})
         self.assertEqual(server.diagnostic_fields({"x": float("nan"), "y": float("inf"), "windowId": True}), {})
+
+    def test_scroll_request_logs_explicit_direction_and_legacy_delta_without_text(self):
+        self.assertEqual(server.diagnostic_fields({'direction': 'down', 'lines': 6, 'value': 'private'}),
+                         {'direction': 'down', 'lines': 6})
+        self.assertEqual(server.diagnostic_fields({'direction': 'private', 'deltaY': -6}), {'deltaY': -6})
 
     def test_preview_host_and_capture_targets_are_logged_separately_without_ui_contents(self):
         preview = {"trackingWindowId": 7, "hostWindowId": 10, "hostPid": 42,

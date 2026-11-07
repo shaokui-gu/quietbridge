@@ -93,10 +93,14 @@ enum SharedHelperProxy {
         private let channel: SharedSocket
         private let limit: Int
         private var buffer = Data()
+        private let parentPID = getppid()
         init(channel: SharedSocket, limit: Int) { self.channel = channel; self.limit = limit }
         func next(timeout: Double) throws -> Data? {
             let started = DispatchTime.now().uptimeNanoseconds
             while true {
+                guard getppid() == parentPID else {
+                    throw NativeFailure(code: "NATIVE_CANCELLED", message: "Bridge process exited; closing its native connection")
+                }
                 if let newline = buffer.firstIndex(of: 10) {
                     let frame = Data(buffer[..<newline])
                     buffer.removeSubrange(...newline)
@@ -106,8 +110,9 @@ enum SharedHelperProxy {
                 let remaining = timeout - Double(DispatchTime.now().uptimeNanoseconds - started) / 1_000_000_000
                 guard remaining > 0 else { throw NativeFailure(code: "NATIVE_TIMEOUT", message: "Shared helper response timed out") }
                 var item = pollfd(fd: channel.descriptor, events: Int16(POLLIN), revents: 0)
-                let ready = poll(&item, 1, Int32(min(remaining * 1000, Double(Int32.max)).rounded(.up)))
+                let ready = poll(&item, 1, Int32(min(remaining * 1000, 200).rounded(.up)))
                 if ready < 0 && errno == EINTR { continue }
+                if ready == 0 { continue }
                 guard ready > 0 else { throw NativeFailure(code: "NATIVE_TIMEOUT", message: "Shared helper response timed out") }
                 guard buffer.count <= limit else { throw NativeFailure(code: "NATIVE_RESPONSE_LIMIT", message: "Shared helper reply exceeded its byte limit") }
                 var bytes = [UInt8](repeating: 0, count: min(65536, limit + 1 - buffer.count))

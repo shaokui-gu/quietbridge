@@ -7,8 +7,11 @@ final class CancellationLatch: @unchecked Sendable {
     // Blocking AX calls and synchronous input loops also observe connection cancellation.
     private let lock = NSLock()
     private var cancelled = false
+    private let applicationSession: ApplicationSession?
+    init(applicationSession: ApplicationSession? = nil) { self.applicationSession = applicationSession }
     func cancel() { lock.withLock { cancelled = true } }
     func check() throws {
+        try applicationSession?.requireActive()
         if Task.isCancelled || lock.withLock({ cancelled }) { throw NativeFailure(code: "NATIVE_CANCELLED", message: "Helper operation cancelled") }
     }
     var isCancelled: Bool { lock.withLock { cancelled } }

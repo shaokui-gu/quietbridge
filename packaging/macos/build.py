@@ -22,16 +22,9 @@ def run(*args):
     subprocess.run(list(map(str, args)), check=True)
 
 
-def build_app_icon(work, resources):
-    source = Path(__file__).with_name("assets") / "AppIcon.png"
-    iconset = work / "AppIcon.iconset"
-    iconset.mkdir()
-    for size in (16, 32, 128, 256, 512):
-        for scale in (1, 2):
-            suffix = "@2x" if scale == 2 else ""
-            target = iconset / f"icon_{size}x{size}{suffix}.png"
-            run("/usr/bin/sips", "-z", size * scale, size * scale, source, "--out", target)
-    run("/usr/bin/iconutil", "-c", "icns", iconset, "-o", resources / "AppIcon.icns")
+def build_app_icon(resources):
+    source = Path(__file__).with_name("assets") / "AppIcon.icns"
+    shutil.copy2(source, resources / "AppIcon.icns")
 
 
 def write_distribution(destination, version):
@@ -137,7 +130,7 @@ def main():
     (contents / "Info.plist").write_bytes(plistlib.dumps(info))
     resources = contents / "Resources"
     resources.mkdir()
-    build_app_icon(work, resources)
+    build_app_icon(resources)
     localized = resources / "en.lproj"
     localized.mkdir()
     (localized / "InfoPlist.strings").write_bytes(plistlib.dumps({
@@ -145,7 +138,7 @@ def main():
     }))
     bridge = resources / "bridge"
     bridge.mkdir()
-    for name in ("server.py", "browser_events.py"):
+    for name in ("server.py", "browser_events.py", "recovery.py", "connector.py", "task_lifecycle.py", "stdio_transport.py"):
         shutil.copy2(ROOT / "cua-mcp-bridge" / name, bridge / name)
     support = payload / "Library/Application Support/workbuddy-cua"
     support.mkdir(parents=True)

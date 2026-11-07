@@ -28,7 +28,9 @@ from pathlib import Path
 from contextlib import contextmanager
 from urllib.parse import urlsplit
 import ipaddress
-from browser_events import config_dir, make_tool as make_browser_events_tool
+from browser_events import application_session, config_dir, make_tool as make_browser_events_tool
+from recovery import GUIDANCE as RECOVERY_GUIDANCE, policy as recovery_policy
+from task_lifecycle import TaskOwner, lease_live
 
 WAIT_DEADLINE = None
 
@@ -42,6 +44,10 @@ POWER_GUARD_SECONDS = 3600
 POWER_GUARD_RENEW_AFTER = 300
 POWER_GUARD = {"active": False, "nextRenewAt": 0.0}
 TOOL_LOCK = threading.RLock()
+TASK_OWNER = TaskOwner()
+REQUEST_CANCELLED = threading.Event()
+TASK_WATCH_STOP = threading.Event()
+TASK_WATCH_THREAD = None
 
 DEFAULT_HELPER = (
     "/Users/gushaokui/Documents/AI/computer-use/cua-helper-build/"
@@ -49,8 +55,18 @@ DEFAULT_HELPER = (
 )
 HELPER_PATH = os.environ.get("CUA_HELPER_PATH", DEFAULT_HELPER)
 SERVER_NAME = "workbuddy-cua"
-SERVER_VERSION = "1.0.0"
+SERVER_VERSION = "1.2.0"
 DEFAULT_PROTOCOL = "2024-11-05"
+
+AGENT_INSTRUCTIONS = """Workbuddy CUA 用于保持用户正常使用电脑的后台界面操作。所有界面操作必须遵守：
+1. 不抢焦点：保持用户的前台应用、键盘窗口、物理鼠标和当前 Space。禁止调用 activate、AXRaise、置前窗口、切换 Space 或全局 HID 输入来促成操作；也禁止先抢焦点再自动恢复。无法在后台完成时报告阻塞并等待，不更换自动化通道绕过。
+2. 先核实权限和真实目标，再创建并绑定 cua_task；普通桌面应用用 interactionMode=desktop，网页用默认 background_browser。始终复用已确认的 appHandle/windowId 或 browserWindowId/tabId，不按前台焦点换目标，不把后台网页任务改为桌面任务。
+3. 使用共享窗口能力：原生界面操作前调用 cua_windows(action=share, appHandle=..., windowId=..., source=window)，确认目标窗口及 streamReady=true。后续观察和输入会自动核验并续租，复用同一捕获流，不要为每次点击重复 unshare/share。共享预览只负责展示，不提供独立桌面或焦点隔离；仍须使用窗口定向输入。
+4. 网页只走 cua_browser_events：先 bind、用真实候选 assign，再 verify_mapping 核验系统窗口与标签的对应关系，随后为该窗口建立共享预览。映射或共享未就绪时报告并等待，不展示未经核验的窗口，不激活浏览器或回落原生键鼠；标签 screenshot 是观察证据，不能代替实时共享窗口。
+5. 原生输入前必须有同一目标的最新快照或图像证据；坐标使用窗口内 point。后台点击走窗口定向事件，AX 点击仅用于已经处于前台键盘焦点的同一窗口。桌面任务拒绝没有窗口级确认的 type_text/paste/key，使用已确认且可写的 AX 元素；网页填写用扩展 fill。
+6. 串行派发并读回核实。dispatched/performed 不代表成功；点击回执中的 focusPreserved=false 或 null 时暂停后续输入并核实原因，不能直接重复点击或自动恢复焦点。FOCUS_STATE_UNKNOWN、FOREGROUND_REQUIRED、共享或窗口投递错误均不得通过激活窗口绕过。超时或执行状态未知时先观察或查询既有命令，不重放副作用。结束时 cua_task(action=end, confirm=true) 释放共享租约。"""
+AGENT_INSTRUCTIONS += "\n7. " + RECOVERY_GUIDANCE
+AGENT_INSTRUCTIONS += "\n8. 任务取消、连接断开或退出时释放本任务的共享、保护和绑定；120 秒没有实际任务操作也会中断，ping、权限/任务状态查询和扩展心跳不续期。长任务持续操作可正常续期；等待用户时先 end。TASK_INTERRUPTED/TASK_CANCELLED 后不得复活旧任务或重放输入，先核实既有结果，用户要求继续时 begin 并显式绑定新任务。TARGET_MISMATCH 只说明目标不一致，不证明旧任务已失效；先查看状态，不自动结束或接管其他任务。"
 
 def shots_directory():
     """Screenshots must land somewhere the signed app bundle never owns."""
@@ -83,18 +99,22 @@ STATE = {
 
 
 def control_snapshot():
-    """Read the resident menu bar once. No process means the current behavior remains."""
+    """Only the live application's current session can enable capabilities."""
+    session = application_session()
+    if session is None:
+        return None
     try:
         with urllib.request.urlopen(CONTROL_URL, timeout=0.15) as response:
             payload = json.loads(response.read(4096).decode())
     except (OSError, ValueError, json.JSONDecodeError):
         return None
-    return payload if isinstance(payload, dict) else None
+    return payload if (isinstance(payload, dict) and isinstance(payload.get('_service'), dict) and
+                       payload['_service'].get('applicationSession') == session) else None
 
 
 def capability_block(name, args, switches):
-    if not isinstance(switches, dict):
-        return None
+    if not isinstance(switches, dict) or type(switches.get('master')) is not bool:
+        return 'application'
     if switches.get("master") is False and name != "cua_permissions":
         return "master"
     key = CAPABILITIES.get(name)
@@ -116,8 +136,8 @@ def log(message):
     sys.stderr.flush()
 
 
-OPERATION_METHODS = {"click", "hover", "scroll", "drag", "getState", "screenshot", "visualState", "listWindows", "preview"}
-OPERATION_TOOLS = {"cua_click", "cua_hover", "cua_scroll", "cua_drag", "cua_state", "cua_screenshot", "cua_visual_state", "cua_wait_ready", "cua_windows", "cua_browser_events"}
+OPERATION_METHODS = {"click", "hover", "scroll", "drag", "getState", "screenshot", "visualState", "listWindows", "windowIdentity", "browserSession", "preview"}
+OPERATION_TOOLS = {"cua_click", "cua_hover", "cua_scroll", "cua_drag", "cua_state", "cua_screenshot", "cua_visual_state", "cua_wait_ready", "cua_windows", "cua_browser_events", "cua_task", "cua_browser_session"}
 OPERATION_TRACE_ID = None
 OPERATION_LOG_LOCK = threading.Lock()
 OPERATION_LOG_MAX_BYTES = 5 * 1024 * 1024
@@ -137,10 +157,13 @@ def diagnostic_fields(params):
         return {}
     numbers = {"windowId", "elementIndex", "x", "y", "fromX", "fromY", "toX", "toY", "clickCount", "holdMs", "deltaLinesX", "deltaLinesY", "durationMs", "steps"}
     identifiers = {"appHandle", "snapshotId", "mouseButton", "action", "source", "taskId", "operation", "commandId", "documentId", "interactionMode"}
-    numbers.update({"browserWindowId", "tabId", "navigationEpoch"})
-    return {key: value[:256] if isinstance(value, str) else value for key, value in (params or {}).items()
+    numbers.update({"browserWindowId", "tabId", "navigationEpoch", "deltaY", "lines"})
+    fields = {key: value[:256] if isinstance(value, str) else value for key, value in (params or {}).items()
             if (key in numbers and diagnostic_number(value)) or
                (key in identifiers and isinstance(value, str))}
+    if params.get('direction') in ('up', 'down'):
+        fields['direction'] = params['direction']
+    return fields
 
 
 def diagnostic_geometry(value, fields):
@@ -336,9 +359,10 @@ class HelperClient(object):
                 log("helper pipe failed (%s); restarting for idempotent %s" % (exc, method))
                 with self.lock:
                     self._stop()
-                time.sleep(0.15)
+                cancellable_wait(0.15)
 
     def _request_once(self, method, params, timeout):
+        check_request_cancelled()
         deadline = time.monotonic() + timeout
         if WAIT_DEADLINE is not None:
             deadline = min(deadline, WAIT_DEADLINE)
@@ -377,6 +401,9 @@ class HelperClient(object):
 
             with self.cv:
                 while rid not in self.responses:
+                    if REQUEST_CANCELLED.is_set():
+                        self._stop()
+                        raise HelperError('TASK_CANCELLED', '宿主取消或断开连接，已停止原生请求；可能已执行的输入不重放')
                     remaining = deadline - time.monotonic()
                     if remaining <= 0:
                         break
@@ -419,6 +446,7 @@ TIMEOUTS = {
     "findApps": 30,
     "getApp": 30,
     "listWindows": 30,
+    "windowIdentity": 15,
     "browserSession": 15,
     "getState": 60,
     "screenshot": 60,
@@ -557,12 +585,16 @@ def ensure_share(app, window, source=None, duration=600):
     record = {"source": source, "scope": preview.get("scope") or
               {"desktop": "display_current_space", "application": "application_current_space", "window": "window"}[source],
               "targetOnCurrentSpace": preview.get("targetOnCurrentSpace")}
-    if source == "application" and preview.get("targetOnCurrentSpace") is False:
-        connection, preview = request_share(app, window, "window", duration)
-        record = {"source": "window", "scope": preview.get("scope") or "window",
+    if source == "application" and preview.get("scope") == "window":
+        # SpacePreview already routes an application on a background/unknown Space
+        # to window capture. Keep the requested mode: another window hold would
+        # tear down that ready stream, then switch it back on the next action.
+        record = {"source": "window", "scope": "window",
                   "requestedSource": "application",
-                  "targetOnCurrentSpace": False,
-                  "reason": "target_on_background_space: 应用流不含后台 Space，改为仅共享目标窗口"}
+                  "targetOnCurrentSpace": preview.get("targetOnCurrentSpace"),
+                  "reason": ("target_on_background_space: 应用流不含后台 Space，复用目标窗口共享"
+                             if preview.get("targetOnCurrentSpace") is False else
+                             "application_window_capture: Space 归属未确认，复用原生端的目标窗口共享")}
     if CALL_RECORDS is not None:
         CALL_RECORDS.append({"method": "share", "target": {"appHandle": app, "windowId": window},
                              "share": record})
@@ -572,6 +604,7 @@ def ensure_share(app, window, source=None, duration=600):
 
 
 def call_helper(method, params=None, **kwargs):
+    check_request_cancelled()
     global INPUT_CONNECTION, SHARE_SELECTION
     timeout = kwargs.pop("timeout", None) or TIMEOUTS.get(method, 45)
     if TASK_DISPATCH is not None:
@@ -688,6 +721,92 @@ def current_connection():
     return (id(HELPER), HELPER.connection_id)
 
 
+def check_request_cancelled():
+    if REQUEST_CANCELLED.is_set():
+        raise HelperError('TASK_CANCELLED', '当前调用已取消，未派发后续操作')
+
+
+def cancellable_wait(seconds):
+    REQUEST_CANCELLED.wait(seconds)
+    check_request_cancelled()
+
+
+def interrupt_task(reason):
+    """Only this bridge's task/socket is revoked; never start a helper to clean up."""
+    global SHARE_SELECTION
+    with TOOL_LOCK:
+        try:
+            if os.path.lexists(TASK_FILE):
+                with task_store() as data:
+                    record = data['tasks'].get(data.get('activeTaskId'))
+                    if record and TASK_OWNER.owns(record) and record['state'] not in ('ended', 'interrupted'):
+                        record.update(state='interrupted', interruptionReason=reason, interruptedAt=time.time())
+                        TASK_BINDINGS.pop(record['taskId'], None)
+                        operation_log('task.interrupted', taskId=record['taskId'], reason=reason)
+        finally:
+            SHARE_SELECTION = None
+            STATE.update(snapshot=None, snapshot_app=None, snapshot_window=None)
+            POWER_GUARD.update(active=False, nextRenewAt=0.0)
+            HELPER._stop()
+
+
+def reap_task_lease():
+    if not os.path.lexists(TASK_FILE):
+        return
+    expired = False
+    with task_store() as data:
+        record = data['tasks'].get(data.get('activeTaskId'))
+        expired = bool(record and record['state'] not in ('ended', 'interrupted') and TASK_OWNER.expired(record))
+    if expired:
+        interrupt_task('idle_timeout')
+
+
+def renew_task_lease(name, args):
+    relevant = name in TASK_TARGET_TOOLS or (name == 'cua_windows' and args.get('action') in ('share', 'unshare')) or (
+        name == 'cua_browser_events' and args.get('action') not in ('status', 'candidates', 'annotations'))
+    if not relevant or not os.path.lexists(TASK_FILE):
+        return
+    renewed = False
+    with task_store() as data:
+        record = data['tasks'].get(data.get('activeTaskId'))
+        if (record and record['state'] not in ('ended', 'interrupted') and TASK_OWNER.owns(record) and
+                args.get('taskId', record['taskId']) == record['taskId']):
+            TASK_OWNER.renew(record)
+            renewed = True
+    # Do not hold the task file lock during native I/O or cleanup.
+    if renewed and name == 'cua_browser_events' and HELPER._alive():
+        try:
+            HELPER.request('preview', {'action': 'renew'}, timeout=3, retry_safe=False)
+        except HelperError:
+            # Preserve the browser receipt: it may already have executed.
+            interrupt_task('native_lease_renewal_failed')
+
+
+def start_task_watch():
+    global TASK_WATCH_THREAD
+    if TASK_WATCH_THREAD is not None and TASK_WATCH_THREAD.is_alive():
+        return
+    def watch():
+        while not TASK_WATCH_STOP.wait(0.5):
+            if TOOL_LOCK.acquire(blocking=False):
+                try:
+                    reap_task_lease()
+                except Exception as exc:
+                    log('task lease watchdog: %s' % type(exc).__name__)
+                finally:
+                    TOOL_LOCK.release()
+    TASK_WATCH_THREAD = threading.Thread(target=watch, daemon=True)
+    TASK_WATCH_THREAD.start()
+
+
+def shutdown(reason='connector_disconnected'):
+    TASK_WATCH_STOP.set()
+    try:
+        interrupt_task(reason)
+    finally:
+        TASK_OWNER.close()
+
+
 def assert_task_connection(binding):
     if current_connection() != binding["connection"] or not HELPER._alive():
         raise HelperError("REQUIRES_REVALIDATION", "requires_revalidation：连接已改变，需显式 bind + confirm=true；不会按 PID 自动重绑")
@@ -695,6 +814,13 @@ def assert_task_connection(binding):
 
 def native_task_check(record, binding):
     assert_task_connection(binding)
+    if record.get("interactionMode") == "desktop":
+        target = call_helper("windowIdentity", {"appHandle": binding["appHandle"], "windowId": record["windowId"]}) or {}
+        assert_task_connection(binding)
+        if (target.get("processIdentity") != record["processIdentity"] or
+                target.get("pid") != record["pid"] or target.get("windowId") != record["windowId"]):
+            return "invalidated"
+        return "bound"
     listing = call_helper("browserSession", {"action": "list"}) or {}
     assert_task_connection(binding)
     session = next((s for s in listing.get("sessions", [])
@@ -717,9 +843,13 @@ def native_task_check(record, binding):
 
 
 def task_status(record):
+    if record.get('lease') and not lease_live(record, Path(TASK_FILE).parent) and record['state'] not in ('ended', 'interrupted'):
+        record.update(state='interrupted', interruptionReason='owner_disconnected_or_expired', interruptedAt=time.time())
+        return dict(record)
+    if record.get('lease') and not TASK_OWNER.owns(record):
+        return dict(record, ownership='another_connector')
     previous_state = record["state"]
-    checked_native_binding = False
-    if record["state"] in ("awaiting_window", "invalidated", "ended"):
+    if record["state"] in ("awaiting_window", "invalidated", "ended", "interrupted"):
         return dict(record)
     binding = TASK_BINDINGS.get(record["taskId"])
     if binding is None or binding["connection"] != current_connection() or not HELPER._alive():
@@ -727,15 +857,14 @@ def task_status(record):
     else:
         try:
             record["state"] = native_task_check(record, binding)
-            checked_native_binding = True
         except HelperError as exc:
-            if exc.code in ("STALE_APP", "WINDOW_UNAVAILABLE", "BROWSER_PROCESS_MISMATCH"):
+            if exc.code in ("STALE_APP", "APP_UNAVAILABLE", "WINDOW_UNAVAILABLE", "BROWSER_PROCESS_MISMATCH"):
                 record["state"] = "invalidated"
             elif exc.code == "REQUIRES_REVALIDATION":
                 record["state"] = "requires_revalidation"
             else:
                 raise
-    if checked_native_binding and record["state"] == "invalidated" and previous_state != "invalidated":
+    if record["state"] == "invalidated" and previous_state != "invalidated" and (not record.get('lease') or TASK_OWNER.owns(record)):
         # A task that can no longer be verified is no longer executing. Never leave
         # the privacy shield covering the user's desktop after its target vanished.
         release_power_guard()
@@ -811,9 +940,14 @@ def tool_task(args):
         raise HelperError("INVALID_ARGUMENT", "taskId 必须是非空字符串")
     with task_store() as data:
         if action == "begin":
-            SHARE_SELECTION = None
             previous = data["tasks"].get(data.get("activeTaskId"))
-            if isinstance(previous, dict) and previous.get("state") == "bound":
+            if isinstance(previous, dict) and previous.get("state") not in ('ended', 'interrupted'):
+                if previous.get('lease') and not TASK_OWNER.owns(previous) and lease_live(previous, Path(TASK_FILE).parent):
+                    raise HelperError('TASK_IN_USE', '活动任务仍由另一个连接持有；不能用 begin 接管')
+                previous.update(state='interrupted', interruptionReason='replaced_by_explicit_begin', interruptedAt=time.time())
+                TASK_BINDINGS.pop(previous['taskId'], None)
+            SHARE_SELECTION = None
+            if isinstance(previous, dict) and previous.get("windowId") is not None and HELPER._alive():
                 try:
                     call_helper("preview", {"action": "release"})
                 except HelperError:
@@ -823,22 +957,30 @@ def tool_task(args):
             record = {"taskId": task_id, "state": "awaiting_window", "mode": None,
                       "newWindowCreated": False,
                       "interactionMode": args.get("interactionMode", "background_browser")}
+            TASK_OWNER.attach(record, Path(TASK_FILE).parent)
             data["tasks"][task_id] = record
             data["activeTaskId"] = task_id
             return json.dumps(record, ensure_ascii=False)
         task_id = args.get("taskId", data["activeTaskId"])
         record = data["tasks"].get(task_id)
         if record is None:
+            if action == 'status' and 'taskId' not in args:
+                return json.dumps({'state': 'idle', 'activeTaskId': None})
             raise HelperError("UNKNOWN_TASK", "任务不存在；先 begin")
         if action == "status":
             return json.dumps(task_status(record), ensure_ascii=False)
         if action == "end":
             # 显式结束是唯一回到「无任务」原生模式的入口：只收尾记录，
             # 不清空历史，也不把已绑定目标转交其它窗口。
+            active = data.get("activeTaskId") == task_id
+            if active and record.get('lease') and not TASK_OWNER.owns(record) and lease_live(record, Path(TASK_FILE).parent):
+                raise HelperError('TASK_IN_USE', '任务属于另一个活动连接，未结束其任务')
             TASK_BINDINGS.pop(task_id, None)
-            if data.get("activeTaskId") == task_id:
+            if active:
                 data["activeTaskId"] = None
             record["state"] = "ended"
+            if not active:
+                return json.dumps(dict(record, cleanup='historical_record_only'), ensure_ascii=False)
             # 共享面板跟随界面操作任务：任务结束就释放租约，不让浮层继续留在屏幕上。
             try:
                 call_helper("preview", {"action": "release"})
@@ -850,6 +992,13 @@ def tool_task(args):
             raise HelperError("INVALID_ARGUMENT", "bind 需要显式 appHandle、有效 windowId、confirm=true")
         if READ_ONLY:
             raise HelperError("READ_ONLY", "CUA_READ_ONLY=1，bind 已禁用")
+        if record['state'] in ('ended', 'interrupted'):
+            raise HelperError('TASK_INTERRUPTED', '任务已结束或中断；先核实目标并 begin 新任务，不能复活旧输入')
+        if record.get('lease') and not TASK_OWNER.owns(record):
+            raise HelperError('TASK_IN_USE' if lease_live(record, Path(TASK_FILE).parent) else 'TASK_INTERRUPTED',
+                              '原任务属于其他连接；不能静默恢复或接管')
+        if data.get('activeTaskId') != task_id:
+            raise HelperError('TASK_INTERRUPTED', '历史任务不能重新成为活动任务；请显式 begin')
         app = resolve_app(args["appHandle"])
         pid = STATE["apps"][app].get("pid")
         if type(pid) is not int or not 1 <= pid <= 2147483647:
@@ -858,29 +1007,37 @@ def tool_task(args):
             raise HelperError("TARGET_MISMATCH", "已记录任务不能改绑其他 PID 或窗口；新任务使用 begin")
         if record["state"] == "invalidated":
             raise HelperError("TASK_INVALIDATED", "任务绑定已失效，不能复用窗口 ID")
-        if ALLOWLIST and not any(a in "com.google.chrome google chrome" for a in ALLOWLIST):
-            raise HelperError("APP_NOT_ALLOWED", "CUA_ALLOWLIST 未包含 Google Chrome")
-        native = call_helper("browserSession", {"action": "attach", "pid": pid,
-                             "windowId": args["windowId"], "confirm": True}) or {}
+        desktop = record.get("interactionMode") == "desktop"
+        if desktop:
+            native = call_helper("windowIdentity", {"appHandle": app, "windowId": args["windowId"]}) or {}
+        else:
+            if ALLOWLIST and not any(a in "com.google.chrome google chrome" for a in ALLOWLIST):
+                raise HelperError("APP_NOT_ALLOWED", "CUA_ALLOWLIST 未包含 Google Chrome")
+            native = call_helper("browserSession", {"action": "attach", "pid": pid,
+                                 "windowId": args["windowId"], "confirm": True}) or {}
         identity = native.get("processIdentity")
-        if (native.get("state") != "attached" or native.get("running") is not True or
-                native.get("pid") != pid or native.get("windowId") != args["windowId"] or
+        if (native.get("pid") != pid or native.get("windowId") != args["windowId"] or
                 not isinstance(identity, dict) or identity.get("pid") != pid or
                 not all(isinstance(identity.get(k), str) and identity[k].isdigit()
-                        for k in ("startedSeconds", "startedMicroseconds")) or
+                        for k in ("startedSeconds", "startedMicroseconds")) or (not desktop and (
+                native.get("state") != "attached" or native.get("running") is not True or
                 not isinstance(native.get("sessionId"), str) or not native["sessionId"] or
-                not any(w.get("windowId") == args["windowId"] for w in native.get("windows", []))):
-            raise HelperError("ATTACH_UNVERIFIED", "原生 attach 未返回完整窗口和进程代际身份；任务未绑定")
+                not any(w.get("windowId") == args["windowId"] for w in native.get("windows", []))))):
+            raise HelperError("ATTACH_UNVERIFIED", "原生服务未返回完整窗口和进程代际身份；任务未绑定")
         if record.get("processIdentity") is not None and record["processIdentity"] != identity:
             record["state"] = "invalidated"
             return json.dumps(record, ensure_ascii=False)
         record.update(state="bound", mode="attached_existing", pid=pid, processIdentity=identity,
-                      windowId=args["windowId"], sessionId=native["sessionId"], newWindowCreated=False)
+                      windowId=args["windowId"], newWindowCreated=False)
+        if not desktop:
+            record["sessionId"] = native["sessionId"]
         TASK_BINDINGS[task_id] = {"appHandle": app, "connection": current_connection()}
+        TASK_OWNER.attach(record, Path(TASK_FILE).parent)
         data["activeTaskId"] = task_id
         STATE.update(app=app, snapshot=None, snapshot_app=None, snapshot_window=None)
         # 绑定成功即进入任务运行期：按住防睡眠断言，锁屏后任务仍能继续。
-        return json.dumps(dict(record, limitation="仅绑定已有窗口，共享 Chrome 数据；未实现新建专用窗口或数据隔离",
+        return json.dumps(dict(record, limitation="仅绑定指定应用的已有窗口，未提供数据隔离" if desktop else
+                               "仅绑定已有窗口，共享 Chrome 数据；未实现新建专用窗口或数据隔离",
                                powerGuard=hold_power_guard() if record.get("interactionMode") == "desktop" else {"active": False}), ensure_ascii=False)
 
 
@@ -901,6 +1058,13 @@ def task_guard(name, args):
         record = data["tasks"].get(data["activeTaskId"])
         if record is None:
             return args, None
+        if record.get('lease') and (record['state'] == 'interrupted' or not lease_live(record, Path(TASK_FILE).parent)):
+            if name in TASK_TARGET_TOOLS or name in ('cua_windows', 'cua_browser_events'):
+                raise HelperError('TASK_INTERRUPTED', '原任务已中断或租约已过期；查看任务状态后显式创建新任务')
+        if record.get('lease') and not TASK_OWNER.owns(record) and (
+                name in TASK_TARGET_TOOLS or name == 'cua_windows' or
+                (name == 'cua_browser_events' and args.get('action') not in ('status', 'candidates', 'annotations'))):
+            raise HelperError('TASK_IN_USE', '任务属于另一个活动连接，未接管其输入或共享资源')
         # 等待绑定时允许只读枚举窗口：否则「先建窗再绑定」会被守卫锁死。
         discovery = (name == "cua_windows" and args.get("action", "list") == "list" and
                      record.get("state") == "awaiting_window")
@@ -1196,10 +1360,10 @@ def tool_permissions(args):
     ]
     if not perms.get("accessibility") or not perms.get("screenRecording"):
         lines.append(
-            "缺失授权：给 \"workbuddy-cua\" 授予辅助功能与屏幕录制后重试；"
-            "可调用 cua_permissions(action=\"open_settings\", permission=\"accessibility\")。"
+            "缺失授权：请用户在 Workbuddy CUA 权限向导中完成所需授权，再告知继续。"
+            "暂停依赖该权限的操作，不能自行打开系统设置或更换工具绕过。"
         )
-    return "\n".join(lines)
+    return {'content': [{'type': 'text', 'text': "\n".join(lines)}], 'permissionStatus': payload}
 
 
 def wait_for_window(app, pid, timeout=8.0, interval=0.25):
@@ -1221,7 +1385,7 @@ def wait_for_window(app, pid, timeout=8.0, interval=0.25):
             return None, "多个候选窗口，未猜测"
         if time.monotonic() >= deadline:
             return None, last
-        time.sleep(interval)
+        cancellable_wait(interval)
 
 
 def browser_window_snapshot():
@@ -1246,7 +1410,7 @@ def share_new_window(app, before, timeout=6.0):
             raise HelperError("TARGET_REQUIRED", "新建后出现多个候选窗口，未猜测共享目标；请显式 cua_windows action=share")
         if time.monotonic() >= deadline:
             raise HelperError("PREVIEW_NOT_READY", "新建窗口未在 6 秒内唯一出现，共享待补；不冒充已覆盖")
-        time.sleep(0.25)
+        cancellable_wait(0.25)
 
 
 def tool_apps(args):
@@ -1418,7 +1582,8 @@ def tool_situation(args):
                           "preview": preview if isinstance(preview, dict) else {"status": "unknown"},
                           "scopeWarning": "desktop 可能包含其他应用及敏感信息；现场观察不证明共享正在运行。",
                           "suggestedActions": ["按明确目标观察 AX；空树不证明自绘或权限失败。",
-                                               "输入会先校验 desktop 视频首帧；未验证时不派发。"]}}
+                                               "操作前使用 cua_windows action=share source=window，核实共享目标和视频首帧；后续自动续租。",
+                                               "必须不抢焦点；需要前台或共享未就绪时报告阻塞，不激活、不置前、不切换 Space。"]}}
 
 
 def tool_state(args):
@@ -1480,7 +1645,8 @@ def tool_state(args):
             tail.append("AX 树为空或缺失AXWebArea不代表权限失败：用 cua_visual_state 获取视频帧供视觉分析，不自动点击，不根据不确定视觉盲点操作。")
     elif result.get("focusedWindowId") and result.get("windowId") and result["focusedWindowId"] != result["windowId"]:
         tail.append(
-            "注意：观察的是 windowId=%s，但应用焦点在 windowId=%s；输入会进焦点窗口，必要时显式传 windowId。"
+            "注意：观察的是 windowId=%s，但应用焦点在 windowId=%s；必须使用绑定窗口的定向输入或同一快照的可写 AX 元素。"
+            "type_text/paste/key 不提供窗口级确认，桌面任务拒绝；禁止激活窗口、切换焦点或按键兜底。"
             % (result["windowId"], result["focusedWindowId"])
         )
     return "\n".join(header) + "\n" + (tree or "(空)") + "\n".join(tail)
@@ -1707,7 +1873,7 @@ def tool_wait_ready(args):
                 STATE.update(snapshot=visual["snapshotId"], snapshot_app=app, snapshot_window=window)
         remaining = deadline - time.monotonic()
         if remaining > 0:
-            threading.Event().wait(min(interval, remaining))
+            cancellable_wait(min(interval, remaining))
     return output("needs_visual_review" if latest_visual else "timeout")
 
 
@@ -1810,9 +1976,15 @@ def tool_click(args, method="click"):
     remember_window(app_handle, result)
     detail = ""
     if result.get("route"):
-        detail = " route=%s axAction=%s focusRestorationAttempted=%s focusRestorationAccepted=%s frontPid=%s->%s" % (
-            result["route"], result.get("axAction"), result.get("focusRestorationAttempted"),
-            result.get("focusRestorationAccepted"), result.get("frontPidBefore"), result.get("frontPidAfterAction"))
+        detail = " route=%s axAction=%s focusPreserved=%s focusRestorationAttempted=%s focusRestorationAccepted=%s frontPid=%s->%s frontWindowId=%s->%s" % (
+            result["route"], result.get("axAction"), result.get("focusPreserved"),
+            result.get("focusRestorationAttempted"), result.get("focusRestorationAccepted"),
+            result.get("frontPidBefore"), result.get("frontPidAfterAction"),
+            result.get("frontWindowIdBefore"), result.get("frontWindowIdAfterAction"))
+        if result.get("focusPreserved") is False:
+            detail += " 前台应用或键盘窗口发生变化；点击已派发，请勿重试"
+        elif result.get("focusPreserved") is None:
+            detail += " 点击已派发，但焦点状态无法核实；请先检查结果，勿直接重试"
     return "已派发 %s %s dispatched=%s verified=%s（读 cua_state 核实效果）%s%s" % (
         method, target,
         result.get("dispatched"),
@@ -1963,6 +2135,14 @@ def tool_set_value(args):
 APP_HANDLE_PROP = {"type": "string", "description": "cua_apps 返回的 appHandle；省略时使用本会话最近选择的应用"}
 WINDOW_PROP = {"type": "integer", "description": "窗口 id；输入必须显式指定或使用同应用当前连接可信快照的窗口"}
 SNAPSHOT_PROP = {"type": "string", "description": "cua_state 返回的 snapshotId；省略时使用该应用最近快照"}
+NATIVE_INPUT_GUIDANCE = (
+    "必须不抢焦点并使用共享窗口：先绑定 desktop 任务，调用 cua_windows action=share source=window 核实目标与视频首帧；后续自动续租。"
+    "仅操作已确认目标，禁止 activate/AXRaise、切换 Space、移动物理鼠标或全局 HID 兜底；遇到前台要求、共享或投递错误时停止并报告。"
+)
+NATIVE_OBSERVATION_GUIDANCE = (
+    "保持用户焦点；调用会核验共享目标与视频首帧并自动续租。操作任务开始时先用 cua_windows action=share source=window 建立共享；"
+    "共享未就绪时等待，不激活、不置前或切换 Space 来恢复观察。"
+)
 MODIFIERS_PROP = {
     "type": "array",
     "items": {"type": "string", "enum": ["command", "control", "option", "shift", "fn"]},
@@ -1970,7 +2150,7 @@ MODIFIERS_PROP = {
 }
 
 TOOLS = [
-    {"name": "cua_situation", "description": "只读现场：必须显式 appHandle/windowId，经任务守卫核验，仅读取能力、窗口与有界AX（50元素/6层），不截图、不启动共享、不重绑。焦点、AX、共享未知值诚实返回，不推断空树为自绘。选路：原生 App 走本工具及其后的 AX 系列；网页内容优先 cua_browser_events（结构化、不靠猜元素）；纯命令行或文件操作不需要 CUA。",
+    {"name": "cua_situation", "description": "只读现场：必须显式 appHandle/windowId，经任务守卫核验，仅读取能力、窗口与有界AX（50元素/6层），不截图、不启动共享、不重绑。保持用户焦点；返回的 preview 只是状态，不能证明已建立共享，后续界面操作必须使用共享窗口能力。焦点、AX、共享未知值诚实返回，不推断空树为自绘。选路：原生 App 走本工具及其后的 AX 系列；网页内容优先 cua_browser_events（结构化、不靠猜元素）；纯命令行或文件操作不需要 CUA。",
      "inputSchema": {"type": "object", "additionalProperties": False,
                      "properties": {"appHandle": {"type": "string", "minLength": 1},
                                     "windowId": {"type": "integer", "minimum": 1, "maximum": 4294967295}},
@@ -1979,8 +2159,8 @@ TOOLS = [
      "annotations": {"readOnlyHint": True, "destructiveHint": False}},
     {
         "name": "cua_task",
-        "description": "持久任务绑定：begin 默认 interactionMode=background_browser，执行层禁止所有原生输入和窗口激活；扩展未就绪必须等待。只有明确的普通桌面应用任务才在 begin 指定 desktop，模式不能中途更改。begin 生成 UUID，保持 awaiting_window，不创建或启动浏览器。bind 必须显式 appHandle、windowId、confirm=true，仅 attach 已有窗口，mode=attached_existing，不等于新建或数据隔离。status 只读核验进程代际和窗口；跨连接 requires_revalidation，需重新显式确认，绝不按 PID 自动接管。任务期间观察和输入严格限制目标，应用级键盘接口拒绝。"
-                       "后台模式不启动桌面接管；共享预览独立维持原目标和宿主位置。结束任务释放绑定和预览租约。",
+        "description": "界面任务必须不抢焦点，绑定后使用 cua_windows action=share source=window 建立目标共享；绑定不等于共享就绪。持久任务绑定：begin 默认 interactionMode=background_browser，执行层禁止所有原生输入和窗口激活；扩展未就绪必须等待。只有明确的普通桌面应用任务才在 begin 指定 desktop，模式不能中途更改。begin 生成 UUID，保持 awaiting_window，不创建或启动浏览器。bind 必须显式 appHandle、windowId、confirm=true，仅绑定已有窗口，mode=attached_existing，不等于新建或数据隔离。status 只读核验进程代际和窗口；跨连接 requires_revalidation，需重新显式确认，绝不按 PID 自动接管。任务期间观察和输入严格限制目标，应用级键盘接口拒绝。浏览器共享前先 assign 并 verify_mapping。"
+                       "后台模式不启动桌面接管；共享预览独立维持原目标和宿主位置。end 释放绑定、共享和保护；取消/断连自动中断，120秒没有实际任务操作也中断，状态查询与心跳不续期。中断记录保留原因，旧任务不能复活；用户要求继续后 begin 新任务并重新核实目标，禁止重放旧输入。其他连接的活动任务不能接管；TARGET_MISMATCH 不等于旧绑定已失效。",
         "inputSchema": {
             "type": "object", "additionalProperties": False,
             "properties": {
@@ -2005,7 +2185,7 @@ TOOLS = [
     },
     {
         "name": "cua_browser_session",
-        "description": "受管 Chrome 会话：prepare 登记固定配置；start 必须 sessionId+confirm=true 并核验安装身份，返回 pending/started；list 核验进程身份与窗口。start 不重试，超时可能已启动；禁止重复启动，不关闭浏览器、不切换 Space。attach(pid,windowId,confirm=true) 共享既有 Chrome 数据，仅绑定指定进程代际和窗口，不启动、不写 profile、不激活、不 raise；关闭或身份改变后 invalidated，不选择其他窗口。READ_ONLY 拦截 start/attach。", 
+        "description": "受管 Chrome 会话；始终不抢焦点，启动或绑定后仍需核验目标并建立共享窗口，不把会话存在当作共享成功。prepare 登记固定配置；start 必须 sessionId+confirm=true 并核验安装身份，返回 pending/started；list 核验进程身份与窗口。start 不重试，超时可能已启动；禁止重复启动，不关闭浏览器、不切换 Space。attach(pid,windowId,confirm=true) 共享既有 Chrome 数据，仅绑定指定进程代际和窗口，不启动、不写 profile、不激活、不 raise；关闭或身份改变后 invalidated，不选择其他窗口。READ_ONLY 拦截 start/attach。",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -2028,7 +2208,7 @@ TOOLS = [
     },
     {
         "name": "cua_permissions",
-        "description": "查看 macOS 辅助功能/屏幕录制授权、平台能力、会话锁定与任务隐私层状态；action=open_settings 打开对应系统设置面板。任何操作前先确认这里是 true。"
+        "description": "查看 macOS 辅助功能/屏幕录制授权、平台能力、会话锁定与任务隐私层状态；不抢焦点的界面操作前先核实权限，随后核实共享窗口。action=open_settings 会打开系统设置，仅在用户明确要求权限设置时使用，后台任务不能自行调用来恢复连接。"
                        "sessionLocked=true 时所有界面操作会被拒绝（SESSION_LOCKED），须先解锁再重新观察。"
                        "任务隐私层会阻止显示器空闲睡眠并覆盖所有窗口，不保存或输入系统密码；合盖、触控 ID 和系统级锁定仍不可拦截。",
         "inputSchema": {
@@ -2043,7 +2223,7 @@ TOOLS = [
     },
     {
         "name": "cua_apps",
-        "description": "应用层入口：action=list 列出运行中的应用；find 搜索已安装应用；get 按名称/bundleId/PID/路径选中应用并拿到 appHandle；launch 启动已选应用。",
+        "description": "应用层入口：action=list 列出运行中的应用；find 搜索已安装应用；get 按名称/bundleId/PID/路径解析应用并拿到 appHandle，不改变用户焦点。launch 启动已选应用，但第三方应用可能自行激活；要求不抢焦点时优先复用已有进程，未运行则报告并等待用户手动打开。启动回执不代表共享就绪，界面操作前仍须建立共享窗口。",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -2058,9 +2238,9 @@ TOOLS = [
     },
     {
         "name": "cua_windows",
-        "description": "列出应用窗口（windowId、标题、尺寸、屏幕坐标、是否在屏/当前桌面）、请求激活应用，或开始/结束窗口共享预览。share 会让浮动共享面板在整个界面操作任务期间保持（动作自动续租），直到 unshare 或 cua_task end。"
-                       "应用内观察与输入默认只共享目标应用；任务需要跨应用、Dock 或系统界面时，先 share(source=desktop) 共享目标所在桌面，后续动作保留该范围。"
-                       "不必为应用内任务手动 share；锁屏时共享立即关闭并清除画面。",
+        "description": "不抢焦点地列出窗口或使用共享窗口能力。界面任务绑定后，先 action=share 并显式 appHandle/windowId/source=window，仅共享已确认目标，核对 streamReady 与 trackingWindowId；浏览器窗口须先 verify_mapping。后续观察和输入自动核验、续租并复用捕获流，不要逐次 unshare/share。share 持续到 unshare 或 cua_task end；不激活目标或切换 Space，也不提供焦点隔离。"
+                       "未指定范围时默认 application；只有任务确实需要跨应用、Dock 或系统界面时才显式 source=desktop，不能为解决点击失败扩大范围。"
+                       "activate 会改变前台焦点，不抢焦点任务禁止调用，更不能作为失败兜底。锁屏时共享立即关闭并清除画面。",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -2069,7 +2249,7 @@ TOOLS = [
                 "windowId": {"type": "integer", "minimum": 1, "maximum": 4294967295},
                 "durationSeconds": {"type": "number", "minimum": 60, "maximum": 3600, "default": 1800},
                 "source": {"type": "string", "enum": ["application", "window", "desktop"], "default": "application",
-                           "description": "应用内操作用 application，仅包含目标应用的窗口；跨应用或系统界面操作用 desktop，包含目标显示器当前桌面；window 仅包含指定窗口。所选范围随动作续租，直到结束共享或更换目标。"},
+                           "description": "不抢焦点的固定窗口任务显式用 window，仅包含指定窗口；application 包含目标应用，后台 Space 时原生端收窄为目标窗口；desktop 包含目标显示器当前桌面，仅用于确有跨应用需要的任务。共享不授权激活、置前或切换 Space；所选范围随动作续租。"},
             },
         },
         "handler": tool_windows,
@@ -2077,7 +2257,7 @@ TOOLS = [
     },
     {
         "name": "cua_state",
-        "description": "读取应用的辅助功能界面树（紧凑文本，含 [elementIndex]、role、title/value、可用 actions），返回 snapshotId 供元素级操作。AXWebArea缺失或树不完整不代表权限失败，可调用 cua_visual_state 获取真实视频帧供视觉分析；禁止自动点击或根据不确定视觉盲点操作。"
+        "description": NATIVE_OBSERVATION_GUIDANCE + "读取应用的辅助功能界面树（紧凑文本，含 [elementIndex]、role、title/value、可用 actions），返回 snapshotId 供元素级操作。AXWebArea缺失或树不完整不代表权限失败，可调用 cua_visual_state 获取真实视频帧供视觉分析；禁止自动点击或根据不确定视觉盲点操作。"
                        "浏览器里的网页内容优先 cua_browser_events，AX 对网页结构通常不完整。",
         "inputSchema": {
             "type": "object",
@@ -2095,7 +2275,7 @@ TOOLS = [
     },
     {
         "name": "cua_wait_ready",
-        "description": "只读有界 AX 加载观察：显式应用、窗口、expectedUrl 和 expectedText；同一真实 AXWebArea URL与正文静态文本连续两次匹配才 ready，completionEvidence=ax_url_and_content，否则 unknown。单次调用内按 intervalSeconds>=1 轮询，共享 monotonic 总预算默认/最多30秒，包含任务核验，不重试。URL规范化scheme/host/defaultport/path，保留query、忽略fragment；不支持credentials。最多3个视频帧，仅返回最新供主代理审核，结束timeout或needs_visual_review，不自动视觉分类。权限/锁屏/进程/窗口错误立即传播。不启动、导航、点击或刷新，不访问HTTP/JS/调试接口。不证明DOM readyState或网络完成；页面身份仅AX树位置+URL，同URL重载不可区分。",
+        "description": NATIVE_OBSERVATION_GUIDANCE + "只读有界 AX 加载观察：显式应用、窗口、expectedUrl 和 expectedText；同一真实 AXWebArea URL与正文静态文本连续两次匹配才 ready，completionEvidence=ax_url_and_content，否则 unknown。单次调用内按 intervalSeconds>=1 轮询，共享 monotonic 总预算默认/最多30秒，包含任务核验，不重试。URL规范化scheme/host/defaultport/path，保留query、忽略fragment；不支持credentials。最多3个视频帧，仅返回最新供主代理审核，结束timeout或needs_visual_review，不自动视觉分类。权限/锁屏/进程/窗口错误立即传播。不启动、导航、点击或刷新，不访问HTTP/JS/调试接口。不证明DOM readyState或网络完成；页面身份仅AX树位置+URL，同URL重载不可区分。",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -2115,7 +2295,7 @@ TOOLS = [
     },
     {
         "name": "cua_visual_state",
-        "description": "AXWebArea缺失、AX树不完整或自绘界面的视觉兜底观察：从目标window的SCStream取请求后的首个新complete视频帧并stop，等待最多4秒，返回PNG image、frameId、snapshotId、单调采集时间/age、point bounds及pixel尺寸。保留右上角实时视频预览，不是截图轮播。不绕过进程身份、owner、解锁、屏幕录制与真实坐标几何校验。仅供主agent视觉分析，不做OCR或视觉规划，不自动点击，禁止根据不确定视觉盲点操作；首帧不保证是实际新页面。snapshotId仅用于坐标观察，不含AX元素。",
+        "description": NATIVE_OBSERVATION_GUIDANCE + "AXWebArea缺失、AX树不完整或自绘界面的视觉兜底观察：从目标window的SCStream取请求后的首个新complete视频帧并stop，等待最多4秒，返回PNG image、frameId、snapshotId、单调采集时间/age、point bounds及pixel尺寸。保留右上角实时视频预览，不是截图轮播。不绕过进程身份、owner、解锁、屏幕录制与真实坐标几何校验。仅供主agent视觉分析，不做OCR或视觉规划，不自动点击，禁止根据不确定视觉盲点操作；首帧不保证是实际新页面。snapshotId仅用于坐标观察，不含AX元素。",
         "inputSchema": {
             "type": "object",
             "properties": {"appHandle": APP_HANDLE_PROP, "windowId": WINDOW_PROP},
@@ -2126,7 +2306,7 @@ TOOLS = [
     },
     {
         "name": "cua_screenshot",
-        "description": "截取应用窗口的 PNG（ScreenCaptureKit），返回图片、像素尺寸、屏幕 bounds 与落盘路径。坐标换算：窗口坐标 = 屏幕坐标 - bounds.x/y；像素与 point 比例应按实际 pixelWidth/pixelHeight 和 bounds 宽高分别计算，不能假定固定 2x。",
+        "description": NATIVE_OBSERVATION_GUIDANCE + "截取应用窗口的 PNG（ScreenCaptureKit），返回图片、像素尺寸、屏幕 bounds 与落盘路径。坐标换算：窗口坐标 = 屏幕坐标 - bounds.x/y；像素与 point 比例应按实际 pixelWidth/pixelHeight 和 bounds 宽高分别计算，不能假定固定 2x。",
         "inputSchema": {
             "type": "object",
             "properties": {"appHandle": APP_HANDLE_PROP, "windowId": WINDOW_PROP},
@@ -2136,8 +2316,8 @@ TOOLS = [
     },
     {
         "name": "cua_click",
-        "description": "点击。优先元素级：传 snapshotId + elementIndex（走 AXPress 或元素中心事件）；否则传 windowId + x/y（窗口左上角起算的 point）。clickCount=2 双击。"
-                       "元素级找不到可点元素时，先用 cua_visual_state 或 cua_screenshot 核对真实位置再改坐标点击，不要凭 AX 树缺失就假定点中了。",
+        "description": NATIVE_INPUT_GUIDANCE + "点击优先使用最新 snapshotId + elementIndex；仅当前台应用和键盘窗口均为目标时用 AXPress/AXPick，后台目标走 PID+窗口定向事件。坐标点击用 windowId + x/y（窗口左上角起算的 point）；clickCount=2 双击。"
+                       "元素路径不可用时先用 cua_visual_state/cua_screenshot 核实位置，不猜坐标。核对 focusPreserved 及前后 PID/窗口；false/null 时暂停后续输入并查明原因，不自动恢复焦点。FOCUS_STATE_UNKNOWN 表示拒绝派发；已派发或结果未知时先读回，不直接重试。",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -2158,7 +2338,7 @@ TOOLS = [
     },
     {
         "name": "cua_type_text",
-        "description": "向前台应用输入文本（逐字符 Unicode 事件，适合短文本/需触发逐键行为的场景）。长文本用 cua_paste 更快。",
+        "description": NATIVE_INPUT_GUIDANCE + "向指定应用当前输入控件发送逐字符 Unicode 事件，不具备 windowId 级投递确认，desktop 绑定任务会以 UNSAFE_WINDOW_DELIVERY 拒绝。不要激活应用、点击抢焦点或改为无任务模式绕过；原生任务使用最新 AX 快照中的可写元素 cua_set_value，网页用扩展 fill。",
         "inputSchema": {
             "type": "object",
             "properties": {"appHandle": APP_HANDLE_PROP, "text": {"type": "string"}},
@@ -2169,7 +2349,7 @@ TOOLS = [
     },
     {
         "name": "cua_paste",
-        "description": "通过剪贴板粘贴文本（长文本/中文/带换行首选），会核对输入框内容。要求目标输入框已聚焦。",
+        "description": NATIVE_INPUT_GUIDANCE + "通过剪贴板粘贴到目标应用现有输入控件并核对内容，会临时使用系统剪贴板。没有窗口级投递确认，desktop 绑定任务会以 UNSAFE_WINDOW_DELIVERY 拒绝；不通过激活或切换焦点使粘贴生效，原生任务用可写 AX 元素，网页用扩展 fill。",
         "inputSchema": {
             "type": "object",
             "properties": {"appHandle": APP_HANDLE_PROP, "text": {"type": "string"}},
@@ -2180,7 +2360,7 @@ TOOLS = [
     },
     {
         "name": "cua_key",
-        "description": "按键或组合键，如 key=return / tab / escape / space / f5 / a 配 modifiers=[\"command\"]。用于提交、切换焦点、快捷键。",
+        "description": NATIVE_INPUT_GUIDANCE + "向指定应用发送按键或组合键，如 key=return/tab/escape 或单字符配 modifiers。没有窗口级投递确认，desktop 绑定任务会以 UNSAFE_WINDOW_DELIVERY 拒绝。不能用于切换用户焦点、Command+Tab 或全局快捷键兜底；网页按键使用 cua_browser_events command(operation=keypress)。",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -2195,7 +2375,7 @@ TOOLS = [
     },
     {
         "name": "cua_scroll",
-        "description": "在窗口内滚动。deltaLinesY>0 显示上方内容、<0 显示下方内容；每轴 -10..10。省略 x/y 时用窗口中心。",
+        "description": NATIVE_INPUT_GUIDANCE + "在绑定窗口内滚动，后台使用 AX 滚动条或窗口定向滚轮，不通过置前促成滚动。deltaLinesY>0 显示上方内容、<0 显示下方内容；每轴 -10..10。省略 x/y 时用窗口中心。派发后读回核实是否移动；网页滚动走扩展 scroll。",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -2213,7 +2393,7 @@ TOOLS = [
     },
     {
         "name": "cua_drag",
-        "description": "窗口内拖拽（窗口坐标）。用于滑块、框选、拖放排序。默认 400ms / 15 步。",
+        "description": NATIVE_INPUT_GUIDANCE + "窗口内拖拽使用窗口定向事件，不移动物理鼠标；根据同一窗口最新快照确认起止点（窗口内 point）。用于滑块、框选、拖放排序，默认 400ms / 15 步。派发不代表成功，拖拽后观察核实；不可用时不改为全局拖拽。",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -2236,7 +2416,7 @@ TOOLS = [
     },
     {
         "name": "cua_set_value",
-        "description": "直接写入 AX 元素的 value（比逐键输入可靠，但只对 valueWritable 元素生效）。元素来自 cua_state 的树。",
+        "description": NATIVE_INPUT_GUIDANCE + "直接写入同一窗口最新 cua_state 快照中 valueWritable=true 的 AX 元素，不要求把目标输入框切到用户前台。只对可写 AX value 生效；失败不通过聚焦、按键或粘贴兜底，网页填写用扩展 fill。写入后读取新快照核实值。",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -2253,7 +2433,7 @@ TOOLS = [
 ]
 
 TOOLS.append(dict(next(t for t in TOOLS if t["name"] == "cua_click"),
-                  name="cua_hover", description="悬停指定窗口坐标或快照元素；任务期间执行相同严格目标校验。",
+                  name="cua_hover", description=NATIVE_INPUT_GUIDANCE + "悬停指定窗口局部坐标或最新快照元素；使用 AX 展开动作或窗口定向 hover，不移动物理鼠标。执行严格任务目标校验；无法后台悬停时报告阻塞，不能把鼠标移到用户当前桌面兜底。",
                   handler=lambda args: tool_click(args, method="hover")))
 def validate_browser_assignment(task_id):
     with task_store() as data:
@@ -2290,7 +2470,7 @@ def _bound_windows(task_id):
             for row in rows if isinstance(row, dict) and isinstance(row.get('windowId'), int)]
 
 
-_events_tool = make_browser_events_tool(lambda: TASK_FILE, validate_browser_assignment)
+_events_tool = make_browser_events_tool(lambda: TASK_FILE, validate_browser_assignment, check_request_cancelled)
 _events_handler = _events_tool['handler']
 
 
@@ -2361,6 +2541,11 @@ def _events_dispatch(args):
         return output
     output = _events_handler(args)
     if isinstance(args, dict) and args.get('action') == 'assign':
+        payload = json.loads(output) if isinstance(output, str) else output
+        operation_log('browser.assigned', taskId=args.get('taskId'),
+                      browserWindowId=args.get('browserWindowId'), tabId=args.get('tabId'),
+                      candidateRefreshed=payload.get('candidateRefreshed', False),
+                      candidateAgeMs=payload.get('candidateAgeMs'))
         # Assignment invalidates native mapping evidence. Never leave a previous
         # capture showing a different window while the new association is unknown.
         try:
@@ -2376,6 +2561,18 @@ def _events_dispatch(args):
     if isinstance(args, dict) and args.get('action') == 'result':
         payload = json.loads(output) if isinstance(output, str) else output
         result = payload.get('result', {}) if isinstance(payload, dict) else {}
+        if payload.get('operation') == 'scroll' and isinstance(result, dict):
+            observed = result.get('observed') or {}
+            scroll = diagnostic_geometry(observed, ('beforeY', 'afterY', 'maxY', 'expectedY'))
+            for key in ('moved', 'atBoundary'):
+                if type(observed.get(key)) is bool:
+                    scroll[key] = observed[key]
+            for key, allowed in (('direction', ('up', 'down', 'none')),
+                                 ('outcome', ('scrolled', 'at_boundary', 'no_op', 'no_movement'))):
+                if observed.get(key) in allowed:
+                    scroll[key] = observed[key]
+            operation_log('browser.scroll_result', taskId=args.get('taskId'), commandId=args.get('commandId'),
+                          performed=result.get('performed'), verified=result.get('verified'), observed=scroll)
         if result.get('mimeType') == 'image/jpeg' and result.get('data'):
             metadata = dict(payload, result={k: v for k, v in result.items() if k != 'data'})
             return {"content": [{"type": "image", "mimeType": "image/jpeg", "data": result['data']},
@@ -2384,17 +2581,24 @@ def _events_dispatch(args):
 
 
 TOOLS.append(dict(_events_tool, handler=_events_dispatch))
+for _tool in TOOLS:
+    _tool['description'] += "\n" + RECOVERY_GUIDANCE
 TOOL_MAP = dict((t["name"], t) for t in TOOLS)
 HINTS = {
     "BACKGROUND_ONLY": "继续使用 cua_browser_events 的原任务、原标签；先检查 status，不能改用前台输入或新建窗口。",
     "TARGET_LOST": "原窗口不可用时保留任务状态，显式重新选择；不自动新建 Chrome 窗口。",
-    "PERMISSION_DENIED": "给 \"workbuddy-cua\" 授予辅助功能/屏幕录制后再试。",
-    "FOREGROUND_REQUIRED": "先观察确切目标与焦点；仅在明确需要且允许时请求激活，不自动切换窗口。",
+    "PERMISSION_DENIED": "请用户通过 Workbuddy CUA 的权限向导授予辅助功能/屏幕录制；暂停操作，不自行打开系统设置抢焦点。",
+    "FOREGROUND_REQUIRED": "此路径需要前台，不符合不抢焦点要求；停止并报告阻塞，禁止调用 activate/AXRaise、切换 Space 或移动物理鼠标兜底。",
+    "FOCUS_STATE_UNKNOWN": "焦点状态无法确认，原生点击已拒绝派发；先只读观察并报告，不能激活窗口或绕过焦点检查。",
+    "SHARE_NOT_READY": "保留原目标，等待共享窗口恢复并确认 streamReady；未就绪时不派发输入，不激活、不置前、不切换 Space。",
+    "PREVIEW_NOT_READY": "共享窗口尚未核实；保留原任务和范围，等待同一共享流就绪，不反复 unshare/share 或换前台绕过。",
+    "SHARE_REQUIRED": "界面操作需要共享窗口能力；只读模式可用 cua_situation 检查状态，不能绕过共享派发输入。",
+    "UNSAFE_WINDOW_DELIVERY": "缺少绑定窗口的投递确认；使用同窗口已确认的可写 AX 元素或网页扩展通道，不能结束任务、激活窗口或改用应用级键盘绕过。",
     "STALE_SNAPSHOT": "快照已失效：重新 cua_state 后再操作。",
     "STALE_APP": "应用进程已变化：重新 cua_apps(action=\"get\")。",
     "WINDOW_UNAVAILABLE": "窗口不存在或已关闭：重新 cua_windows。",
-    "CAPTURE_BUSY": "上一次屏幕捕获未结束：稍后重试截图，AX/输入仍可用。",
-    "APP_NOT_ALLOWED": "CUA_ALLOWLIST 拦截：修改环境变量或换目标应用。",
+    "CAPTURE_BUSY": "上一次屏幕捕获未结束：保留任务等待，重新观察共享就绪状态；不能跳过共享或改为前台输入。",
+    "APP_NOT_ALLOWED": "CUA_ALLOWLIST 拦截：通知用户确认目标访问范围，暂停并等待；不能更换目标绕过。",
     "SESSION_LOCKED": "屏幕已锁定：解锁后再操作。",
     "READ_ONLY": "当前 CUA_READ_ONLY=1，只允许观察类操作。",
 }
@@ -2418,7 +2622,7 @@ def call_tool(name, args):
                          ('dispatched' if last and last.get('dispatched') is True else
                           'not_dispatched' if last and last.get('dispatched') is False else
                           'unknown' if last else 'not_requested'))
-            payload = None
+            payload = result.get('permissionStatus')
             if name == _events_tool['name']:
                 try:
                     payload = json.loads(result['content'][0]['text'])
@@ -2444,8 +2648,22 @@ def call_tool(name, args):
             structured['errorCode'] = error_code
             structured['suggestedNext'] = ('query_existing_result' if execution in ('queued', 'unknown') else
                                            'observe_target' if error_code else 'inspect_verification')
+            recovery = recovery_policy(error_code, execution, payload)
+            if recovery:
+                structured['recovery'] = recovery
+                structured['suggestedNext'] = ('notify_user_and_wait' if recovery.get('waitForUser') else recovery['action'])
+                for block in result['content']:
+                    if block.get('type') == 'text':
+                        if result.get('isError') or 'permissionStatus' in result:
+                            block['text'] += '\n恢复指引（%s）: %s 禁止换工具绕过或重放副作用。' % (recovery['status'], recovery['message'])
+                        elif isinstance(payload, dict):
+                            payload['recovery'] = recovery
+                            block['text'] = json.dumps(payload, ensure_ascii=False)
+                        break
             if 'situation' in result:
                 structured['situation'] = result.pop('situation')
+            if 'permissionStatus' in result:
+                structured['permissionStatus'] = result.pop('permissionStatus')
             if SHARE_RECORD is not None:
                 structured['share'] = SHARE_RECORD
             if isinstance(payload, dict):
@@ -2468,6 +2686,9 @@ def call_tool(name, args):
 
 
 def capability_failure(name, key):
+    if key == 'application':
+        return {"content": [{"type": "text", "text": "APP_NOT_RUNNING: Workbuddy CUA 已退出，请先打开应用；本次调用未执行"}],
+                "isError": True, "errorCode": "APP_NOT_RUNNING"}
     return {"content": [{"type": "text", "text": "CAPABILITY_DISABLED: %s 已关闭，本次调用未执行" % key}],
             "isError": True, "errorCode": "CAPABILITY_DISABLED"}
 
@@ -2484,6 +2705,8 @@ def _call_tool(name, args):
     if READ_ONLY and not tool["readOnly"]:
         return {"content": [{"type": "text", "text": "CUA_READ_ONLY=1，输入类工具已禁用"}], "isError": True}
     try:
+        check_request_cancelled()
+        reap_task_lease()
         if name == "cua_wait_ready":
             timeout, _ = wait_ready_options(args)
             WAIT_DEADLINE = time.monotonic() + timeout
@@ -2503,6 +2726,8 @@ def _call_tool(name, args):
             ensure_share(app, window)
             guarded = dict(guarded, windowId=window)
         out = tool["handler"](guarded)
+        check_request_cancelled()
+        renew_task_lease(name, args)
         if isinstance(out, dict):
             return out
         return {"content": [{"type": "text", "text": out}]}
@@ -2524,7 +2749,8 @@ def _call_tool(name, args):
         if name != "cua_browser_events":
             return {"content": [{"type": "text", "text": "INVALID_ARGUMENT: %s" % exc}], "isError": True, "errorCode": "INVALID_ARGUMENT"}
         message = str(exc)
-        code = next((c for c in ("BACKGROUND_WAITING", "STALE_SNAPSHOT") if message.startswith(c)), "BROWSER_TARGET_WAITING")
+        code = next((c for c in ("BROWSER_HOST_UNAVAILABLE", "BROWSER_PERMISSION_MISSING", "BROWSER_DISABLED", "BACKGROUND_WAITING", "STALE_SNAPSHOT", "CANDIDATE_REFRESH_TIMEOUT",
+                                "BROWSER_TARGET_CHANGED") if message.startswith(c)), "BROWSER_TARGET_WAITING")
         return {"content": [{"type": "text", "text": message + "\n保持原任务与标签；等待扩展恢复或重新观察，禁止回落桌面输入。"}],
                 "isError": True, "errorCode": code}
     except Exception as exc:  # noqa: BLE001 - surface anything as a tool error
@@ -2544,12 +2770,15 @@ def send(msg):
     sys.stdout.flush()
 
 
-def handle(msg):
+def handle(msg, cancel_event=None):
+    global REQUEST_CANCELLED
     method = msg.get("method")
     rid = msg.get("id")
     params = msg.get("params") or {}
 
     if method == "initialize":
+        # Also works when an older stable connector hot-loads this bridge.
+        start_task_watch()
         client_version = params.get("protocolVersion") or DEFAULT_PROTOCOL
         return {
             "jsonrpc": "2.0",
@@ -2558,6 +2787,7 @@ def handle(msg):
                 "protocolVersion": client_version,
                 "capabilities": {"tools": {"listChanged": False}},
                 "serverInfo": {"name": SERVER_NAME, "version": SERVER_VERSION},
+                "instructions": AGENT_INSTRUCTIONS,
             },
         }
 
@@ -2577,7 +2807,14 @@ def handle(msg):
         return {"jsonrpc": "2.0", "id": rid, "result": {"tools": public}}
 
     if method == "tools/call":
-        result = call_tool(params.get("name"), params.get("arguments") or {})
+        previous = REQUEST_CANCELLED
+        REQUEST_CANCELLED = cancel_event if cancel_event is not None else threading.Event()
+        try:
+            result = call_tool(params.get("name"), params.get("arguments") or {})
+            if REQUEST_CANCELLED.is_set():
+                interrupt_task('client_cancelled')
+        finally:
+            REQUEST_CANCELLED = previous
         return {"jsonrpc": "2.0", "id": rid, "result": result}
 
     if method in ("resources/list", "prompts/list"):
@@ -2594,29 +2831,9 @@ def handle(msg):
 
 def main():
     log("starting %s v%s helper=%s readOnly=%s" % (SERVER_NAME, SERVER_VERSION, HELPER_PATH, READ_ONLY))
-    stream = sys.stdin.buffer
-    while True:
-        line = stream.readline()
-        if not line:
-            break
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            msg = json.loads(line.decode("utf-8", "replace"))
-        except Exception as exc:
-            send({"jsonrpc": "2.0", "id": None, "error": {"code": -32700, "message": "Parse error: %s" % exc}})
-            continue
-        if isinstance(msg, list):
-            for item in msg:
-                reply = handle(item)
-                if reply:
-                    send(reply)
-            continue
-        reply = handle(msg)
-        if reply:
-            send(reply)
-    HELPER._stop()
+    from stdio_transport import serve
+    start_task_watch()
+    serve(handle, send, on_close=shutdown)
 
 
 if __name__ == "__main__":

@@ -68,7 +68,7 @@ final class NativeSignals {
 }
 
 // Blocking accepts own only Sendable state; server access belongs to the MainActor callback.
-private func acceptConnections(listener: SharedSocket, lifetime: SharedHelperLifetime,
+private func acceptConnections(listener: SharedSocket, lifetime: SharedHelperLifetime, session: ApplicationSession,
                                onAccept: @escaping @MainActor @Sendable (UUID, SharedSocket, CancellationLatch) -> Void) {
     while !lifetime.isStopping {
         let descriptor = accept(listener.descriptor, nil, nil)
@@ -82,7 +82,7 @@ private func acceptConnections(listener: SharedSocket, lifetime: SharedHelperLif
         var gid: gid_t = 0
         guard getpeereid(descriptor, &uid, &gid) == 0, uid == getuid() else { channel.shutdown(); continue }
         let id = UUID()
-        let cancellation = CancellationLatch()
+        let cancellation = CancellationLatch(applicationSession: session)
         guard lifetime.add(id, channel: channel, cancellation: cancellation) else { channel.shutdown(); return }
         Task { @MainActor [onAccept, id, channel, cancellation] in
             onAccept(id, channel, cancellation)
@@ -104,8 +104,20 @@ private func acceptConnections(listener: SharedSocket, lifetime: SharedHelperLif
     private var startupDeadline: NativeDeadline?
     private var holdRecheck: NativeDeadline?
     private var signals: NativeSignals?
+    private let applicationSession: ApplicationSession
+    private var applicationWatch: DispatchSourceTimer?
+    private lazy var resourceLease = TaskResourceLease { [weak self] client, resources, reason in
+        self?.connections[client]?.cancelTaskResources()
+        if resources.contains(.preview) { SpacePreview.shared.release() }
+        if resources.contains(.protection) {
+            TaskPrivacyController.shared.release()
+            PowerGuard.shared.release(reason: reason)
+        }
+    }
 
     init?(options: SharedHelperOptions) throws {
+        guard let session = ApplicationSession.current(in: options.directory) else { throw ApplicationSession.unavailable }
+        applicationSession = session
         self.options = options
         lifetime = SharedHelperLifetime(startupTimeout: options.startupTimeout)
         try options.prepareDirectory()
@@ -123,6 +135,7 @@ private func acceptConnections(listener: SharedSocket, lifetime: SharedHelperLif
     }
 
     func start() throws {
+        try applicationSession.requireActive()
         let lifetime = self.lifetime
         let onStop: @MainActor @Sendable () -> Void = { [weak self] in
             guard let self else { return }
@@ -133,6 +146,27 @@ private func acceptConnections(listener: SharedSocket, lifetime: SharedHelperLif
             lifetime.abort(grace: lifetime.shutdownGrace, status: 128 + number)
             Task { @MainActor [onStop] in onStop() }
         }
+        let session = applicationSession
+        let onApplicationExit: @MainActor @Sendable () -> Void = { [weak self] in
+            guard let self else { return }
+            LockedUseAuthorizationServer.shared.endTask()
+            TaskPrivacyController.shared.release()
+            PowerGuard.shared.release(reason: "application-exit")
+            SpacePreview.shared.stop()
+            self.closeConnections()
+            self.exitIfEmpty()
+        }
+        let watch = DispatchSource.makeTimerSource(queue: .global(qos: .userInitiated))
+        watch.schedule(deadline: .now(), repeating: .milliseconds(100))
+        // This timer runs off the main queue. Explicit Sendable isolation keeps
+        // Swift from inheriting start()'s MainActor and trapping on first fire.
+        watch.setEventHandler { @Sendable [session, lifetime, onApplicationExit] in
+            guard !lifetime.isStopping, !session.isActive else { return }
+            lifetime.abort(grace: max(1, lifetime.shutdownGrace), status: 0)
+            Task { @MainActor in onApplicationExit() }
+        }
+        watch.resume()
+        applicationWatch = watch
         let onIdle: @MainActor @Sendable () -> Void = { [weak self] in self?.exitIfEmpty() }
         // A share lease outlives individual clients: re-check exit when it ends.
         SpacePreview.shared.onHoldEnded = { [weak self] in self?.exitIfEmpty() }
@@ -154,8 +188,8 @@ private func acceptConnections(listener: SharedSocket, lifetime: SharedHelperLif
             }
             self.admit(id, channel: channel, cancellation: cancellation)
         }
-        DispatchQueue.global(qos: .utility).async { [listener, lifetime, onAccept] in
-            acceptConnections(listener: listener, lifetime: lifetime, onAccept: onAccept)
+        DispatchQueue.global(qos: .utility).async { [listener, lifetime, session, onAccept] in
+            acceptConnections(listener: listener, lifetime: lifetime, session: session, onAccept: onAccept)
         }
     }
 
@@ -200,6 +234,7 @@ private func acceptConnections(listener: SharedSocket, lifetime: SharedHelperLif
         let lifetime = self.lifetime
         let onFatal: @MainActor @Sendable () -> Void = { [weak self] in self?.closeConnections() }
         let coordinator = RequestCoordinator(configuration: configuration, capture: capture, channel: channel, cancellation: cancellation,
+            clientID: id, resourceLease: resourceLease,
             scheduler: scheduler, writer: writer, permissions: permissions, onClose: { [weak self] in
                 channel.shutdown()
                 guard let self else { lifetime.remove(id); return }
@@ -214,10 +249,10 @@ private func acceptConnections(listener: SharedSocket, lifetime: SharedHelperLif
     }
 
     private func disconnected(_ id: UUID) {
+        resourceLease.disconnect(id)
         connections.removeValue(forKey: id)
         lifetime.remove(id)
-        // The last client leaving normally means the task ended, but an active
-        // share lease keeps the floating preview for the rest of the UI task.
+        // Only the disconnected owner's resources were revoked above.
         if connections.isEmpty, !SpacePreview.shared.isHolding { SpacePreview.shared.stop() }
         exitIfEmpty()
     }

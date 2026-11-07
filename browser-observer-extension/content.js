@@ -199,6 +199,35 @@
     if (!point || !hitTarget(target, point)) return { ok: false, reason: 'obscured' };
     return { ok: true, ...point };
   };
+  globalThis.__cuaScroll = (config, action) => {
+    const target = targetFor(config, action);
+    if (!target?.isConnected || !Number.isInteger(action.deltaY) || Math.abs(action.deltaY) > 10) return fail('stale_ref');
+    if (action.ref !== undefined) {
+      const prepared = globalThis.__cuaPrepare(config, action);
+      if (!prepared.ok) return fail(prepared.reason);
+    }
+    const root = target.ownerDocument.scrollingElement;
+    let scroller = target;
+    while (scroller && scroller !== root) {
+      const overflow = getComputedStyle(scroller).overflowY;
+      if (['auto', 'scroll', 'overlay'].includes(overflow) && scroller.scrollHeight > scroller.clientHeight) break;
+      scroller = scroller.parentElement || root;
+    }
+    if (!scroller?.isConnected || !visible(scroller)) return fail('not_scrollable');
+    const beforeY = Math.round(scroller.scrollTop);
+    const maxY = Math.max(0, Math.round(scroller.scrollHeight - scroller.clientHeight));
+    const deltaPixels = -action.deltaY * 40;
+    const expectedY = Math.max(0, Math.min(maxY, beforeY + deltaPixels));
+    if (action.deltaY !== 0) scroller.scrollBy({ top: -action.deltaY * 40, left: 0, behavior: 'instant' });
+    const afterY = Math.round(scroller.scrollTop);
+    const moved = afterY !== beforeY;
+    const atBoundary = action.deltaY !== 0 && expectedY === beforeY;
+    const verified = moved && Math.sign(afterY - beforeY) === Math.sign(deltaPixels);
+    return { performed: true, verified,
+      observed: { route: 'extension_dom', direction: deltaPixels > 0 ? 'down' : deltaPixels < 0 ? 'up' : 'none',
+        beforeY, afterY, maxY, expectedY, moved, atBoundary,
+        outcome: verified ? 'scrolled' : atBoundary ? 'at_boundary' : action.deltaY === 0 ? 'no_op' : 'no_movement' } };
+  };
   globalThis.__cuaFocusInput = (config, action) => {
     const target = targetFor(config, action);
     if (!target?.isConnected || (!writable(target) && !target.isContentEditable) ||
@@ -266,7 +295,7 @@
     removeEventListener('unhandledrejection', onRejection);
     delete globalThis.__cuaObserver;
     delete globalThis.__cuaSnapshot;
-    for (const key of ['__cuaPrepare', '__cuaFocusInput', '__cuaInputReady', '__cuaPointMatches', '__cuaVerifyFill', '__cuaSelect']) delete globalThis[key];
+    for (const key of ['__cuaPrepare', '__cuaScroll', '__cuaFocusInput', '__cuaInputReady', '__cuaPointMatches', '__cuaVerifyFill', '__cuaSelect']) delete globalThis[key];
     delete globalThis.__cuaDiagnostics;
     delete globalThis.__cuaObserverStop;
   };

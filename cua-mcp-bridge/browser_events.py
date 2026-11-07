@@ -9,6 +9,7 @@ import re
 import secrets
 import stat
 import time
+import uuid
 from contextlib import contextmanager
 from urllib.parse import urlsplit
 
@@ -31,6 +32,36 @@ CONFIG_DIR = config_dir()
 TASK_FILE = CONFIG_DIR / 'task-windows.json'
 EVENT_FILE = CONFIG_DIR / 'browser-events.json'
 MAX_BYTES = 1024 * 1024
+
+
+def application_session(runtime=None):
+    """A stale file is not a live app: the menu must still hold its kernel lock."""
+    runtime = Path(runtime or ('/tmp/workbuddy-cua-' + str(os.getuid())))
+    try:
+        info = runtime.lstat()
+        if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) != 0o700:
+            return None
+        with directory(runtime.resolve()) as parent:
+            source = os.open('application.lock', os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=parent)
+            with os.fdopen(source, 'rb') as stream:
+                info = os.fstat(source)
+                if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) != 0o600:
+                    return None
+                try:
+                    fcntl.flock(source, fcntl.LOCK_SH | fcntl.LOCK_NB)
+                    return None
+                except BlockingIOError:
+                    pass
+                raw = stream.read(256)
+                if len(raw) >= 256:
+                    return None
+                record = json.loads(raw)
+                if not isinstance(record, dict) or type(record.get('version')) is not int or record['version'] != 2:
+                    return None
+                value = record.get('sessionId')
+                return value if isinstance(value, str) and re.fullmatch(r'[0-9A-Fa-f]{8}(?:-[0-9A-Fa-f]{4}){3}-[0-9A-Fa-f]{12}', value) else None
+    except (OSError, ValueError, UnicodeError):
+        return None
 
 
 def require(condition, message):
@@ -151,18 +182,22 @@ def valid_selector(value):
 
 CREATED_FIELDS = {'requestId', 'browserWindowId', 'tabId'}
 COMMAND_TTL = 8
+CANDIDATE_TTL = 20
+CANDIDATE_REFRESH_TIMEOUT = 3
 MAX_RESULTS = 8
 MAX_SEEN = 64
 OPERATIONS = ('snapshot', 'click', 'fill', 'select', 'scroll', 'navigate', 'diagnostics', 'screenshot', 'keypress')
 MAX_ELEMENTS = 300
 MAX_LABEL = 80
-ACTION_FIELDS = ('ref', 'value', 'deltaY', 'url', 'snapshotId', 'key')
+ACTION_FIELDS = ('ref', 'value', 'deltaY', 'direction', 'lines', 'url', 'snapshotId', 'key')
 
 
 def command_params(args, operation):
     allowed = {'snapshot': set(), 'click': {'ref'}, 'fill': {'ref', 'value'},
-               'select': {'ref', 'value'}, 'scroll': {'ref', 'deltaY'},
+               'select': {'ref', 'value'}, 'scroll': {'ref', 'direction', 'lines'},
                'navigate': {'url'}, 'diagnostics': set(), 'screenshot': set(), 'keypress': {'key'}}[operation]
+    if operation == 'scroll' and 'deltaY' in args:
+        raise ValueError('浏览器滚动请使用 direction=down/up 和 lines，不接受有符号 deltaY')
     if operation in ('click', 'fill', 'select', 'scroll'):
         allowed.add('snapshotId')
     given = {key for key in ACTION_FIELDS if key in args}
@@ -176,14 +211,20 @@ def command_params(args, operation):
         require(valid_int(args['ref'], 1), '元素引用必须是正整数')
     if 'value' in args:
         require(type(args['value']) is str and len(args['value']) <= 1000, '输入值类型或长度错误')
-    if 'deltaY' in args:
-        require(valid_int(args['deltaY'], -10, 10), '滚动量必须是 -10..10')
+    if operation == 'scroll':
+        require(args.get('direction') in ('up', 'down'), '滚动必须指定 direction=down/up')
+        require(valid_int(args.get('lines', 6), 1, 10), 'lines 必须是 1..10 的整数')
     if operation in ('click', 'fill', 'select'):
         require('ref' in args, '该命令必须指定元素引用')
     if operation == 'navigate':
         require('url' in args, '导航命令必须指定地址')
         creation_url(args['url'])
-    return {key: args[key] for key in ACTION_FIELDS if key in args}
+    params = {key: args[key] for key in ACTION_FIELDS if key in args}
+    if operation == 'scroll' and 'direction' in params:
+        # Preserve the installed extension's legacy sign convention on the wire.
+        # Callers use words for direction and never need to infer a sign.
+        params['deltaY'] = params.pop('lines', 6) * (-1 if params.pop('direction') == 'down' else 1)
+    return params
 
 
 def validate_diagnostics(result):
@@ -296,18 +337,57 @@ def validate_event(event):
     return copy.deepcopy(event)
 
 
+def lease_live(record, parent, now=None):
+    lease = record.get('lease')
+    if lease is None:
+        return True  # Legacy records still require the existing explicit revalidation.
+    if not isinstance(lease, dict):
+        return False
+    try:
+        token = lease['ownerId']
+        if (str(uuid.UUID(token)) != token or
+                not 0 < lease['expiresAt'] - (time.time() if now is None else now) <= 125 or
+                not 0 < lease['expiresAtUptime'] - time.monotonic() <= 125):
+            return False
+        path = Path(parent) / ('task-owner-' + token + '.lock')
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        with os.fdopen(fd, 'rb') as stream:
+            info = os.fstat(stream.fileno())
+            if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) != 0o600:
+                return False
+            try:
+                fcntl.flock(stream, fcntl.LOCK_SH | fcntl.LOCK_NB)
+                return False
+            except BlockingIOError:
+                return stream.read(64).decode('ascii') == token
+    except (OSError, ValueError, KeyError, TypeError, UnicodeError):
+        return False
+
+
 def active_task(task_file):
     data = read_file(task_file, {'version': 1, 'tasks': {}})
     require(type(data) is dict and data.get('version') == 1 and type(data.get('tasks')) is dict,
             '任务记录格式错误')
     task_id = data.get('activeTaskId')
     task = data['tasks'].get(task_id) if type(task_id) is str else None
+    if task is not None and (task.get('state') in ('ended', 'interrupted') or not lease_live(task, Path(task_file).parent)):
+        return None, None
     return task_id, task
 
 
 def target_identity(task):
     return {k: copy.deepcopy(task.get(k)) for k in
             ('taskId', 'state', 'windowId', 'pid', 'processIdentity', 'sessionId')}
+
+
+def prune_creation(peer, task_id, task):
+    request = peer.get('createRequest')
+    if request and (request.get('taskId') != task_id or not task or
+                    task.get('state') not in ('awaiting_window', 'bound')):
+        # Keep only IDs so late acknowledgements can drain without re-creating
+        # a window or blocking every following extension heartbeat.
+        peer['canceledCreateRequests'] = ([request['requestId']] + peer.get('canceledCreateRequests', []))[:8]
+        peer['createRequest'] = None
 
 
 def mapping_conflict(record, task):
@@ -349,16 +429,32 @@ def bound_native_target(task):
 
 
 def sync_peer(message, origin, task_file, event_file):
+    session = application_session()
+    require(session is not None, 'APP_NOT_RUNNING: 请先打开 Workbuddy CUA')
     base = {'action', 'enabled', 'permission'}
-    optional = ('candidates', 'created', 'commandResult', 'clientVersion', 'assignmentTitle', 'capabilities', 'panelState', 'panelResult')
+    optional = ('candidates', 'created', 'commandResult', 'clientVersion', 'assignmentTitle', 'capabilities', 'panelState', 'panelResult', 'applicationSession')
     allowed = {frozenset(base | set(combo))
                for size in range(len(optional) + 1)
                for combo in itertools.combinations(optional, size)}
     require(frozenset(message) in allowed, '握手字段错误')
     require(type(message['enabled']) is bool and type(message['permission']) is bool, '权限类型错误')
+    require('applicationSession' not in message or message['applicationSession'] is None or
+            (type(message['applicationSession']) is str and 0 < len(message['applicationSession']) <= 128), '应用会话格式错误')
     now = time.time()
     with event_store(event_file) as data:
         peer = data.setdefault('peer', {})
+        session_reset = (peer.get('applicationSession') not in (None, session) or
+                         ('applicationSession' in message and message['applicationSession'] != session))
+        if peer.get('applicationSession') != session:
+            # A fresh app session must never resume a previous task or replay commands.
+            data['tasks'] = {}
+            peer.clear()
+            peer['applicationSession'] = session
+        if session_reset:
+            # An old in-flight sync may carry results after the app restarts.
+            # Acknowledge the new session without importing that old evidence.
+            message = {key: value for key, value in message.items() if key in
+                       ('action', 'enabled', 'permission', 'clientVersion', 'capabilities')}
         if 'panelState' in message:
             state = message['panelState']
             require(type(state) is dict and set(state) == {'taskSummary', 'activity', 'downloads', 'review'}, '面板状态字段错误')
@@ -425,9 +521,22 @@ def sync_peer(message, origin, task_file, event_file):
             require(type(title) is str and 0 < len(title) <= 200 and
                     not any(ord(c) < 32 for c in title), '标签标题不合法')
             peer['assignmentTitle'] = title
+        active_id, active_record = active_task(task_file)
+        prune_creation(peer, active_id, active_record)
+        if (isinstance(message.get('created'), dict) and
+                message['created'].get('requestId') in peer.get('canceledCreateRequests', [])):
+            message = dict(message)
+            message.pop('created')  # Acknowledge a late result; never assign it.
         if 'created' in message:
             created = message['created']
-            require(type(created) is dict and set(created) == CREATED_FIELDS, '创建结果字段错误')
+            require(type(created) is dict and set(created) in (CREATED_FIELDS,
+                    CREATED_FIELDS | {'navigationState'}, CREATED_FIELDS | {'navigationState', 'navigationError'}),
+                    '创建结果字段错误')
+            navigation = created.get('navigationState', 'unknown')
+            require(navigation in ('not_requested', 'issued', 'failed', 'unknown'), '创建导航状态错误')
+            if 'navigationError' in created:
+                require(navigation in ('failed', 'unknown') and type(created['navigationError']) is str and
+                        0 < len(created['navigationError']) <= 200, '创建导航错误信息不合法')
             request = peer.get('createRequest')
             require(type(created['requestId']) is str and re.fullmatch('[0-9a-f]{32}', created['requestId']),
                     '创建请求标识错误')
@@ -446,6 +555,8 @@ def sync_peer(message, origin, task_file, event_file):
             peer['createdTargets'] = ([{
                 'requestId': created['requestId'], 'taskId': task_id_now,
                 'browserWindowId': created['browserWindowId'], 'tabId': created['tabId'],
+                'navigationState': navigation,
+                **({'navigationError': created['navigationError']} if 'navigationError' in created else {}),
                 'at': now}] + [t for t in peer.get('createdTargets', [])
                                if t.get('tabId') != created['tabId']])[:8]
             peer['createRequest'] = None
@@ -592,6 +703,8 @@ def sync_peer(message, origin, task_file, event_file):
             command.setdefault('deliveredAt', now)
             peer['command'] = command
         return {'ok': True, 'protocolVersion': 2, 'heartbeatAt': now,
+                'applicationSession': session,
+                'sessionReset': session_reset,
                 'panelBridge': True,
                 'activeTaskId': task_id,
                 'requestCandidates': bool(peer.get('requestCandidates')),
@@ -605,7 +718,57 @@ def sync_peer(message, origin, task_file, event_file):
                 'assignment': assignment}
 
 
-def internal_action(args, task_file=TASK_FILE, event_file=EVENT_FILE):
+class CandidateEvidenceExpired(ValueError):
+    def __init__(self, candidate, task, peer):
+        super().__init__('扩展候选证据过期')
+        self.expected = {'candidate': copy.deepcopy(candidate), 'targetIdentity': target_identity(task),
+                         'applicationSession': peer.get('applicationSession'),
+                         'candidatesAt': peer.get('candidatesAt', 0)}
+
+
+def validate_candidate_refresh(data, expected, task_file):
+    peer = data.get('peer', {})
+    task_id, task = active_task(task_file)
+    require(bound_native_target(task) and task_id == expected['targetIdentity']['taskId'] and
+            target_identity(task) == expected['targetIdentity'],
+            'BROWSER_TARGET_CHANGED: 刷新期间原生任务目标已变化，未分配标签')
+    require(application_session() == expected['applicationSession'] == peer.get('applicationSession') and
+            time.time() - peer.get('lastSeen', 0) < CANDIDATE_TTL and
+            peer.get('enabled') and peer.get('permission'),
+            '刷新期间应用会话、扩展连接或授权已变化，未分配标签')
+
+
+def internal_action(args, task_file=TASK_FILE, event_file=EVENT_FILE, revalidate=None, check_cancelled=None):
+    if check_cancelled:
+        check_cancelled()
+    try:
+        return _internal_action(args, task_file, event_file)
+    except CandidateEvidenceExpired as expired:
+        expected = expired.expected
+    # Refresh only metadata for an already selected candidate. No input,
+    # navigation, creation or assignment has been dispatched by the failed check.
+    with event_store(event_file) as data:
+        validate_candidate_refresh(data, expected, task_file)
+        data['peer']['requestCandidates'] = True
+    deadline = time.monotonic() + CANDIDATE_REFRESH_TIMEOUT
+    while True:
+        data = read_file(event_file)
+        validate_candidate_refresh(data, expected, task_file)
+        peer = data['peer']
+        if not peer.get('requestCandidates') and peer.get('candidatesAt', 0) > expected['candidatesAt']:
+            if revalidate:
+                revalidate(args['taskId'])
+            # Recheck identity, URL and freshness under the assignment's lock.
+            return _internal_action(args, task_file, event_file, refreshed=expected)
+        if time.monotonic() >= deadline:
+            raise ValueError('CANDIDATE_REFRESH_TIMEOUT: 扩展未在 3 秒内回传新候选，未分配标签；'
+                             '保持原任务与标签，连接恢复后重试 assign')
+        time.sleep(0.1)
+        if check_cancelled:
+            check_cancelled()
+
+
+def _internal_action(args, task_file, event_file, refreshed=None):
     action = args.get('action')
     require(action in ('candidates', 'assign', 'create_target', 'command', 'result', 'cancel',
                        'annotate', 'annotations', 'verify_mapping', 'tabs', 'select_tab'), '内部操作错误')
@@ -628,10 +791,13 @@ def internal_action(args, task_file=TASK_FILE, event_file=EVENT_FILE):
     with event_store(event_file) as data:
         peer = data.get('peer', {})
         # 单活动任务模型：其他任务的浏览器分配一律淘汰（assign 可能早于下一次 sync）。
-        active_now, _ = active_task(task_file)
+        active_now, active_record = active_task(task_file)
+        prune_creation(peer, active_now, active_record)
         data['tasks'] = {k: v for k, v in data.get('tasks', {}).items() if k == active_now}
         live = time.time() - peer.get('lastSeen', 0) < 20
-        available = live and peer.get('enabled') and peer.get('permission')
+        session = application_session()
+        available = (session is not None and live and peer.get('enabled') and peer.get('permission') and
+                     peer.get('applicationSession') == session)
         if action == 'candidates':
             if 'taskId' in args:
                 require(type(args['taskId']) is str and args['taskId'] == active_now and active_now is not None,
@@ -641,9 +807,15 @@ def internal_action(args, task_file=TASK_FILE, event_file=EVENT_FILE):
             return {'nativeConnection': 'connected' if live else 'host_unavailable',
                     'globalPermission': bool(peer.get('permission')) if live else None,
                     'candidates': copy.deepcopy(peer.get('candidates', [])) if available and
-                        time.time() - peer.get('candidatesAt', 0) < 20 else [],
-                    'refreshPending': True, 'mappingVerified': False}
-        require(available, 'host_unavailable 或 permission_missing')
+                        0 <= time.time() - peer.get('candidatesAt', 0) < CANDIDATE_TTL else [],
+                    'refreshPending': True, 'mappingVerified': False,
+                    'candidateAgeMs': round(max(0, time.time() - peer['candidatesAt']) * 1000)
+                        if peer.get('candidatesAt') else None,
+                    'candidateTtlMs': CANDIDATE_TTL * 1000}
+        require(session is not None and live and peer.get('applicationSession') == session,
+                'BROWSER_HOST_UNAVAILABLE: 扩展未连接，请用户恢复扩展连接')
+        require(peer.get('permission'), 'BROWSER_PERMISSION_MISSING: 浏览器能力未授权，请用户完成授权')
+        require(peer.get('enabled'), 'BROWSER_DISABLED: 浏览器能力已关闭，请用户在控制面板开启')
         task_id, task = active_task(task_file)
         if action == 'create_target':
             # 建窗发生在绑定之前，因此只要求活动任务，不要求 sessionId（那是绑定后才有的）。
@@ -655,7 +827,11 @@ def internal_action(args, task_file=TASK_FILE, event_file=EVENT_FILE):
             if created:
                 return {'requested': False, 'reused': True, 'requestId': created['requestId'],
                         'browserWindowId': created['browserWindowId'], 'tabId': created['tabId'],
-                        'mappingVerified': False, 'nextAction': 'candidates_then_assign'}
+                        'navigationState': created.get('navigationState', 'unknown'),
+                        **({'navigationError': created['navigationError']} if 'navigationError' in created else {}),
+                        'mappingVerified': False, 'nextAction': 'candidates_then_assign' if
+                            created.get('navigationState') == 'issued' else 'inspect_created_tab',
+                        'limitation': 'issued 仅表示导航请求已受理；须在 HTTP(S) 候选中出现才能 assign。失败或结果未知时不重建窗口、不重放导航。'}
             pending = peer.get('createRequest')
             if pending and pending.get('taskId') == task_id:
                 require(pending.get('url') == requested_url, '已有创建请求；复用原目标，不因地址变化另开窗口')
@@ -820,10 +996,17 @@ def internal_action(args, task_file=TASK_FILE, event_file=EVENT_FILE):
                         'note': '结果已被后续命令挤出保留窗口'}
             return {'commandId': args['commandId'], 'status': 'unknown'}
         require(valid_int(args['tabId']) and valid_int(args['browserWindowId']), '标签身份错误')
-        require(time.time() - peer.get('candidatesAt', 0) < 20, '扩展候选证据过期')
         candidate = next((c for c in peer.get('candidates', []) if c['tabId'] == args['tabId'] and
                           c['browserWindowId'] == args['browserWindowId']), None)
         require(candidate is not None, '缺少扩展目标证据；不能使用 CGWindowID 代替浏览器窗口 ID')
+        if refreshed:
+            validate_candidate_refresh(data, refreshed, task_file)
+            require(candidate == refreshed['candidate'],
+                    'BROWSER_TARGET_CHANGED: 刷新后标签地址已变化，请重新查询候选并确认目标')
+            require(peer.get('candidatesAt', 0) > refreshed['candidatesAt'], '未收到新的扩展候选证据')
+        candidate_age = time.time() - peer.get('candidatesAt', 0)
+        if not 0 <= candidate_age < CANDIDATE_TTL:
+            raise CandidateEvidenceExpired(candidate, task, peer)
         require(not any(r['tabId'] == args['tabId'] and k != task_id for k, r in data['tasks'].items()),
                 '标签属于其他任务')
         created = next((t for t in peer.get('createdTargets', [])
@@ -856,6 +1039,7 @@ def internal_action(args, task_file=TASK_FILE, event_file=EVENT_FILE):
                          [{'tabId': args['tabId'], 'browserWindowId': args['browserWindowId']}],
             'targetIdentity': target_identity(task), 'mappingVerified': False, 'paused': False, 'event': None}
         return {'assigned': True, 'assignmentVersion': version, 'mappingVerified': False,
+                'candidateRefreshed': refreshed is not None, 'candidateAgeMs': round(candidate_age * 1000),
                 'targetEvidence': copy.deepcopy(evidence),
                 'limitation': '创建或选择仅为浏览器标签证据；系统窗口自动映射尚未实现，不授权桌面输入'}
 
@@ -873,6 +1057,9 @@ def status(task_id, task_file=TASK_FILE, event_file=EVENT_FILE):
     data = read_file(event_file, {'version': 1, 'tasks': {}})
     require(type(data) is dict and data.get('version') == 1 and type(data.get('tasks')) is dict,
             '观察记录格式错误')
+    session = application_session()
+    if session is None or data.get('peer', {}).get('applicationSession') != session:
+        data = {'version': 1, 'tasks': {}}
     record = data['tasks'].get(task_id)
     if record and current_assignment(data, task_file) is not record:
         record = None
@@ -885,6 +1072,7 @@ def status(task_id, task_file=TASK_FILE, event_file=EVENT_FILE):
     conflict = mapping_conflict(record, active_task(task_file)[1] or {}) if record else None
     task = active_task(task_file)[1] or {}
     capabilities = {'cdp_input', 'document_binding', 'background_popups'} <= set(peer.get('capabilities', []))
+    created = next((t for t in peer.get('createdTargets', []) if t.get('taskId') == task_id), None)
     waiting = (reason if not live or not peer.get('permission') or not peer.get('enabled') else
                'extension_upgrade_required' if not capabilities else 'target_not_assigned' if not record else
                'target_paused' if record.get('paused') else 'document_pending' if not (record.get('event') or {}).get('documentId') else None)
@@ -895,6 +1083,7 @@ def status(task_id, task_file=TASK_FILE, event_file=EVENT_FILE):
                          'verificationOperation': verify.get('operation') if verify else None,
                          'lastResultStatus': (peer.get('commandResult') or {}).get('status')},
         'clientVersion': peer.get('clientVersion'),
+        'createdTarget': copy.deepcopy(created),
         'capabilities': copy.deepcopy(peer.get('capabilities', [])),
         'observationOnly': bool(waiting),
         'executionPolicy': {'mode': task.get('interactionMode', 'background_browser'),
@@ -913,6 +1102,9 @@ def dispatch(message, origin, allowed_origins, task_file=TASK_FILE, event_file=E
     require(type(origin) is str and re.fullmatch(r'chrome-extension://[a-p]{32}/', origin)
             and origin in allowed_origins, '扩展 origin 不在允许列表')
     require(type(message) is dict, '请求必须是对象')
+    session = application_session()
+    if session is None:
+        return {'ok': False, 'code': 'APP_NOT_RUNNING', 'error': 'Workbuddy CUA 已退出，请先打开应用'}
     action = message.get('action')
     if action == 'bind':
         return {'ok': False, 'code': 'LEGACY_UNSUPPORTED',
@@ -922,7 +1114,7 @@ def dispatch(message, origin, allowed_origins, task_file=TASK_FILE, event_file=E
     if action == 'ping':
         # 长期端口保活：只需确认 host 可达，不改动任何任务或观察状态。
         require(set(message) == {'action'}, 'ping 字段不合法')
-        return {'ok': True, 'protocolVersion': 2, 'heartbeatAt': time.time()}
+        return {'ok': True, 'protocolVersion': 2, 'heartbeatAt': time.time(), 'applicationSession': session}
     shapes = {'status': {'action', 'taskId'},
               'unbind': {'action', 'taskId', 'token'},
               'pause': {'action', 'taskId', 'token'},
@@ -934,6 +1126,8 @@ def dispatch(message, origin, allowed_origins, task_file=TASK_FILE, event_file=E
         return {'ok': True, 'status': status(task_id, task_file, event_file)}
     with event_store(event_file) as data:
         # 在持有观察锁之后再次核验，不创建或改写任务记录。
+        require(application_session() == session and data.get('peer', {}).get('applicationSession') == session,
+                'APP_SESSION_EXPIRED: 应用运行会话已变化，请重新分配任务')
         task_exists(task_id, task_file)
         records = data['tasks']
         record = records.get(task_id)
@@ -987,7 +1181,7 @@ def dispatch(message, origin, allowed_origins, task_file=TASK_FILE, event_file=E
         return {'ok': True, 'mappingVerified': False}
 
 
-def make_tool(task_file, validate_task=None):
+def make_tool(task_file, validate_task=None, check_cancelled=None):
     def shape(action, required=(), optional=(), operation=None):
         fields = {'action': {'const': action}, **{key: {} for key in (*required, *optional)}}
         needed = ['action', *required]
@@ -1006,7 +1200,8 @@ def make_tool(task_file, validate_task=None):
             ('snapshot', (), ()), ('diagnostics', (), ()), ('screenshot', (), ()), ('keypress', ('key',), ()),
             ('click', ('ref', 'snapshotId'), ()), ('fill', ('ref', 'snapshotId'), ('value',)),
             ('select', ('ref', 'snapshotId'), ('value',)),
-            ('scroll', ('snapshotId',), ('ref', 'deltaY')), ('navigate', ('url',), ())):
+            ('scroll', ('snapshotId', 'direction'), ('ref', 'lines')),
+            ('navigate', ('url',), ())):
         shapes.append(shape('command', ('taskId', *required), optional, operation))
 
     def handler(args):
@@ -1015,11 +1210,13 @@ def make_tool(task_file, validate_task=None):
                                   'cancel', 'annotate', 'annotations', 'verify_mapping', 'tabs', 'select_tab'):
             if args.get('action') == 'assign' and validate_task:
                 validate_task(args.get('taskId'))
-            return json.dumps(internal_action(args, task_file=task_file()), ensure_ascii=False)
+            options = {'revalidate': validate_task} if args.get('action') == 'assign' else {}
+            return json.dumps(internal_action(args, task_file=task_file(), check_cancelled=check_cancelled, **options), ensure_ascii=False)
         require(set(args) == {'action', 'taskId'} and args['action'] == 'status', '状态查询需要 taskId')
         return json.dumps(status(args['taskId'], task_file=task_file()), ensure_ascii=False)
-    return {'name': 'cua_browser_events', 'description': '通过已授权扩展观察及操作固定浏览器标签。优先 candidates（可带当前 taskId；轮询后再次查询），再以真实 browserWindowId/tabId 显式 assign；ID 不能用 CGWindowID 代替。绑定后持续复用同一标签，不按前台焦点换目标。create_target 仅用于尚无窗口的活动任务，可带 url，focused=false；同一任务重复申请复用原请求或结果，不因超时另开窗口。command 下发限定操作（snapshot/click/fill/select/scroll/navigate/diagnostics，单飞，8 秒过期），result 轮询（pending/ok/error/expired/canceled/unknown，不重放，附 latencyMs），cancel 如实报告 mayHaveExecuted。动作执行过之后必须先用 snapshot 复核才能继续动作。performed 不代表业务成功，浏览器分配不授权桌面输入或 wait_ready 判定。'
-                                                          '前提：Chrome 已加载 workbuddy-cua Browser Extension 并授予站点权限、原生宿主已登记（可在 cua_permissions 或安装页核对）。后台网页任务仅走此通道，扩展未就绪时等待，禁止回落 AX 或桌面输入。snapshot 返回 snapshotId，click/fill/select/scroll 必须传该标识；screenshot 直接截取该标签。tabs 列出任务归属标签，select_tab 只改逻辑目标，不激活标签或窗口。keypress 只支持页面按键。',
+    return {'name': 'cua_browser_events', 'description': '网页操作必须不抢焦点并使用共享窗口能力。保持用户的前台应用、键盘窗口、物理鼠标和当前 Space；只走固定标签扩展通道，禁止 activate/AXRaise、切换 Space、前台键鼠或原生输入兜底。bind+assign 后用 verify_mapping 核验系统窗口与标签对应关系，再调用 cua_windows action=share source=window，确认共享目标与视频首帧后开始网页输入；后续复用同一共享流。映射或预览未就绪时报告并等待；扩展 screenshot 仅为标签观察证据，不能冒充实时共享窗口。'
+                                                          '通过已授权扩展观察及操作固定浏览器标签。优先 candidates（可带当前 taskId；refreshPending 表示异步刷新），先 cua_task bind 真实系统窗口，再以候选中的 browserWindowId/tabId 显式 assign；ID 不能用 CGWindowID 代替。候选超过 20 秒时 assign 自动等待至多 3 秒获取新证据，原标签、窗口、地址及任务目标均未变化才分配；不必反复刷新候选，不自动重建窗口。绑定后持续复用同一标签，不按前台焦点换目标。create_target 仅用于尚无窗口的活动任务，可带 url，focused=false；同一任务重复申请复用原请求或结果，不因超时另开窗口。command 下发限定操作（snapshot/click/fill/select/scroll/navigate/diagnostics/screenshot/keypress，单飞，8 秒过期），result 轮询（pending/ok/error/expired/canceled/unknown，不重放，附 latencyMs），cancel 如实报告 mayHaveExecuted。动作执行过之后必须先用 snapshot 复核才能继续动作。performed 不代表业务成功，浏览器分配不授权桌面输入或 wait_ready 判定。'
+                                                          '前提：Chrome 已加载 workbuddy-cua Browser Extension 并授予站点权限、原生宿主已登记（可在 cua_permissions 或安装页核对）。后台网页任务仅走此通道，扩展未就绪时等待，禁止回落 AX 或桌面输入。snapshot 返回 snapshotId，click/fill/select/scroll 必须传该标识。滚动使用 direction=down/up、lines=6（1..10）；不要猜 deltaY 符号。到达边界与滚动未生效会分别报告，不把 performed 当作已移动。screenshot 直接截取该标签。tabs 列出任务归属标签，select_tab 只改逻辑目标，不激活标签或窗口。keypress 只支持页面按键。',
             'inputSchema': {'type': 'object', 'properties': {'action': {'type': 'string', 'enum': ['status', 'candidates', 'create_target', 'command', 'result', 'cancel', 'annotate', 'annotations', 'verify_mapping', 'assign', 'tabs', 'select_tab']},
                 'taskId': {'type': 'string'}, 'browserWindowId': {'type': 'integer'}, 'tabId': {'type': 'integer'},
                 'operation': {'type': 'string', 'enum': list(OPERATIONS)},
@@ -1028,11 +1225,14 @@ def make_tool(task_file, validate_task=None):
                 'ref': {'type': 'integer', 'minimum': 1, 'description': '快照中的元素引用'},
                 'note': {'type': 'string', 'maxLength': 200, 'description': 'annotate 的标注文本'},
                 'value': {'type': 'string', 'maxLength': 1000, 'description': 'fill/select 的目标值'},
-                'deltaY': {'type': 'integer', 'minimum': -10, 'maximum': 10, 'description': 'scroll 行数'},
+                'direction': {'type': 'string', 'enum': ['down', 'up'], 'description': 'scroll 必填方向：down 向下，up 向上'},
+                'lines': {'type': 'integer', 'minimum': 1, 'maximum': 10, 'default': 6, 'description': 'direction 模式的滚动行数，每行 40 CSS px，默认 6'},
                 'commandId': {'type': 'string', 'description': 'command 返回的标识，用于 result/cancel'},
                 'url': {'type': 'string', 'description': 'create_target 起始地址或 navigate 目标，仅 http/https 且不允许凭据'}},
                 'required': ['action'], 'additionalProperties': False, 'oneOf': shapes,
                 'examples': [{'action': 'candidates', 'taskId': 'current-task'},
                              {'action': 'assign', 'taskId': 'current-task', 'browserWindowId': 2, 'tabId': 7},
-                             {'action': 'command', 'taskId': 'current-task', 'operation': 'snapshot'}]},
+                             {'action': 'command', 'taskId': 'current-task', 'operation': 'snapshot'},
+                             {'action': 'command', 'taskId': 'current-task', 'operation': 'scroll',
+                              'snapshotId': 'snapshot-from-last-result', 'direction': 'down', 'lines': 6}]},
             'handler': handler, 'readOnly': False}

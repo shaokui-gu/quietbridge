@@ -14,6 +14,7 @@ import server
 class BrowserSessionTests(unittest.TestCase):
     def setUp(self):
         for patcher in (mock.patch.object(server, "TASK_FILE", "/nonexistent/browser-test-task.json"),
+                        mock.patch.object(server, "control_snapshot", return_value={"master": True}),
                         mock.patch.object(server, "TASK_BINDINGS", {})):
             patcher.start()
             self.addCleanup(patcher.stop)

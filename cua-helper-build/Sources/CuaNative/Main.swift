@@ -6,6 +6,8 @@ import Darwin
 @MainActor private final class MenuBarApplicationDelegate: NSObject, NSApplicationDelegate {
     let panel = MenuBarPanel()
 
+    func applicationWillTerminate(_ notification: Notification) { panel.shutdown() }
+
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
         panel.show()
         return false

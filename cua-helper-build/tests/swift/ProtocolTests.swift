@@ -83,7 +83,7 @@ func admitsPreviewLeaseWithoutGrantingInput(_ source: String) throws {
     #expect(try hold.number("durationSeconds") == 900)
     #expect(try hold.string("source") == source)
     // release/status carry no target: the task may end after the app quit.
-    for action in ["release", "status"] {
+    for action in ["release", "status", "renew"] {
         let params = try RequestParameters(NativeRequest(data: Data("{\"id\":\"p\",\"method\":\"preview\",\"params\":{\"action\":\"\(action)\"}}".utf8)))
         #expect(try params.string("action") == action)
     }

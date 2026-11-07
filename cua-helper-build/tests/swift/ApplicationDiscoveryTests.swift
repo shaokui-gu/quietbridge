@@ -91,6 +91,40 @@ func failedLaunchInspectionInvalidatesThePendingHandle(failure: String) async th
     }
 }
 
+@Test(arguments: ["loctable", "strings"]) func findsLocalizedApplicationNamesWhileRetainingEnglishAndBundleIdentity(format: String) throws {
+    let root = FileManager.default.temporaryDirectory.appendingPathComponent("workbuddy-cua-localized-" + UUID().uuidString)
+    defer { try? FileManager.default.removeItem(at: root) }
+    let original = try fixtureApplication(root, name: "Calculator", identifier: "test.dsh.localized." + UUID().uuidString)
+    let url = URL(fileURLWithPath: original.path)
+    let resources = url.appendingPathComponent("Contents/Resources")
+    let names = ["CFBundleDisplayName": "计算器", "CFBundleName": "计算器"]
+    let file = format == "loctable" ? resources.appendingPathComponent("InfoPlist.loctable") :
+        resources.appendingPathComponent("zh_CN.lproj/InfoPlist.strings")
+    try FileManager.default.createDirectory(at: file.deletingLastPathComponent(), withIntermediateDirectories: true)
+    let contents: [String: Any] = format == "loctable" ? ["zh_CN": names, "LocProvenance": ["zh_CN": 1]] : names
+    try PropertyListSerialization.data(fromPropertyList: contents, format: .binary, options: 0).write(to: file)
+    let localized = try #require(InstalledApplication.read(url, preferredLanguages: ["zh-Hans-CN"]))
+    #expect(localized.name == "计算器")
+    #expect(localized.matches("计算器", exact: true))
+    #expect(localized.matches("calculator", exact: true))
+    #expect(localized.matches(original.bundleID!, exact: true))
+    #expect(localized.path == original.path)
+    #expect(localized.executablePath == original.executablePath)
+    #expect(try ApplicationAuthorization.describeInstalled(localized)["id"] == ApplicationAuthorization.describeInstalled(original)["id"])
+    if format == "loctable" {
+        #expect(InstalledApplication.read(url, preferredLanguages: ["en"])?.name == "Calculator")
+    }
+}
+
+@Test func readsActualSystemCalculatorChineseNameWithoutLaunching() throws {
+    let url = URL(fileURLWithPath: "/System/Applications/Calculator.app")
+    guard FileManager.default.fileExists(atPath: url.appendingPathComponent("Contents/Resources/InfoPlist.loctable").path) else { return }
+    let app = try #require(InstalledApplication.read(url, preferredLanguages: ["zh-Hans-CN"]))
+    #expect(app.name == "计算器")
+    #expect(app.matches("计算器", exact: true))
+    #expect(app.matches("com.apple.calculator", exact: true))
+}
+
 @Test(arguments: [nil, ""] as [String?]) func applicationsWithoutBundleIdentifiersRetainPathConsentAcrossUpdates(identifier: String?) throws {
     let root = FileManager.default.temporaryDirectory.appendingPathComponent("workbuddy-cua-apps-" + UUID().uuidString)
     defer { try? FileManager.default.removeItem(at: root) }

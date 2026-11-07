@@ -51,7 +51,9 @@ import Testing
         #expect(view.rows["locked_use"]?.isHidden == false)
         #expect(view.rows["locked_use"]?.isEnabled == true)
         #expect(view.installButton.isHiddenOrHasHiddenAncestor == true)
-        #expect(view.rows["operation_log"]?.nextKeyView === view.rows["locked_use"])
+        #expect(view.rows["operation_log"]?.nextKeyView === view.browserButton)
+        #expect(view.browserButton.nextKeyView === view.permissionsButton)
+        #expect(view.permissionsButton.nextKeyView === view.rows["locked_use"])
         #expect(input.accessibilityLabel() == "屏幕操作")
         #expect(view.manageButton.isHidden == false)
     }
@@ -120,6 +122,39 @@ import Testing
             }
             try saveSnapshot(container, name: name)
         }
+    }
+
+    @Test func permissionDetailReplacesBrowserWithinTheSamePanel() throws {
+        let target = PanelActionTarget()
+        let view = makeView(target)
+        let browser = NSView(), permissions = MenuBarPermissionsView(frame: .zero)
+        let container = MenuBarPanelContainer(content: view, browser: browser, permissions: permissions)
+        container.frame.size = NSSize(width: 760, height: 750)
+        let control = CapabilityControl()
+        view.refresh(preferences: control.preferences(), pluginState: .available, permissions: nil)
+        #expect(view.rows["native_input"]?.state == .off)
+        #expect(view.rows["native_input"]?.isEnabled == true)
+        #expect(view.rows["preview"]?.state == .off)
+        #expect(view.permissionsButton.badge.stringValue == "待授权")
+        container.setDetail(.browser, narrow: false)
+        container.layoutSubtreeIfNeeded()
+        #expect(view.browserButton.selected)
+        #expect(permissions.isHidden)
+        container.setDetail(.permissions, narrow: false)
+        container.layoutSubtreeIfNeeded()
+        #expect(!view.browserButton.selected)
+        #expect(view.permissionsButton.selected)
+        #expect(browser.isHidden)
+        #expect(!permissions.isHidden)
+        #expect(permissions.frame == NSRect(x: 360, y: 0, width: 400, height: 750))
+        container.setDetail(.permissions, narrow: true)
+        container.layoutSubtreeIfNeeded()
+        #expect(view.isHidden)
+        #expect(permissions.frame.minX == 0)
+        container.setDetail(nil, narrow: false)
+        #expect(!view.isHidden)
+        #expect(!view.permissionsButton.selected)
+        #expect(permissions.isHidden)
     }
 
     @Test func browserSetupUsesPackagedFilesAndStaysInPanel() throws {

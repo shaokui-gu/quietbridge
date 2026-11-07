@@ -12,6 +12,7 @@ import server
 class VisualStateTests(unittest.TestCase):
     def setUp(self):
         for patcher in (mock.patch.object(server, "TASK_FILE", "/nonexistent/visual-test-task.json"),
+                        mock.patch.object(server, "control_snapshot", return_value={"master": True}),
                         mock.patch.object(server, "TASK_BINDINGS", {}),
                         mock.patch.object(server, "ensure_share", return_value=None),
                         mock.patch.object(server, "READ_ONLY", False)):
@@ -99,6 +100,7 @@ class WaitReadyTests(unittest.TestCase):
         self.fake._alive.return_value = True
         self.fake.request.side_effect = lambda method, *a, **k: dict(self.ax if method == "getState" else self.visual)
         for patcher in (mock.patch.object(server, "STATE", self.state),
+                        mock.patch.object(server, "control_snapshot", return_value={"master": True}),
                         mock.patch.object(server, "HELPER", self.fake),
                         mock.patch.object(server, "TASK_FILE", "/nonexistent/wait-test-task.json"),
                         mock.patch.object(server, "TASK_BINDINGS", {}),

@@ -25,10 +25,10 @@ struct RequestParameters: Sendable {
                       Set(values.keys).isSubset(of: ["action", "appHandle", "windowId", "durationSeconds", "source", "waitForFrame"]) else {
                     throw Self.invalid("hold 需要 appHandle、windowId，可选 durationSeconds 与 source")
                 }
-            case "release", "status":
+            case "release", "status", "renew":
                 guard Set(values.keys) == ["action"] else { throw Self.invalid("release/status 仅接受 action") }
             default:
-                throw Self.invalid("preview action 必须为 hold、release 或 status")
+                throw Self.invalid("preview action 必须为 hold、release、status 或 renew")
             }
         }
         if request.method == "powerGuard" {

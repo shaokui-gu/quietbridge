@@ -25,6 +25,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import uuid
 
 LABEL = 'com.workbuddy.cua.menubar'
 APP = Path('/Applications/Workbuddy CUA.app')
@@ -89,11 +90,12 @@ def owned(entry, home):
     if not isinstance(entry, dict) or not isinstance(entry.get('args'), list):
         return False
     runtime = home / 'Library/Application Support/workbuddy-cua/releases'
+    connector = home / 'Library/Application Support/workbuddy-cua/connector/connector.py'
     for arg in entry['args']:
         if not isinstance(arg, str):
             continue
         path = Path(arg)
-        if (path in (APP / 'Contents/Resources/bridge/server.py',
+        if (path == connector or path in (APP / 'Contents/Resources/bridge/server.py',
                      LEGACY_APP / 'Contents/Resources/bridge/server.py') or
                 (path.name == 'server.py' and runtime in path.parents)):
             return True
@@ -107,7 +109,7 @@ def owned(entry, home):
     return False
 
 
-def config_plan(home, bridge, helper):
+def config_plan(home, bridge, helper, stable=False):
     config = checked(home / '.workbuddy/mcp.json')
     original = read(config)
     data = json.loads(original) if original is not None else {}
@@ -123,7 +125,12 @@ def config_plan(home, bridge, helper):
     if not isinstance(entry.get('env', {}), dict):
         raise ValueError('现有连接 env 格式错误；未修改')
     env = dict(entry.get('env', {}))
-    env['CUA_HELPER_PATH'] = str(helper)
+    if stable:
+        # The active manifest owns the helper version; keep the transport hash
+        # fixed across upgrades so the host retains trust and enabled state.
+        env.pop('CUA_HELPER_PATH', None)
+    else:
+        env['CUA_HELPER_PATH'] = str(helper)
     entry.update(command=sys.executable, args=['-B', str(bridge)], env=env)
     servers[key] = entry
     return config, original, (json.dumps(data, ensure_ascii=False, indent=2) + '\n').encode()
@@ -247,6 +254,40 @@ class MenuBarService:
         self.name = self.domain + '/' + LABEL
         self.agent = home / 'Library/LaunchAgents' / (LABEL + '.plist')
 
+    def is_running(self):
+        connection = http.client.HTTPConnection('127.0.0.1', 47631, timeout=0.5)
+        try:
+            connection.request('GET', '/')
+            service = json.loads(connection.getresponse().read(8192)).get('_service', {})
+            pid = service.get('pid')
+            if type(pid) is not int or pid <= 0:
+                return False
+            owner = subprocess.run(['/bin/ps', '-p', str(pid), '-o', 'uid='], capture_output=True, text=True)
+            command = subprocess.run(['/bin/ps', '-p', str(pid), '-o', 'command='], capture_output=True, text=True)
+            return self.owns_process(Path(service.get('executable', '')), owner.stdout.strip(), command.stdout.strip())
+        except (OSError, ValueError, http.client.HTTPException):
+            return False
+        finally:
+            connection.close()
+
+    def owns_process(self, executable, owner, arguments):
+        if owner != str(os.getuid()):
+            return False
+        system_binaries = {app / 'Contents/MacOS/workbuddy-cua-native' for app in (APP, LEGACY_APP)}
+        releases = self.agent.parents[1] / 'Application Support/workbuddy-cua/releases'
+        if executable in system_binaries:
+            # proc_pidpath follows the renamed bundle, while argv retains the
+            # path used at launch. Only these two system paths are aliases.
+            launch_paths = system_binaries
+        elif (executable.parent.name == 'MacOS' and executable.parent.parent.name == 'Contents'
+              and executable.name == 'workbuddy-cua-native' and releases in executable.parents):
+            launch_paths = {executable}
+        else:
+            return False
+        return any(arguments in (str(path), str(path) + ' --menubar') or
+                   re.fullmatch(re.escape(str(path)) + r' -psn_[0-9_]+', arguments)
+                   for path in launch_paths)
+
     def stop(self):
         status = subprocess.run(['/bin/launchctl', 'print', self.name], capture_output=True)
         if status.returncode == 0:
@@ -270,15 +311,7 @@ class MenuBarService:
             command = subprocess.run(['/bin/ps', '-p', text, '-o', 'command='], capture_output=True, text=True)
             if not owner.stdout.strip() or not command.stdout.strip():
                 continue  # The old process exited between lsof and ps.
-            args = command.stdout.strip()
-            releases = self.agent.parents[1] / 'Application Support/workbuddy-cua/releases'
-            known_arguments = (args in (str(executable), str(executable) + ' --menubar') or
-                               re.fullmatch(re.escape(str(executable)) + r' -psn_[0-9_]+', args))
-            if (owner.stdout.strip() != str(os.getuid()) or
-                    not (executable in (APP / 'Contents/MacOS/workbuddy-cua-native',
-                                        LEGACY_APP / 'Contents/MacOS/workbuddy-cua-native') or
-                         releases in executable.parents) or
-                    not known_arguments):
+            if not self.owns_process(executable, owner.stdout.strip(), command.stdout.strip()):
                 raise RuntimeError('状态端口被其他程序占用；未终止该进程')
             try:
                 os.kill(pid, signal.SIGTERM)
@@ -322,6 +355,80 @@ class MenuBarService:
 def verify_code(app, identifier):
     requirement = '=anchor apple generic and identifier "' + identifier + '" and certificate leaf[subject.OU] = "' + TEAM + '"'
     subprocess.run(['/usr/bin/codesign', '--verify', '--strict', '-R', requirement, str(app)], check=True, capture_output=True)
+
+
+def user_processes():
+    """Read only PID/UID and executable paths; never dump host arguments/env."""
+    result = subprocess.run(['/bin/ps', '-axo', 'pid=,uid='], capture_output=True, text=True, check=True)
+    library = ctypes.CDLL('/usr/lib/libproc.dylib')
+    processes = []
+    for line in result.stdout.splitlines():
+        fields = line.split()
+        if len(fields) != 2 or not all(field.isdigit() for field in fields):
+            continue
+        pid, uid = map(int, fields)
+        if uid != os.getuid() or pid == os.getpid():
+            continue
+        path = ctypes.create_string_buffer(4096)
+        if library.proc_pidpath(pid, path, len(path)) > 0:
+            processes.append((pid, Path(os.fsdecode(path.value))))
+    return processes
+
+
+def legacy_bridges(home):
+    """A rewritten mcp.json does not replace a host's cached live transport."""
+    releases = home / 'Library/Application Support/workbuddy-cua/releases'
+    found = []
+    for pid, executable in user_processes():
+        if not executable.name.lower().startswith('python'):
+            continue
+        result = subprocess.run(['/bin/ps', '-p', str(pid), '-o', 'command='], capture_output=True, text=True)
+        command = result.stdout.strip()
+        for separator in (' -B ', ' '):
+            prefix = str(executable) + separator
+            if not command.startswith(prefix):
+                continue
+            script = Path(command[len(prefix):])
+            if (script.parts[-4:] == ('Contents', 'Resources', 'bridge', 'server.py') and
+                    (releases in script.parents or script in (
+                        APP / 'Contents/Resources/bridge/server.py', LEGACY_APP / 'Contents/Resources/bridge/server.py'))):
+                verify_code(script.parents[3], LABEL)
+                found.append({'pid': pid, 'bridge': str(script)})
+                break
+    return found
+
+
+def retire_previous_helpers(helper, build):
+    """Upgrade only CUA workers; never signal Workbuddy or a target application."""
+    candidates = []
+    verified = set()
+    for pid, executable in user_processes():
+        if executable == helper or PUBLIC not in executable.parents or executable.parts[-3:] != (
+                'Contents', 'MacOS', 'workbuddy-cua-native'):
+            continue
+        app = checked(executable.parents[2])
+        info = plistlib.loads((app / 'Contents/Info.plist').read_bytes())
+        if (info.get('CFBundleIdentifier') != 'com.workbuddy.cua.helper' or
+                not str(info.get('CFBundleVersion', '')).isdigit() or int(info['CFBundleVersion']) >= int(build)):
+            continue
+        if app not in verified:
+            verify_code(app, 'com.workbuddy.cua.helper')
+            verified.add(app)
+        candidates.append((pid, executable))
+    def alive(identity):
+        return identity in user_processes()  # Revalidate UID/path before each signal.
+    for identity in candidates:
+        if alive(identity):
+            try: os.kill(identity[0], signal.SIGTERM)
+            except ProcessLookupError: pass
+    until = time.monotonic() + 3
+    while any(alive(identity) for identity in candidates) and time.monotonic() < until:
+        time.sleep(0.1)
+    for identity in candidates:
+        if alive(identity):
+            try: os.kill(identity[0], signal.SIGKILL)
+            except ProcessLookupError: pass
+    return [pid for pid, _ in candidates]
 
 
 def handshake(bridge, helper):
@@ -372,7 +479,8 @@ def deploy(home, helper, app=APP, support=SUPPORT, service=None):
     verify_code(menu_app, LABEL)
     binary = menu_app / 'Contents/MacOS/workbuddy-cua-native'
     bridge = menu_app / 'Contents/Resources/bridge/server.py'
-    config, original, rendered = config_plan(home, bridge, helper)
+    connector = checked(runtime / 'connector/connector.py')
+    config, original, rendered = config_plan(home, connector, helper, stable=True)
     handshake(bridge, helper)
     extension = checked(runtime / 'extension/extension-stage')
     sys.path.insert(0, str(release / 'extension'))
@@ -388,7 +496,14 @@ def deploy(home, helper, app=APP, support=SUPPORT, service=None):
                 value.get('allowed_origins') != plan['manifest']['allowed_origins'] or
                 Path(value.get('path', '')) != Path(plan['launcherPath'])):
             raise ValueError('原生宿主注册被其他组件占用；未覆盖')
-    files = [(config, original, rendered, 0o600)]
+    manifest = connector.with_name('active.json')
+    generation = str(uuid.uuid4())
+    active = json.dumps({'generation': generation, 'bridge': str(bridge), 'helper': str(helper),
+                         'version': menu_info['CFBundleShortVersionString']}).encode()
+    files = [(config, original, rendered, 0o600),
+             (connector, read(connector), (bridge.parent / 'connector.py').read_bytes(), 0o600),
+             (connector.with_name('stdio_transport.py'), read(connector.with_name('stdio_transport.py')),
+              (bridge.parent / 'stdio_transport.py').read_bytes(), 0o600)]
     for source, target in ((release / 'extension/native_host.py', Path(plan['hostPath'])),
                            (release / 'extension/browser_events.py', Path(plan['bridgePath']))):
         files.append((target, read(target), source.read_bytes(), 0o600))
@@ -403,6 +518,8 @@ def deploy(home, helper, app=APP, support=SUPPORT, service=None):
                                'RunAtLoad': False, 'KeepAlive': False, 'ProcessType': 'Interactive',
                                'LimitLoadToSessionType': 'Aqua'})
     files.append((agent, old_agent, agent_data, 0o644))
+    # Publish last: a running connector only sees a fully committed file set.
+    files.append((manifest, read(manifest), active, 0o600))
     # Create the runtime state directory expected by the native host.
     checked(plan['statePath']).mkdir(parents=True, exist_ok=True, mode=0o700)
     transactions = runtime / 'transactions'
@@ -410,11 +527,15 @@ def deploy(home, helper, app=APP, support=SUPPORT, service=None):
     directory = Path(tempfile.mkdtemp(prefix=datetime.datetime.now().strftime('%Y%m%d-%H%M%S-'), dir=transactions))
     transaction = Transaction(directory, files, extension, release / 'extension')
     service = service or MenuBarService(home)
+    was_running = service.is_running()
     stopped = False
     try:
         stopped = True
         service.stop()
         transaction.apply()
+        if was_running:
+            service.start()
+            service.wait_ready(binary, menu_info)
         transaction.values['phase'] = 'committed'
         transaction.save()
     except Exception as error:
@@ -428,15 +549,67 @@ def deploy(home, helper, app=APP, support=SUPPORT, service=None):
             transaction.rollback()
         except Exception as failure:
             recovery_errors.append(str(failure))
-        if stopped and old_agent is not None and not recovery_errors:
+        if stopped and was_running and old_agent is not None and not recovery_errors:
             try:
                 service.start()
             except Exception as failure:
                 recovery_errors.append(str(failure))
         raise RuntimeError(str(error) + '\n用户文件恢复结果: ' + ('；'.join(recovery_errors) or '已恢复') +
                            '\n安装记录: ' + str(transaction.journal)) from error
-    return {'installed': True, 'version': plistlib.loads((menu_app / 'Contents/Info.plist').read_bytes())['CFBundleShortVersionString'],
-            'helper': str(helper), 'journal': str(transaction.journal), 'startupVerified': False}
+    cleanup = {}
+    try:
+        cleanup['retiredHelperPids'] = retire_previous_helpers(helper, menu_info['CFBundleVersion'])
+        running_legacy = legacy_bridges(home)
+    except (OSError, ValueError, subprocess.SubprocessError) as error:
+        cleanup['error'] = type(error).__name__
+        running_legacy = None
+    transaction.values['legacyCleanup'] = cleanup
+    previous_servers = json.loads(original).get('mcpServers', {}) if original else {}
+    previous_entry = next((v for k, v in previous_servers.items() if k in ('workbuddy-cua', 'cua') and owned(v, home)), None)
+    stable_before = previous_entry is not None and str(connector) in previous_entry.get('args', [])
+    connection = {'state': 'pending_connection' if stable_before else
+                  'host_refresh_required' if previous_entry else 'first_install',
+                  'automaticUpdates': True}
+    if running_legacy:
+        connection.update(state='host_refresh_required', legacyBridgePids=[item['pid'] for item in running_legacy])
+    elif running_legacy is None:
+        connection['state'] = 'verification_unavailable'
+    if connection['state'] == 'host_refresh_required':
+        connection['message'] = ('Workbuddy 仍缓存旧连接的启动命令，普通重连不会重新读取配置。'
+                                 '请保存当前工作后完整退出并重新打开 Workbuddy，再连接 workbuddy-cua；'
+                                 '迁移到固定入口后，后续覆盖安装和升级自动加载新版。')
+    if stable_before and connection['state'] == 'pending_connection':
+        until = time.monotonic() + 8
+        while time.monotonic() < until:
+            try:
+                raw = read(connector.with_name('status.json'))
+                status = json.loads(raw) if raw else {}
+                if not isinstance(status, dict):
+                    raise ValueError('连接器状态格式错误')
+            except (OSError, ValueError):
+                # Runtime acknowledgment is advisory after the file transaction
+                # commits. A malformed/stale status file must not fail a PKG
+                # whose verified components have already installed successfully.
+                connection['state'] = 'verification_unavailable'
+                break
+            if status.get('generation') == generation and status.get('state') == 'ready':
+                connection['state'] = 'reloaded'
+                break
+            # No connected host: do not launch a new connector behind its back.
+            if not raw:
+                break
+            if type(status.get('pid')) is not int or status['pid'] <= 0:
+                break
+            try:
+                os.kill(status['pid'], 0)
+            except (ProcessLookupError, PermissionError):
+                break
+            time.sleep(0.2)
+    transaction.values['connectorUpdate'] = connection
+    transaction.save()
+    return {'installed': True, 'version': menu_info['CFBundleShortVersionString'],
+            'helper': str(helper), 'journal': str(transaction.journal), 'startupVerified': was_running,
+            'connectorUpdate': connection}
 
 
 def main():

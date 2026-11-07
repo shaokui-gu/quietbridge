@@ -8,12 +8,17 @@ import server
 
 
 class CapabilityControlTests(unittest.TestCase):
-    def test_missing_menu_bar_keeps_existing_behavior(self):
+    def test_missing_menu_bar_disables_every_tool_without_starting_helpers(self):
         # Isolate from a menu bar that may actually be running on this machine.
         with mock.patch.object(server.urllib.request, "urlopen",
                                side_effect=OSError("connection refused")):
             self.assertIsNone(server.control_snapshot())
-        self.assertIsNone(server.capability_block("cua_click", {}, {}))
+        for name in server.TOOL_MAP:
+            with self.subTest(tool=name), mock.patch.object(server, 'control_snapshot', return_value=None), \
+                    mock.patch.object(server, 'task_guard') as guard:
+                result = server._call_tool(name, {})
+                self.assertEqual(result['errorCode'], 'APP_NOT_RUNNING')
+                guard.assert_not_called()
 
     def test_switch_blocks_only_its_capability(self):
         switches = {"master": True, "native_input": False, "native_observe": True}
@@ -42,7 +47,7 @@ class CapabilityControlTests(unittest.TestCase):
 
     def test_new_power_lease_records_locked_use_but_renewal_does_not(self):
         server.POWER_GUARD.update(active=False, nextRenewAt=0)
-        with mock.patch.object(server, "control_snapshot", return_value={"locked_use": False}), \
+        with mock.patch.object(server, "control_snapshot", return_value={"master": True, "locked_use": False}), \
                 mock.patch.object(server, "call_helper", return_value={"guard": {"holding": True}}) as helper:
             server.hold_power_guard()
             self.assertIs(helper.call_args.args[1]["lockedUse"], False)

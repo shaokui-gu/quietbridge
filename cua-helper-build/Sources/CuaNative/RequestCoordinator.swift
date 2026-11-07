@@ -28,12 +28,17 @@ import Darwin
     private var replying = false
     private var nextFrame: Data?
     private var nextCancelled = false
+    private let clientID: UUID
+    private let resourceLease: TaskResourceLease
 
     init(configuration: HelperConfiguration, capture: WindowCapture, channel: SharedSocket,
-         cancellation: CancellationLatch, scheduler: RequestScheduler, writer: JSONLWriter, permissions: SystemPermissions,
+         cancellation: CancellationLatch, clientID: UUID, resourceLease: TaskResourceLease,
+         scheduler: RequestScheduler, writer: JSONLWriter, permissions: SystemPermissions,
          onClose: @escaping @MainActor @Sendable () -> Void,
          onFatal: @escaping @Sendable (NativeFailure, Double) -> Void) {
         self.configuration = configuration
+        self.clientID = clientID
+        self.resourceLease = resourceLease
         self.capture = capture
         self.permissions = permissions
         self.cancellation = cancellation
@@ -179,6 +184,10 @@ import Darwin
     private func execute(_ request: NativeRequest, trace: ScreenshotTrace?) async throws -> JSONValue {
         let params = try RequestParameters(request)
         try cancellation.check()
+        let taskOperation = ["getState", "visualState", "screenshot", "click", "hover", "scroll", "drag",
+                             "setValue", "typeText", "paste", "pressKey", "selectText", "performSecondaryAction"].contains(request.method)
+        if taskOperation { try resourceLease.require(clientID); resourceLease.touch(clientID) }
+        defer { if taskOperation { resourceLease.touch(clientID) } }
         if request.method == "screenshot" { try capture.requireAvailable() }
         let requiresCatalog = ["getApp", "listApps", "findApps", "typeText", "pressKey"].contains(request.method)
         let catalog = requiresCatalog ? ApplicationCatalog.snapshot() : ApplicationCatalogSnapshot(applications: [], frontPID: nil)
@@ -219,6 +228,7 @@ import Darwin
             }
             trace?.mark("worker.begin")
             let outcome = try await worker.execute(request.method, params: params, catalog: catalog, installed: installed, trace: trace)
+            try cancellation.check()
             trace?.mark("worker.end")
             switch outcome {
             case .result(let value):
@@ -229,12 +239,17 @@ import Darwin
                 } else { result = value }
             case .capture(let target):
                 let previewPID = target.process.pid, previewWindow = target.window.windowID
-                Task { @MainActor in SpacePreview.shared.track(pid: previewPID, windowID: previewWindow) }
+                try cancellation.check()
+                try resourceLease.acquire(clientID, resource: .preview)
+                SpacePreview.shared.track(pid: previewPID, windowID: previewWindow)
                 let image = try await capture.capture(target, cancellation: cancellation, trace: trace)
                 result = try await worker.finishCapture(target, image: image, trace: trace)
             case .visual(let target):
+                try resourceLease.acquire(clientID, resource: .preview)
                 let frame = try await visualCapture.capture(target)
                 result = try await worker.finishVisual(target, frame: frame)
+                try cancellation.check()
+                try resourceLease.require(clientID)
                 SpacePreview.shared.track(pid: target.process.pid, windowID: target.window.windowID)
             case .foreground(let plan): result = try await performForeground(plan, requestID: request.id)
             case .hover(let route, let point):
@@ -256,7 +271,7 @@ import Darwin
     }
 
     /// Start, stop or inspect the floating share panel without dispatching input.
-    /// The lease belongs to the UI task, so it survives client reconnects and idle gaps.
+    /// Resources belong to this socket and a bounded activity lease.
     private func previewControl(_ params: RequestParameters) async throws -> JSONValue {
         let action = try params.string("action")
         switch action {
@@ -277,6 +292,7 @@ import Darwin
             guard let source = PreviewSource(rawValue: rawSource) else {
                 throw RequestParameters.invalid("source 必须为 application、desktop 或 window")
             }
+            try resourceLease.acquire(clientID, resource: .preview)
             SpacePreview.shared.track(pid: target.pid, windowID: target.windowID, source: source)
             let granted = SpacePreview.shared.hold(seconds: seconds)
             // Browser CDP input is independent of native video availability.
@@ -291,8 +307,12 @@ import Darwin
                             "durationSeconds": .number(granted),
                             "preview": previewDiagnostics()])
         case "release":
-            SpacePreview.shared.release()
+            if resourceLease.release(clientID, resource: .preview) { SpacePreview.shared.release() }
             return .object(["action": .string("release"), "preview": previewDiagnostics()])
+        case "renew":
+            try resourceLease.require(clientID)
+            resourceLease.touch(clientID)
+            return .object(["action": .string("renew"), "preview": previewDiagnostics()])
         default:
             return .object(["action": .string("status"), "preview": previewDiagnostics()])
         }
@@ -343,6 +363,7 @@ import Darwin
         let action = try params.string("action")
         switch action {
         case "unlock", "unlockInspect":
+            try resourceLease.require(clientID)
             // AX traversal blocks for up to the messaging timeout per element;
             // never run it on the main actor that also drives the shield.
             let inspectOnly = action == "unlockInspect"
@@ -363,6 +384,7 @@ import Darwin
                 "privacy": TaskPrivacyController.shared.status(),
             ])
         case "lockSynthetic":
+            try resourceLease.require(clientID)
             // Diagnostic: lock the session with a synthetic shortcut so the
             // guardian's hardware-input takeover stays out of the picture.
             return .object([
@@ -377,7 +399,9 @@ import Darwin
                 throw RequestParameters.invalid("durationSeconds 必须在 \(Int(PowerGuard.minimumSeconds))...\(Int(PowerGuard.maximumSeconds)) 之间")
             }
             let lockedUse = try params.optionalBoolean("lockedUse") ?? true
+            try resourceLease.acquire(clientID, resource: .protection)
             guard TaskPrivacyController.shared.hold(seconds: seconds, lockedUse: lockedUse) else {
+                resourceLease.release(clientID, resource: .protection)
                 throw NativeFailure(code: "MANUAL_AUTHENTICATION_REQUIRED", message: "用户已接管；先结束当前任务，再显式绑定新任务")
             }
             var guardStatus: JSONValue
@@ -396,10 +420,11 @@ import Darwin
                 "privacy": TaskPrivacyController.shared.status(),
             ])
         case "release":
-            TaskPrivacyController.shared.release()
+            let released = resourceLease.release(clientID, resource: .protection)
+            if released { TaskPrivacyController.shared.release() }
             return .object([
                 "action": .string("release"),
-                "guard": PowerGuard.shared.release(),
+                "guard": released ? PowerGuard.shared.release() : PowerGuard.shared.status(),
                 "privacy": TaskPrivacyController.shared.status(),
             ])
         default:
@@ -435,6 +460,10 @@ import Darwin
         shutdown()
     }
     func close() { shutdown() }
+
+    func cancelTaskResources() {
+        cancelRequest(NativeFailure(code: "TASK_INTERRUPTED", message: "任务连接断开或空闲租约过期"))
+    }
 
     private func shutdown() {
         guard !stopping else { return }

@@ -229,6 +229,7 @@ final class SharedSocket: @unchecked Sendable {
 
 enum SharedHelperLauncher {
     static func ensure(_ options: SharedHelperOptions, publishReady: Bool = true) throws {
+        guard ApplicationSession.current(in: options.directory) != nil else { throw ApplicationSession.unavailable }
         try options.prepareDirectory()
         if let lock = try SharedHelperLock(path: options.versionLockPath) {
             // The serving process acquires its own lock after exec.

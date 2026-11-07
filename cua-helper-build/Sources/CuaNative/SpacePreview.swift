@@ -72,6 +72,9 @@ final class SpacePreview {
     private var stream: SCStream?
     private var streamOutput: PreviewStreamOutput?
     private var generation = UUID()
+    // Capture streams can restart while the requested target and scope stay fixed.
+    // A first-frame waiter follows those restarts, but never follows a new lease.
+    private var leaseGeneration = UUID()
     private var streamStarting = false
     private var streamStarted = false
     private var streamError: String?
@@ -152,33 +155,39 @@ final class SpacePreview {
 
     /// 复用同一条流等待真实首帧，不重启捕获，也不操作目标窗口。
     func waitUntilReady(checkCancellation: () throws -> Void) async throws {
-        let token = generation
+        let token = leaseGeneration
         var succeeded = false
         defer {
             // 只清理本次等待的失败流，不能关闭重入请求已建立的新共享。
-            if !succeeded, generation == token, !waitingForTargetDesktop { stop() }
+            if !succeeded, leaseGeneration == token, !waitingForTargetDesktop { stop() }
         }
         let deadline = ProcessInfo.processInfo.systemUptime + 3
+        func failure(_ reason: String, _ message: String) -> NativeFailure {
+            OperationTrace.current?.mark("preview.wait_failed", fields: ["reason": .string(reason)])
+            return NativeFailure(code: "SHARE_NOT_READY", message: message)
+        }
         while true {
             try checkCancellation()
             try Task.checkCancellation()
-            guard generation == token, target != nil,
-                  NativePlatform.sessionLocked() == false, CGPreflightScreenCaptureAccess() else {
-                throw NativeFailure(code: "SHARE_NOT_READY", message: "共享目标、屏幕录制授权或解锁状态已不可用")
+            guard leaseGeneration == token, target != nil else {
+                throw failure("lease_changed", "共享目标已停止或改变")
+            }
+            guard NativePlatform.sessionLocked() == false, CGPreflightScreenCaptureAccess() else {
+                throw failure("access_unavailable", "共享的屏幕录制授权或解锁状态已不可用")
             }
             if streamReady {
                 guard let target,
                       NativePlatform.windows().contains(where: { $0.pid == target.pid && $0.windowID == target.windowID }) else {
-                    throw NativeFailure(code: "SHARE_NOT_READY", message: "共享就绪前目标进程或窗口已不可用")
+                    throw failure("target_unavailable", "共享就绪前目标进程或窗口已不可用")
                 }
                 succeeded = true
                 return
             }
             if let streamError {
-                throw NativeFailure(code: "SHARE_NOT_READY", message: "共享未就绪：\(streamError)")
+                throw failure("stream_error", "共享未就绪：\(streamError)")
             }
             guard ProcessInfo.processInfo.systemUptime < deadline else {
-                throw NativeFailure(code: "SHARE_NOT_READY", message: "共享在 3 秒内未完成启动并收到首帧")
+                throw failure("first_frame_timeout", "共享在 3 秒内未完成启动并收到首帧")
             }
             try await Task.sleep(for: .milliseconds(25))
         }
@@ -210,6 +219,7 @@ final class SpacePreview {
 
     /// Stop tracking without ending an active share lease (for example when switching targets).
     private func teardown() {
+        leaseGeneration = UUID()
         timer?.invalidate()
         timer = nil
         if let workspaceObserver { NSWorkspace.shared.notificationCenter.removeObserver(workspaceObserver) }

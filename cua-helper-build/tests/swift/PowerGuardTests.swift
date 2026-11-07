@@ -14,7 +14,12 @@ struct PowerGuardTests {
         try process.run()
         let data = pipe.fileHandleForReading.readDataToEndOfFile()
         process.waitUntilExit()
-        return String(decoding: data, as: UTF8.self)
+        // An installed CUA service may legitimately hold its own assertion.
+        // Verify only assertions created by this isolated test process.
+        let prefix = "pid \(ProcessInfo.processInfo.processIdentifier)("
+        return String(decoding: data, as: UTF8.self).split(separator: "\n")
+            .filter { $0.trimmingCharacters(in: .whitespaces).hasPrefix(prefix) }
+            .joined(separator: "\n")
     }
 
     @Test func holdsAndReleasesVisiblyInSystemPowerState() throws {

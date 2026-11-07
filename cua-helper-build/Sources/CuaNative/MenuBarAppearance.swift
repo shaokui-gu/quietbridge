@@ -164,22 +164,25 @@ enum MenuBarTheme {
 }
 
 @MainActor final class MenuBarNavigationRow: NSButton {
-    private let icon = MenuBarPanelView.icon("browser")
-    private let label = MenuBarPanelView.label("浏览器任务", size: 13, weight: .medium)
+    private let icon: NSImageView
+    private let label: NSTextField
+    let badge = MenuBarPanelView.label("", size: 10, color: MenuBarTheme.warning)
     private let arrow = NSImageView()
     var isHovered = false { didSet { if isHovered != oldValue { needsDisplay = true } } }
     var selected = false { didSet { needsDisplay = true; updateColors() } }
     override var isFlipped: Bool { true }
 
-    init() {
+    init(title: String = "浏览器任务", iconName: String = "browser") {
+        icon = MenuBarPanelView.icon(iconName)
+        label = MenuBarPanelView.label(title, size: 13, weight: .medium)
         super.init(frame: .zero)
-        title = ""; isBordered = false; focusRingType = .exterior
-        setAccessibilityLabel("浏览器任务")
-        setAccessibilityHelp("打开浏览器任务详情")
+        self.title = ""; isBordered = false; focusRingType = .exterior
+        setAccessibilityLabel(title)
+        setAccessibilityHelp("打开\(title)详情")
         arrow.image = NSImage(systemSymbolName: "chevron.right", accessibilityDescription: nil)
         arrow.imageScaling = .scaleProportionallyUpOrDown
         arrow.setAccessibilityElement(false)
-        addSubview(icon); addSubview(label); addSubview(arrow)
+        addSubview(icon); addSubview(label); addSubview(arrow); addSubview(badge)
         updateColors()
     }
     required init?(coder: NSCoder) { nil }
@@ -193,6 +196,8 @@ enum MenuBarTheme {
         icon.frame = NSRect(x: 12, y: (bounds.height - 18) / 2, width: 18, height: 18)
         label.frame = NSRect(x: 42, y: (bounds.height - 20) / 2, width: max(0, bounds.width - 76), height: 20)
         arrow.frame = NSRect(x: bounds.width - 24, y: (bounds.height - 12) / 2, width: 12, height: 12)
+        badge.frame = NSRect(x: bounds.width - 94, y: (bounds.height - 17) / 2, width: 62, height: 17)
+        badge.alignment = .right
     }
     override func hitTest(_ point: NSPoint) -> NSView? {
         isHidden || !bounds.contains(convert(point, from: superview)) ? nil : self
@@ -210,12 +215,13 @@ enum MenuBarTheme {
 }
 
 @MainActor final class MenuBarPanelView: MenuBarCard {
-    static let panelSize = NSSize(width: 360, height: 720)
+    static let panelSize = NSSize(width: 360, height: 750)
     private(set) var rows: [String: MenuBarSwitchRow] = [:]
     let installButton = NSButton(title: "安装…", target: nil, action: nil)
     let manageButton = NSButton(title: "管理…", target: nil, action: nil)
-    let quitButton = NSButton(title: "退出菜单栏", target: nil, action: nil)
+    let quitButton = NSButton(title: "退出应用", target: nil, action: nil)
     let browserButton = MenuBarNavigationRow()
+    let permissionsButton = MenuBarNavigationRow(title: "系统权限", iconName: "lock")
     private let pluginCard = MenuBarPluginCard()
     private let pluginDetails = NSView()
     private let pluginRow: MenuBarSwitchRow
@@ -228,7 +234,7 @@ enum MenuBarTheme {
         fill = MenuBarTheme.window
         radius = 22
         bordered = true
-        setAccessibilityLabel("WorkBuddy 电脑控制助手")
+        setAccessibilityLabel("Workbuddy CUA 电脑控制助手")
         let stack = NSStackView()
         stack.orientation = .vertical
         stack.alignment = .leading
@@ -253,7 +259,7 @@ enum MenuBarTheme {
         symbol.frame = NSRect(x: 9, y: 9, width: 18, height: 18)
         mark.addSubview(symbol)
         heading.addSubview(mark)
-        let name = Self.label("WorkBuddy", size: 18, weight: .medium)
+        let name = Self.label("Workbuddy CUA", size: 18, weight: .medium)
         name.frame = NSRect(x: 52, y: 17, width: 260, height: 26)
         let subtitle = Self.label("电脑控制助手", size: 11, color: MenuBarTheme.secondary)
         subtitle.frame = NSRect(x: 52, y: 0, width: 260, height: 17)
@@ -282,7 +288,13 @@ enum MenuBarTheme {
         append(section("电脑控制", entries: controls), height: 205)
         append(section("辅助功能", entries: helpers), height: 121)
 
-        append(browserButton, height: 54)
+        let navigation = MenuBarCard()
+        navigation.fill = .clear
+        navigation.addSubview(browserButton)
+        navigation.addSubview(permissionsButton)
+        browserButton.frame = NSRect(x: 0, y: 0, width: 320, height: 42)
+        permissionsButton.frame = NSRect(x: 0, y: 42, width: 320, height: 42)
+        append(navigation, height: 84)
 
         pluginCard.addSubview(pluginDetails)
         pluginDetails.frame = NSRect(x: 12, y: 12, width: 296, height: 37)
@@ -323,13 +335,13 @@ enum MenuBarTheme {
         rows["locked_use"] = pluginRow
         append(pluginCard, height: 61)
 
-        append(Self.label("更改对新的调用生效，已开始的操作不受影响。", size: 10, color: MenuBarTheme.secondary), height: 17)
+        append(Self.label("未授权的能力保持关闭，打开时继续授权向导。", size: 10, color: MenuBarTheme.secondary), height: 17)
         let separator = MenuBarCard()
         separator.radius = 0
         separator.fill = MenuBarTheme.separator
         append(separator, height: 1)
         let footer = NSView()
-        let brand = Self.label("WorkBuddy CUA", size: 10, color: MenuBarTheme.tertiary)
+        let brand = Self.label("Workbuddy CUA", size: 10, color: MenuBarTheme.tertiary)
         brand.frame = NSRect(x: 0, y: 0, width: 150, height: 17)
         footer.addSubview(brand)
         quitButton.frame = NSRect(x: 236, y: -3, width: 88, height: 23)
@@ -375,7 +387,7 @@ enum MenuBarTheme {
             let switches = rows.compactMap { key, row in
                 key != "master" && key != "locked_use" && row.isEnabled ? row : nil
             }
-            let controls: [NSView] = switches + [browserButton, pluginCard]
+            let controls: [NSView] = switches + [browserButton, permissionsButton, pluginCard]
             // AppKit can report visibleRect beyond a nonclipping view's bounds.
             // Intersect both so neighboring rows cannot share the hover target.
             target = controls.first { control in
@@ -388,6 +400,7 @@ enum MenuBarTheme {
             card.hoveredRow = row?.isDescendant(of: card) == true ? row : nil
         }
         browserButton.isHovered = target === browserButton
+        permissionsButton.isHovered = target === permissionsButton
         pluginCard.isHovered = target === pluginCard
     }
 
@@ -395,12 +408,21 @@ enum MenuBarTheme {
         refresh(preferences: preferences, pluginState: pluginAvailable ? .available : .missing)
     }
 
-    func refresh(preferences: [String: Bool], pluginState: MenuBarPluginState) {
+    func refresh(preferences: [String: Bool], pluginState: MenuBarPluginState, permissions: DesktopPermissionStatus? = nil) {
         let pluginAvailable = pluginState == .available
         let enabled = preferences["master"] == true
         for (key, row) in rows {
             row.update(value: preferences[key] == true, enabled: key == "master" || (enabled && (key != "locked_use" || pluginAvailable)))
         }
+        let subtitles = ["native_observe": "读取屏幕、窗口和应用", "native_input": "鼠标、键盘与文字输入",
+                         "preview": "显示操作中的实时画面", "locked_use": "允许在锁屏状态下继续使用"]
+        for (key, subtitle) in subtitles {
+            let missing = DesktopPermission.required(for: key).contains { permissions?.granted($0) != true }
+            rows[key]?.detail.stringValue = missing ? "需要授权 · 打开时查看引导" : subtitle
+            rows[key]?.setAccessibilityHelp(rows[key]?.detail.stringValue)
+        }
+        permissionsButton.badge.stringValue = permissions?.allGranted == true ? "已就绪" : "待授权"
+        permissionsButton.badge.textColor = permissions?.allGranted == true ? MenuBarTheme.success : MenuBarTheme.warning
         rows["master"]?.label.stringValue = enabled ? "已启用" : "已暂停"
         rows["master"]?.detail.stringValue = enabled ? "允许助手观察和操作这台 Mac" : "新的调用已暂停，正在执行的操作继续"
         pluginRow.isHidden = !pluginAvailable
@@ -412,9 +434,9 @@ enum MenuBarTheme {
         installButton.isEnabled = true
         // Keep keyboard navigation in visual order, including the alternate
         // install/switch controls; hidden controls never trap the focus.
-        let controls: [NSView] = CapabilitySwitches.keys.compactMap { key in
-            key == "locked_use" && !pluginAvailable ? installButton : rows[key]
-        } + (pluginAvailable ? [manageButton, browserButton, quitButton] : [browserButton, quitButton])
+        let controls: [NSView] = CapabilitySwitches.keys.filter { $0 != "locked_use" }.compactMap { rows[$0] }
+            + [browserButton, permissionsButton]
+            + (pluginAvailable ? [pluginRow, manageButton] : [installButton]) + [quitButton]
         for (index, control) in controls.enumerated() {
             control.nextKeyView = controls[(index + 1) % controls.count]
         }

@@ -143,6 +143,51 @@ test('content 采集页面错误与视口，且在未绑定时拒绝诊断', asy
   assert.equal(handlers.error, undefined, '停止后不应保留错误监听');
 });
 
+test('document scrolling works repeatedly while hidden and rejects stale snapshots', async () => {
+  let reset = false;
+  const root = { isConnected: true, scrollTop: 0, scrollHeight: 1800, clientHeight: 800, getClientRects: () => [{}],
+    scrollIntoView() { reset = true; this.scrollTop = 0; },
+    scrollBy({ top }) { this.scrollTop = Math.max(0, Math.min(1000, this.scrollTop + top)); } };
+  const context = {
+    location: { protocol: 'https:', origin: 'https://example.org', pathname: '/' },
+    document: { visibilityState: 'hidden', scrollingElement: root, body: root, readyState: 'complete',
+      getElementsByTagName: () => ({ length: 1 }), querySelectorAll: () => [] },
+    getComputedStyle: () => ({ display: 'block', visibility: 'visible', opacity: '1' }),
+    chrome: { runtime: { sendMessage: async () => {} } },
+    addEventListener() {}, removeEventListener() {}, setTimeout() { return 1; }, clearTimeout() {},
+    MutationObserver: class { observe() {} disconnect() {} }
+  };
+  root.ownerDocument = context.document;
+  context.document.defaultView = context;
+  vm.createContext(context);
+  vm.runInContext(await readFile(new URL('./content.js', import.meta.url), 'utf8'), context);
+  const config = { bindingId: 'a'.repeat(32), navigationEpoch: 1, authorizedOrigin: 'https://example.org', selector: '' };
+  context.__cuaObserver(config);
+  const snapshot = context.__cuaSnapshot(config);
+  const bound = { ...config, snapshotId: snapshot.snapshotId };
+  const boundary = context.__cuaScroll(bound, { deltaY: 6 });
+  assert.equal(boundary.verified, false);
+  assert.equal(boundary.observed.direction, 'up');
+  assert.equal(boundary.observed.outcome, 'at_boundary');
+  assert.equal(boundary.observed.maxY, 1000);
+  assert.equal(context.__cuaScroll(bound, { deltaY: -6 }).observed.afterY, 240);
+  assert.equal(context.__cuaScroll(bound, { deltaY: -6 }).observed.afterY, 480);
+  assert.equal(context.__cuaScroll(bound, { deltaY: 6 }).observed.afterY, 240);
+  assert.equal(reset, false, 'root scrolling must not reset the previous position');
+  assert.equal(context.__cuaScroll({ ...bound, snapshotId: 'old' }, { deltaY: -6 }).performed, false);
+  assert.equal(root.scrollTop, 240);
+  const scrollBy = root.scrollBy;
+  root.scrollBy = () => {};
+  const blocked = context.__cuaScroll(bound, { deltaY: -6 });
+  assert.equal(blocked.verified, false);
+  assert.equal(blocked.observed.atBoundary, false);
+  assert.equal(blocked.observed.outcome, 'no_movement');
+  assert.equal(blocked.observed.expectedY, 480);
+  root.scrollBy = scrollBy;
+  context.__cuaObserverStop();
+  assert.equal(context.__cuaScroll, undefined);
+});
+
 test('popup 只由按钮手势一次请求全站权限，无用户任务配对', async () => {
   const messages = [];
   const permissions = [];
@@ -211,7 +256,10 @@ test('popup 只由按钮手势一次请求全站权限，无用户任务配对',
 
 test('MV3 无静态站点授权、网页通信入口和自动内容注入', async () => {
   const m = JSON.parse(await readFile(new URL('./manifest.json', import.meta.url), 'utf8'));
-  assert.equal(m.name, 'workbuddy-cua Browser Extension');
+  assert.equal(m.name, 'Workbuddy CUA Browser Extension');
+  const popup = await readFile(new URL('./popup.html', import.meta.url), 'utf8');
+  assert.match(popup, /<title>Workbuddy CUA Browser Extension<\/title>/);
+  assert.match(popup, /class="brand-name">Workbuddy CUA<\/div>/);
   assert.equal(m.manifest_version, 3);
   assert.deepEqual(m.optional_host_permissions, ['http://*/*', 'https://*/*']);
   for (const key of ['host_permissions', 'externally_connectable', 'content_scripts']) assert.equal(key in m, false);

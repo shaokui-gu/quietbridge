@@ -60,13 +60,15 @@ async function refresh() {
   if (!permissionKnown) {
     [label, title, description, tone] = ['状态未知', '无法获取站点权限', '请刷新状态后重试。', 'warning'];
   } else if (!hasPermission) {
-    [label, title, description, tone] = ['待授权', '启用浏览器控制', '授权后，workbuddy-cua 才能接收并执行浏览器任务。', 'warning'];
+    [label, title, description, tone] = ['待授权', '启用浏览器控制', '授权后，Workbuddy CUA 才能接收并执行浏览器任务。', 'warning'];
   } else if (!enabled) {
     [label, title, description, tone] = ['已停用', '观察已停用', '站点权限仍然保留，可随时重新启用。', ''];
+  } else if (connection.status === 'application_stopped') {
+    [label, title, description, tone] = ['应用未运行', 'Workbuddy CUA 已退出', '请先打开 Workbuddy CUA，再使用浏览器控制。', 'warning'];
   } else if (syncing) {
     [label, title, description, tone] = ['连接中', '正在连接原生端', '正在同步扩展与本地应用的状态。', ''];
   } else if (!connected) {
-    [label, title, description, tone] = ['连接异常', '无法连接原生端', '请检查 workbuddy-cua 是否正在运行，然后刷新状态。', 'error-tone'];
+    [label, title, description, tone] = ['连接异常', '无法连接原生端', '请检查 Workbuddy CUA 是否正在运行，然后刷新状态。', 'error-tone'];
   } else if (assignment === 'paused') {
     [label, title, description, tone] = ['已暂停', '任务观察已暂停', '当前任务页面暂不可观察，请检查任务目标。', 'warning'];
   } else if (assignment === 'needs_target_selection') {

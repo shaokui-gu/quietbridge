@@ -34,7 +34,10 @@ class TaskWindowTests(unittest.TestCase):
         self.fake.connection_id = "connection-1"
         self.fake._alive.return_value = True
         self.fake.request.side_effect = self.request
+        owner = server.TaskOwner()
         for patcher in (mock.patch.object(server, "HELPER", self.fake),
+                        mock.patch.object(server, "TASK_OWNER", owner),
+                        mock.patch.object(server, 'control_snapshot', return_value={"master": True}),
                         mock.patch.object(server, "TASK_FILE", str(self.path)),
                         mock.patch.object(server, "SHOTS_DIR", str(self.shots)),
                         mock.patch.object(server, "TASK_BINDINGS", {}),
@@ -48,8 +51,14 @@ class TaskWindowTests(unittest.TestCase):
                         mock.patch.object(server.subprocess, "Popen", side_effect=AssertionError("禁止真实进程"))):
             patcher.start()
             self.addCleanup(patcher.stop)
+        self.addCleanup(owner.close)
 
     def request(self, method, params=None, **kwargs):
+        if method == "windowIdentity":
+            window = next((w for w in self.windows if w['windowId'] == params['windowId']), None)
+            if not window:
+                raise server.HelperError('WINDOW_UNAVAILABLE', 'fixture window closed')
+            return {'pid': 88, 'windowId': window['windowId'], 'processIdentity': copy.deepcopy(self.identity)}
         if method == "browserSession":
             if params["action"] == "attach":
                 session = {"sessionId": "native-%s" % len(self.sessions), "state": "attached",
@@ -193,13 +202,14 @@ class TaskWindowTests(unittest.TestCase):
         self.assertEqual(bound["mode"], "attached_existing")
         self.assertFalse(bound["newWindowCreated"])
         self.assertEqual(bound["processIdentity"], self.identity)
-        # 绑定的原生 attach 必须原样且只发一次；防睡眠断言是随后独立的尽力而为调用。
+        # 桌面窗口使用通用进程代际证明，不能进入 Chrome-only attach。
         attach = [c for c in self.fake.request.call_args_list if c.args[0] == "browserSession"]
-        self.assertEqual([c.args for c in attach], [("browserSession", {
-            "action": "attach", "pid": 88, "windowId": 7, "confirm": True})])
+        self.assertEqual(attach, [])
+        self.assertIn(("windowIdentity", {"appHandle": "a", "windowId": 7}),
+                      [c.args for c in self.fake.request.call_args_list])
         record = json.loads(self.path.read_text())["tasks"][bound["taskId"]]
         self.assertEqual(set(record), {"taskId", "state", "mode", "newWindowCreated", "pid",
-                                       "processIdentity", "windowId", "sessionId", "interactionMode"})
+                                       "processIdentity", "windowId", "interactionMode", "lease"})
         self.assertNotIn("appHandle", record)
         self.assertEqual(self.path.stat().st_mode & 0o777, 0o600)
 
@@ -240,7 +250,8 @@ class TaskWindowTests(unittest.TestCase):
     def test_native_invalidation_and_pid_generation_change(self):
         for change in ("state", "identity", "missing_window"):
             with self.subTest(change=change):
-                self.bind()
+                task = self.payload(action='begin')
+                self.payload(action='bind', taskId=task['taskId'], appHandle='a', windowId=7, confirm=True)
                 session = self.sessions[-1]
                 if change == "state":
                     session["state"] = "invalidated"
@@ -249,7 +260,32 @@ class TaskWindowTests(unittest.TestCase):
                 else:
                     session["windows"] = []
                 self.assertEqual(self.payload(action="status")["state"], "invalidated")
-                self.error("TASK_NOT_BOUND", "cua_click", windowId=7, x=1, y=2)
+                self.error("TASK_NOT_BOUND", "cua_state", windowId=7)
+
+    def test_desktop_binds_non_chrome_and_rejects_a_reused_process_generation(self):
+        self.state['apps']['a']['name'] = 'Calculator'
+        self.state['apps']['a']['bundleId'] = 'com.apple.calculator'
+        with mock.patch.object(server, 'ALLOWLIST', ['com.apple.calculator']):
+            bound = self.bind()
+            self.assertEqual(bound['state'], 'bound')
+            self.assertNotIn('sessionId', bound)
+            self.assertFalse(any(c.args[0] == 'browserSession' for c in self.fake.request.call_args_list))
+            self.assertEqual(self.payload(action='status')['state'], 'bound')
+            self.identity['startedSeconds'] = '101'
+            self.assertEqual(self.payload(action='status')['state'], 'invalidated')
+            self.assertFalse(server.POWER_GUARD['active'])
+            self.error('TASK_NOT_BOUND', 'cua_click', windowId=7, x=1, y=2)
+
+    def test_terminated_desktop_application_invalidates_and_releases_the_guard(self):
+        self.bind()
+        original = self.fake.request.side_effect
+        def gone(method, params=None, **kwargs):
+            if method == 'windowIdentity':
+                raise server.HelperError('APP_UNAVAILABLE', 'fixture process terminated')
+            return original(method, params, **kwargs)
+        self.fake.request.side_effect = gone
+        self.assertEqual(self.payload(action='status')['state'], 'invalidated')
+        self.assertFalse(server.POWER_GUARD['active'])
 
     def test_cross_connection_pauses_without_automatic_attach(self):
         self.bind()
@@ -328,7 +364,7 @@ class TaskWindowTests(unittest.TestCase):
         original = self.fake.request.side_effect
         def read(method, *args, **kwargs):
             result = original(method, *args, **kwargs)
-            if method == "listWindows":
+            if method == "windowIdentity":
                 self.fake.connection_id = "changed-during-check"
             return result
         self.fake.request.side_effect = read
@@ -436,7 +472,7 @@ class TaskWindowTests(unittest.TestCase):
             handler.assert_called_once_with({"action": "command", "taskId": bound["taskId"], "operation": "click", "ref": 1})
             self.fake.request.reset_mock()
             self.rpc(server._events_tool["name"], action="command", taskId=bound["taskId"], operation="snapshot")
-            self.assertFalse(any(c.args[0] == "preview" for c in self.fake.request.call_args_list))
+            self.assertFalse(any(c.args[0] == "preview" and c.args[1].get('action') == 'hold' for c in self.fake.request.call_args_list))
 
     def test_observation_share_failure_and_read_only_stop_before_ax(self):
         self.bind()
@@ -639,19 +675,63 @@ class TaskWindowTests(unittest.TestCase):
         self.assertEqual([c.args for c in self.fake.request.call_args_list if c.args[0] == "preview"],
                          [("preview", {"action": "release"})])
 
-    def test_share_falls_back_to_target_window_on_background_space(self):
-        calls = []
-        def request_share(app, window, source, duration):
-            calls.append(source)
-            return ('connection-1', {'streamReady': True, 'mode': source, 'trackingWindowId': window,
-                                     'scope': 'application_current_space' if source == 'application' else 'window',
-                                     'targetOnCurrentSpace': False if source == 'application' else None})
-        with mock.patch.object(server, 'request_share', side_effect=request_share), \
-                mock.patch.object(server, 'CALL_RECORDS', []), mock.patch.object(server, 'TASK_DISPATCH', None):
-            server.ensure_share('a', 7)
-            self.assertEqual(calls, ['application', 'window'])
-            self.assertEqual(server.SHARE_RECORD['source'], 'window')
-            self.assertIn('background_space', server.SHARE_RECORD['reason'])
+    def test_background_share_reuses_native_window_capture_across_observation_and_clicks(self):
+        self.bind()
+        original = self.request
+        on_current_space = False
+
+        def native_capture(method, params=None, **kwargs):
+            result = original(method, params, **kwargs)
+            if method == 'preview':
+                result['preview'].update(
+                    targetOnCurrentSpace=on_current_space,
+                    captureMode='application' if on_current_space else 'window',
+                    scope='application_current_space' if on_current_space else 'window')
+            return result
+
+        self.fake.request.side_effect = native_capture
+        for name, args in [('cua_state', {}), ('cua_click', {'x': 1, 'y': 2})] * 3:
+            self.fake.request.reset_mock()
+            result = self.rpc(name, windowId=7, **args)
+            self.assertFalse(result.get('isError'), result)
+            previews = [c.args[1] for c in self.fake.request.call_args_list if c.args[0] == 'preview']
+            self.assertEqual([p['source'] for p in previews], ['application'],
+                             'Native capture is already window-scoped; a second hold restarts the stream')
+            share = result['structuredContent']['share']
+            self.assertEqual(share['source'], 'window')
+            self.assertEqual(share['scope'], 'window')
+            self.assertEqual(share['requestedSource'], 'application')
+            self.assertIn('background_space', share['reason'])
+            self.assertEqual(server.SHARE_SELECTION['source'], 'application')
+            self.assertFalse(any(c.args[0] in ('activate', 'show') for c in self.fake.request.call_args_list))
+
+        # Returning to the current Space must still allow the requested application scope.
+        on_current_space = True
+        self.fake.request.reset_mock()
+        result = self.rpc('cua_state', windowId=7)
+        self.assertFalse(result.get('isError'), result)
+        self.assertEqual(result['structuredContent']['share']['source'], 'application')
+        self.assertEqual(result['structuredContent']['share']['scope'], 'application_current_space')
+        previews = [c.args[1] for c in self.fake.request.call_args_list if c.args[0] == 'preview']
+        self.assertEqual([p['source'] for p in previews], ['application'])
+
+    def test_unknown_space_reports_native_window_scope_without_restarting_capture(self):
+        original = self.request
+
+        def native_capture(method, params=None, **kwargs):
+            result = original(method, params, **kwargs)
+            if method == 'preview':
+                result['preview'].update(targetOnCurrentSpace=None, captureMode='window', scope='window')
+            return result
+
+        self.fake.request.side_effect = native_capture
+        server.ensure_share('a', 7)
+        previews = [c.args[1] for c in self.fake.request.call_args_list if c.args[0] == 'preview']
+        self.assertEqual([p['source'] for p in previews], ['application'])
+        self.assertEqual(server.SHARE_RECORD['source'], 'window')
+        self.assertEqual(server.SHARE_RECORD['requestedSource'], 'application')
+        self.assertIsNone(server.SHARE_RECORD['targetOnCurrentSpace'])
+        self.assertNotIn('background_space', server.SHARE_RECORD['reason'])
 
     def test_launch_waits_for_unique_window_and_never_guesses_multiple(self):
         with mock.patch.object(server, 'list_windows', side_effect=[[], [{'windowId': 5, 'pid': 8, 'isOnScreen': True, 'title': '主窗'}]]), \
@@ -752,11 +832,11 @@ class TaskWindowTests(unittest.TestCase):
     def test_wait_budget_includes_guard_and_preserves_target_on_every_poll(self):
         self.bind()
         self.fake.request.reset_mock()
-        now = [100.0]
+        now = [server.time.monotonic()]
         original = self.fake.request.side_effect
         waits = []
         def read(method, params=None, **kwargs):
-            if method in ("browserSession", "listWindows"):
+            if method == "windowIdentity":
                 now[0] += 1
             if method == "getState":
                 return {"windowId": 7, "appHandle": "a", "pid": 88, "snapshotId": "ax-1",
@@ -771,7 +851,7 @@ class TaskWindowTests(unittest.TestCase):
             result = self.rpc("cua_wait_ready", windowId=7, timeoutSeconds=5, intervalSeconds=1)
         self.assertFalse(result.get("isError"), result)
         self.assertTrue(json.loads(self.text(result).split("\n")[0])["ready"])
-        self.assertEqual([c.kwargs["timeout"] for c in self.fake.request.call_args_list], [5, 4, 3, 3, 2])
+        self.assertEqual([c.kwargs["timeout"] for c in self.fake.request.call_args_list], [5, 4, 4, 3])
         shares = [c for c in self.fake.request.call_args_list if c.args[0] == "preview"]
         self.assertEqual(len(shares), 1)
         self.assertEqual(shares[0].args[1]["source"], "application")
@@ -789,7 +869,7 @@ class TaskWindowTests(unittest.TestCase):
                         "tree": '- AXWebArea url="https://example.com/"\n  - AXStaticText "x"'}
             return original(method, params, **kwargs)
         self.fake.request.side_effect = read
-        now = [100.0]
+        now = [server.time.monotonic()]
         def wait(seconds):
             now[0] += seconds
             self.fake.connection_id = "changed-during-wait"
@@ -812,7 +892,7 @@ class TaskWindowTests(unittest.TestCase):
     def test_bind_holds_power_guard_and_end_releases_it(self):
         # 锁屏不会终止进程，空闲睡眠才会；断言必须跟着任务租约出现和消失。
         # 隔离正在运行的菜单栏，让这里只验证无面板时的既有参数。
-        with mock.patch.object(server, "control_snapshot", return_value=None):
+        with mock.patch.object(server, "control_snapshot", return_value={"master": True}):
             bound = self.bind()
         self.assertTrue(bound["powerGuard"]["holding"])
         self.assertTrue(bound["powerGuard"]["privacy"]["active"])

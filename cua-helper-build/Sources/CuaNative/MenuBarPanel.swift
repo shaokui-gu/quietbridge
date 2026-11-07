@@ -14,18 +14,22 @@ import Network
 
 /// Keep both panes in one hierarchy so resizing the window cannot resize the
 /// leading pane or reset its controls and tracking areas.
+enum MenuBarDetail { case browser, permissions }
+
 @MainActor final class MenuBarPanelContainer: NSView {
     private let scroll = NSScrollView()
     private let document = MenuBarCard()
     private let content: MenuBarPanelView
     private let browser: NSView
+    private let permissions: NSView
     private var expanded = false
     private var narrow = false
     override var isFlipped: Bool { true }
 
-    init(content: MenuBarPanelView, browser: NSView) {
+    init(content: MenuBarPanelView, browser: NSView, permissions: NSView = NSView()) {
         self.content = content
         self.browser = browser
+        self.permissions = permissions
         super.init(frame: NSRect(origin: .zero, size: MenuBarPanelView.panelSize))
         wantsLayer = true
         layer?.cornerRadius = 22
@@ -42,21 +46,29 @@ import Network
         document.autoresizingMask = []
         content.autoresizingMask = []
         browser.autoresizingMask = []
+        permissions.autoresizingMask = []
         content.radius = 0
         content.bordered = false
         document.addSubview(content)
         document.addSubview(browser)
+        document.addSubview(permissions)
         setBrowserExpanded(false, narrow: false)
     }
 
     required init?(coder: NSCoder) { nil }
 
     func setBrowserExpanded(_ expanded: Bool, narrow: Bool) {
-        self.expanded = expanded
+        setDetail(expanded ? .browser : nil, narrow: narrow)
+    }
+
+    func setDetail(_ detail: MenuBarDetail?, narrow: Bool) {
+        self.expanded = detail != nil
         self.narrow = narrow
         content.isHidden = expanded && narrow
-        browser.isHidden = !expanded
-        content.browserButton.selected = expanded
+        browser.isHidden = detail != .browser
+        permissions.isHidden = detail != .permissions
+        content.browserButton.selected = detail == .browser
+        content.permissionsButton.selected = detail == .permissions
         needsLayout = true
     }
 
@@ -68,6 +80,7 @@ import Network
         content.frame = NSRect(origin: .zero, size: MenuBarPanelView.panelSize)
         browser.frame = NSRect(x: expanded && narrow ? 0 : MenuBarPanelView.panelSize.width,
                                y: 0, width: 400, height: MenuBarPanelView.panelSize.height)
+        permissions.frame = browser.frame
     }
 }
 
@@ -77,25 +90,59 @@ import Network
     private var content: MenuBarPanelView?
     private var browserContent: MenuBarBrowserView?
     private var container: MenuBarPanelContainer?
-    private var browserExpanded = false
+    private var detail: MenuBarDetail?
+    private var permissionContent: MenuBarPermissionsView?
+    private var permissionModel: MenuBarPermissionModel?
+    private var wizard: MenuBarPermissionWizard?
+    private var pendingCapability: String?
+    private var activationObserver: NSObjectProtocol?
     private var listener: NWListener?
     private var localMonitor: Any?
     private var globalMonitor: Any?
     private var refreshTimer: Timer?
     private var pluginState = MenuBarPluginState.missing
     private var checkingPlugin = false
+    private var runtime: ApplicationRuntimeOwner?
 
     func start() {
+        do { runtime = try ApplicationRuntimeOwner() }
+        catch { FileHandle.standardError.write(Data("workbuddy-cua: \(error.localizedDescription)\n".utf8)); exit(0) }
+        if let session = runtime?.session {
+            let model = MenuBarPermissionModel(session: session)
+            permissionModel = model
+            wizard = MenuBarPermissionWizard(model: model)
+            model.changed = { [weak self] in self?.updateControls(); self?.wizard?.refresh() }
+            wizard?.dismissed = { [weak self] in self?.pendingCapability = nil }
+            wizard?.finished = { [weak self] in
+                guard let self else { return }
+                if let key = self.pendingCapability, self.missingPermissions(for: key).isEmpty,
+                   key != "locked_use" || LockedUseAuthorizationServer.shared.isAvailable {
+                    _ = CapabilityControl.shared.set(key, true)
+                }
+                self.pendingCapability = nil
+                self.updateControls()
+            }
+        }
         item.button?.target = self
         item.button?.action = #selector(toggle)
-        item.button?.setAccessibilityLabel("WorkBuddy 电脑控制助手")
+        item.button?.setAccessibilityLabel("Workbuddy CUA 电脑控制助手")
         build()
         startStatusServer()
         refresh()
+        permissionModel?.refresh()
+        activationObserver = NotificationCenter.default.addObserver(forName: NSApplication.didBecomeActiveNotification,
+            object: nil, queue: .main) { [weak self] _ in
+                Task { @MainActor in self?.permissionModel?.refresh() }
+            }
+        Task { @MainActor [weak self] in
+            guard let self, self.runtime != nil, PermissionOnboarding.consumeFirstLaunch() else { return }
+            self.showPermissionWizard()
+        }
         refreshTimer = Timer.scheduledTimer(withTimeInterval: 3, repeats: true) { [weak self] _ in
             Task { @MainActor in
                 self?.refreshPluginState()
-                if self?.panel?.isVisible == true && self?.browserExpanded == true { self?.browserContent?.refresh() }
+                self?.permissionModel?.refresh()
+                if self?.panel?.isVisible == true && self?.detail == .browser { self?.browserContent?.refresh() }
             }
         }
     }
@@ -105,13 +152,19 @@ import Network
                                     install: #selector(installPlugin), quit: #selector(quitMenuBar))
         view.browserButton.target = self
         view.browserButton.action = #selector(toggleBrowser)
+        view.permissionsButton.target = self
+        view.permissionsButton.action = #selector(togglePermissions)
         let browser = MenuBarBrowserView(frame: NSRect(x: 360, y: 0, width: 400, height: MenuBarPanelView.panelSize.height))
-        browser.back = { [weak self] in self?.browserExpanded = false; self?.layoutPanel() }
+        browser.back = { [weak self] in self?.detail = nil; self?.layoutPanel() }
+        let permissions = MenuBarPermissionsView(frame: browser.frame)
+        permissions.back = { [weak self] in self?.detail = nil; self?.layoutPanel() }
+        permissions.authorize = { [weak self] in self?.showPermissionWizard($0) }
+        permissions.recheck = { [weak self] in self?.permissionModel?.refresh() }
         let panel = MenuBarWindow(contentRect: NSRect(origin: .zero, size: MenuBarPanelView.panelSize),
                                   styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
-        let container = MenuBarPanelContainer(content: view, browser: browser)
+        let container = MenuBarPanelContainer(content: view, browser: browser, permissions: permissions)
         panel.contentView = container
-        panel.title = "WorkBuddy 电脑控制助手"
+        panel.title = "Workbuddy CUA 电脑控制助手"
         panel.isOpaque = false
         panel.backgroundColor = .clear
         panel.hasShadow = true
@@ -123,6 +176,7 @@ import Network
         panel.dismiss = { [weak self] in self?.closePanel() }
         content = view
         browserContent = browser
+        permissionContent = permissions
         self.container = container
         self.panel = panel
     }
@@ -134,10 +188,11 @@ import Network
     }
 
     func show() {
+        if wizard?.isVisible == true { wizard?.bringForward(); return }
         guard let panel, let button = item.button, button.window != nil else { return }
         if panel.isVisible { panel.makeKeyAndOrderFront(nil); return }
         refresh()
-        browserExpanded = false
+        detail = nil
         layoutPanel()
         panel.makeKeyAndOrderFront(nil)
         content?.refreshHover()
@@ -156,9 +211,24 @@ import Network
     }
 
     @objc private func toggleBrowser() {
-        browserExpanded.toggle()
+        detail = detail == .browser ? nil : .browser
         layoutPanel()
-        if browserExpanded { browserContent?.refresh() }
+        if detail == .browser { browserContent?.refresh() }
+    }
+
+    @objc private func togglePermissions() {
+        detail = detail == .permissions ? nil : .permissions
+        layoutPanel()
+        permissionModel?.refresh()
+    }
+
+    private func showPermissionWizard(_ permission: DesktopPermission? = nil) {
+        closePanel()
+        wizard?.show(permission: permission)
+    }
+
+    private func missingPermissions(for key: String) -> [DesktopPermission] {
+        DesktopPermission.required(for: key).filter { permissionModel?.status?.granted($0) != true }
     }
 
     private func layoutPanel() {
@@ -166,13 +236,14 @@ import Network
               let statusWindow = button.window else { return }
         let anchor = statusWindow.convertToScreen(button.convert(button.bounds, to: nil))
         let visible = (statusWindow.screen ?? NSScreen.main)?.visibleFrame ?? anchor
+        let browserExpanded = detail != nil
         let narrow = browserExpanded && visible.width < 776
         let width: CGFloat = browserExpanded ? (narrow ? 400 : 760) : 360
         let height = max(1, min(MenuBarPanelView.panelSize.height, visible.height - 16))
         let preferredX = browserExpanded && !narrow && anchor.maxX + 400 <= visible.maxX - 8
             ? anchor.maxX - 360 : anchor.maxX - width
         let x = max(visible.minX + 8, min(preferredX, visible.maxX - 8 - width))
-        container.setBrowserExpanded(browserExpanded, narrow: narrow)
+        container.setDetail(detail, narrow: narrow)
         panel.setContentSize(NSSize(width: width, height: height))
         container.layoutSubtreeIfNeeded()
         panel.setFrameOrigin(NSPoint(x: x, y: max(visible.minY + 8, min(anchor.minY - 8, visible.maxY - 8) - height)))
@@ -191,6 +262,13 @@ import Network
 
     @objc private func changed(_ sender: NSButton) {
         guard let key = sender.identifier?.rawValue else { return }
+        if sender.state == .on, let missing = missingPermissions(for: key).first {
+            sender.state = .off
+            pendingCapability = key
+            showPermissionWizard(missing)
+            updateControls()
+            return
+        }
         if key == "locked_use", sender.state == .on {
             // Never authorize from a stale cached installation result.
             guard LockedUseAuthorizationServer.shared.isAvailable else {
@@ -229,9 +307,10 @@ import Network
 
     private func updateControls() {
         let preferences = CapabilityControl.shared.preferences()
-        content?.refresh(preferences: preferences, pluginState: pluginState)
+        content?.refresh(preferences: preferences, pluginState: pluginState, permissions: permissionModel?.status)
+        permissionContent?.refresh(status: permissionModel?.status, busy: permissionModel?.busy == true, error: permissionModel?.error)
         item.button?.image = MenuBarAssets.image(preferences["master"] == true ? "status-enabled" : "status-paused")
-        item.button?.toolTip = preferences["master"] == true ? "WorkBuddy · 已启用" : "WorkBuddy · 已暂停"
+        item.button?.toolTip = preferences["master"] == true ? "Workbuddy CUA · 已启用" : "Workbuddy CUA · 已暂停"
     }
 
     @objc private func installPlugin() {
@@ -246,7 +325,7 @@ import Network
         guard let installer = MenuBarPluginInstaller.find(near: Bundle.main.executableURL) else {
             let missing = NSAlert()
             missing.messageText = "插件管理组件缺失"
-            missing.informativeText = "请重新安装最新版 WorkBuddy 安装包，以恢复插件管理器。"
+            missing.informativeText = "请重新安装最新版 Workbuddy CUA 安装包，以恢复插件管理器。"
             missing.runModal()
             return
         }
@@ -265,7 +344,24 @@ import Network
         }
     }
 
-    @objc private func quitMenuBar() { NSApp.terminate(nil) }
+    func shutdown() {
+        _ = CapabilityControl.shared.set("master", false)
+        runtime?.stop()
+        runtime = nil
+        wizard?.close()
+        permissionModel?.stop()
+        if let activationObserver { NotificationCenter.default.removeObserver(activationObserver) }
+        activationObserver = nil
+        refreshTimer?.invalidate()
+        refreshTimer = nil
+        listener?.cancel()
+        closePanel()
+    }
+
+    @objc private func quitMenuBar() {
+        shutdown()
+        NSApp.terminate(nil)
+    }
 
     private func startStatusServer() {
         guard let port = NWEndpoint.Port(rawValue: 47_631) else { return }
@@ -277,6 +373,7 @@ import Network
             exit(0)
         }
         listener.stateUpdateHandler = { state in if case .failed = state { exit(0) } }
+        let applicationSession = runtime?.session.id ?? ""
         listener.newConnectionHandler = { connection in
             connection.start(queue: .global(qos: .utility))
             var snapshot: [String: Any] = CapabilityControl.shared.snapshot()
@@ -285,6 +382,7 @@ import Network
                 "build": Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "development",
                 "pid": ProcessInfo.processInfo.processIdentifier,
                 "executable": Bundle.main.executableURL?.path ?? CommandLine.arguments[0],
+                "applicationSession": applicationSession,
             ]
             let body = (try? JSONSerialization.data(withJSONObject: snapshot)) ?? Data("{}".utf8)
             let response = Data("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: \(body.count)\r\n\r\n".utf8) + body

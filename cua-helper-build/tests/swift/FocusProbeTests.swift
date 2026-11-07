@@ -43,17 +43,41 @@ struct FocusProbeTests {
 
     @Test func clickEvidenceDoesNotMistakeRestorationForVerification() {
         let result = AXWorker.clickResult(route: "accessibility", action: "AXPress",
-            frontBefore: 10, frontAfterAction: 20, restorationAttempted: true, restorationAccepted: true)
+            frontBefore: 10, frontAfterAction: 10, restorationAttempted: true, restorationAccepted: true,
+            frontWindowBefore: 900, frontWindowAfterAction: 901)
         #expect(result["route"] == .string("accessibility"))
         #expect(result["axAction"] == .string("AXPress"))
         #expect(result["dispatched"] == .bool(true))
         #expect(result["verified"] == .bool(false))
         #expect(result["focusRestorationAttempted"] == .bool(true))
         #expect(result["frontPidBefore"] == .number(10))
-        #expect(result["frontPidAfterAction"] == .number(20))
+        #expect(result["frontPidAfterAction"] == .number(10))
+        #expect(result["frontWindowIdBefore"] == .number(900))
+        #expect(result["frontWindowIdAfterAction"] == .number(901))
+        #expect(result["focusPreserved"] == .bool(false))
         let pointer = AXWorker.clickResult(route: "window-pointer")
         #expect(pointer["frontPidBefore"] == .null)
         #expect(pointer["focusRestorationAccepted"] == .null)
+        #expect(pointer["focusPreserved"] == .null)
         #expect(pointer["verified"] == .bool(false))
+    }
+
+    @Test func backgroundTargetsNeverUseAccessibilityClickActions() {
+        #expect(AXWorker.shouldUseAccessibilityClick(frontPID: 10, targetPID: 10,
+                                                     frontWindowID: 900, targetWindowID: 900))
+        #expect(!AXWorker.shouldUseAccessibilityClick(frontPID: 10, targetPID: 10,
+                                                      frontWindowID: 901, targetWindowID: 900))
+        #expect(!AXWorker.shouldUseAccessibilityClick(frontPID: 20, targetPID: 10,
+                                                      frontWindowID: 900, targetWindowID: 900))
+        #expect(!AXWorker.shouldUseAccessibilityClick(frontPID: 10, targetPID: 10,
+                                                      frontWindowID: nil, targetWindowID: 900))
+        #expect(AXWorker.foregroundUnchanged(beforePID: 10, beforeWindow: 900,
+                                             afterPID: 10, afterWindow: 900) == true)
+        #expect(AXWorker.foregroundUnchanged(beforePID: 10, beforeWindow: 900,
+                                             afterPID: 10, afterWindow: 901) == false)
+        #expect(AXWorker.foregroundUnchanged(beforePID: 10, beforeWindow: 900,
+                                             afterPID: 20, afterWindow: 900) == false)
+        #expect(AXWorker.foregroundUnchanged(beforePID: 10, beforeWindow: nil,
+                                             afterPID: 10, afterWindow: 900) == nil)
     }
 }

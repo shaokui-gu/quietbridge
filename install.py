@@ -29,7 +29,7 @@ def checked_path(path):
 
 def sources(root):
     app = root / 'cua-helper-build' / 'workbuddy-cua.app'
-    files = [root / 'cua-mcp-bridge' / name for name in ('server.py', 'browser_events.py')]
+    files = [root / 'cua-mcp-bridge' / name for name in ('server.py', 'browser_events.py', 'recovery.py', 'task_lifecycle.py', 'stdio_transport.py')]
     binary = app / 'Contents/MacOS/workbuddy-cua-native'
     if not all(p.is_file() for p in files + [binary, app / 'Contents/Info.plist']):
         raise ValueError('缺少组件；请保持 install.py、cua-mcp-bridge 和 cua-helper-build 同级')
@@ -175,7 +175,7 @@ def install(root, home, apply=False, verify_signature=True, with_extension=False
         receipt = destination / 'install-receipt.json'
         if not receipt.is_file() or json.loads(receipt.read_text()).get('digest') != digest:
             raise ValueError('现有版本目录无法核验；未修改配置')
-        pairs = [(files[0], destination / 'bridge/server.py'), (files[1], destination / 'bridge/browser_events.py'),
+        pairs = [(path, destination / 'bridge' / path.name) for path in files] + [
                  (app / 'Contents/MacOS/workbuddy-cua-native', helper),
                  (app / 'Contents/Info.plist', destination / 'workbuddy-cua.app/Contents/Info.plist')]
         if any(not b.is_file() or a.read_bytes() != b.read_bytes() for a, b in pairs):
