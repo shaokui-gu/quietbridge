@@ -14,7 +14,7 @@ if [[ -z "$PYTHON" ]]; then
     read -r "REPLY?按回车关闭…"
     exit 1
 fi
-print "安装 workbuddy-cua 到当前用户运行目录，并备份、合并 WorkBuddy 连接配置。"
+print "安装 QuietBridge 到当前用户运行目录，并备份、合并 WorkBuddy 连接配置。"
 print "不需要 sudo，不更改系统权限，不自动开启界面操作。"
 if "$PYTHON" -B "$ROOT/install.py" --install; then
     print "组件与配置部署完成；请在 WorkBuddy 自定义连接器入口确认信任/启用。"

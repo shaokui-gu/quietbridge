@@ -1,0 +1,101 @@
+"""Three bounded execution slots and conservative cross-session target leases."""
+from contextlib import contextmanager
+import hashlib
+import os
+from pathlib import Path
+import re
+import stat
+import time
+
+from browser_events import event_store, lease_live, read_file
+from lifecycle_store import checked
+
+LIMIT = 3
+KEY = re.compile(r'[a-f0-9]{64}')
+
+
+def session_key(session):
+    return hashlib.sha256(('workbuddy\0' + session).encode()).hexdigest()
+
+
+def session_directory(config, key, create=False):
+    if not isinstance(key, str) or not KEY.fullmatch(key):
+        raise ValueError('SESSION_ROUTING_REQUIRED: invalid session channel')
+    parent = checked(Path(config) / 'sessions')
+    path = checked(parent / key)
+    if create:
+        parent.mkdir(mode=0o700, exist_ok=True)
+        path.mkdir(mode=0o700, exist_ok=True)
+    for node in (parent, path):
+        info = node.stat()
+        if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077:
+            raise ValueError('unsafe session directory')
+    return path
+
+
+def live_slots(data):
+    result = {}
+    for key, slot in data.get('tasks', {}).items():
+        if not isinstance(slot, dict):
+            continue
+        try:
+            path = Path(slot['taskFile'])
+            store = read_file(path, {})
+            task = store.get('tasks', {}).get(slot.get('taskId'))
+            if task is None and time.time() - slot.get('reservedAt', 0) < 5:
+                task = slot.get('reservation')
+            if task and task.get('state') not in ('ended', 'interrupted', 'invalidated') and lease_live(task, path.parent):
+                result[key] = slot
+        except (OSError, ValueError, KeyError, TypeError):
+            continue
+    return result
+
+
+@contextmanager
+def registry(config):
+    with event_store(Path(config) / 'session-registry.json') as data:
+        data['tasks'] = live_slots(data)
+        yield data['tasks']
+
+
+def reserve(config, key, task_file, record):
+    """Called while the caller holds its task file lock; no reverse lock order."""
+    with registry(config) as slots:
+        # The caller's new task is not written yet. Keep the reservation until
+        # the task lock releases; competing admissions observe the live owner.
+        others = {k: v for k, v in slots.items() if k != key}
+        if len(others) >= LIMIT:
+            raise ValueError('SESSION_CAPACITY_FULL: 最多同时运行 3 个会话；请结束自己的一项后重试')
+        slots[key] = {'taskFile': str(task_file), 'taskId': record['taskId'],
+                      'reservedAt': time.time(), 'reservation': record}
+
+
+def release(config, key, task_id=None):
+    with registry(config) as slots:
+        if key in slots and (task_id is None or slots[key].get('taskId') == task_id):
+            slots.pop(key)
+
+
+def claim_target(config, key, record, task_file):
+    with registry(config) as slots:
+        for other_key, slot in slots.items():
+            if other_key == key:
+                continue
+            target = slot.get('target') or {}
+            # Separate native windows in one process can share application-wide
+            # state. Until verified, arbitrate desktop operations at PID level.
+            same_window = target.get('pid') == record.get('pid') and target.get('windowId') == record.get('windowId')
+            same_native_app = target.get('pid') == record.get('pid') and (
+                target.get('interactionMode') == 'desktop' or record.get('interactionMode') == 'desktop')
+            if same_window or same_native_app:
+                raise ValueError('TARGET_IN_USE: 目标窗口或应用已由另一个会话操作；请选择独立目标')
+        if key not in slots and len(slots) >= LIMIT:
+            raise ValueError('SESSION_CAPACITY_FULL: 最多同时运行 3 个会话')
+        slots[key] = {'taskFile': str(task_file), 'taskId': record['taskId'],
+                      'target': {k: record.get(k) for k in ('pid', 'windowId', 'interactionMode')}}
+
+
+def channels(config):
+    with registry(config) as slots:
+        return [key for key, slot in slots.items() if KEY.fullmatch(key) and
+                Path(slot['taskFile']).parent == session_directory(config, key)]

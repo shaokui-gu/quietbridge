@@ -1,0 +1,9 @@
+{
+  "id": "workbuddy",
+  "status": "implemented",
+  "transport": "mcp-stdio",
+  "configuration": "~/.workbuddy/mcp.json",
+  "lifecycleEvents": ["PostToolUse", "FinalStop", "SessionEnd"],
+  "trustedContext": ["CODEBUDDY_SESSION_ID", "CODEBUDDY_CONVERSATION_REQUEST_ID"],
+  "supportsConcurrentAgents": false
+}

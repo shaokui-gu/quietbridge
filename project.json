@@ -1,0 +1,12 @@
+{
+  "schemaVersion": 1,
+  "name": "quietbridge",
+  "displayName": "QuietBridge",
+  "application": {"bundleName": "QuietBridge.app", "executable": "quietbridge-native"},
+  "browserExtension": {"name": "QuietBridge Browser", "source": "extensions/chromium"},
+  "products": {
+    "workbuddy": {"name": "QuietBridge for Workbuddy", "source": "products/workbuddy-connector", "status": "implemented"},
+    "deepseek-harness": {"name": "QuietBridge for DeepSeek Harness", "source": "products/deepseek-harness-plugin", "status": "planned"}
+  },
+  "runtime": {"sharedApplication": true, "multiAgentIsolation": false, "simultaneousPreviews": false}
+}

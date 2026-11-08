@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""workbuddy-cua user installer. Preview by default; --install applies changes.
+"""quietbridge user installer. Preview by default; --install applies changes.
 
 加 --with-extension 可一并部署浏览器扩展的原生宿主并拉起本机安装页；
 扩展本体仍需在 chrome://extensions 手动加载（Chrome 137 起无程序化入口）。
@@ -17,6 +17,9 @@ import sys
 import tempfile
 
 ROOT = Path(__file__).resolve().parent
+sys.path[:0] = [str(ROOT / 'tools'), str(ROOT / 'services/mcp')]
+from release_layout import bridge_sources
+from compatibility import LEGACY_SERVER_NAMES, runtime_root
 
 
 def checked_path(path):
@@ -28,13 +31,14 @@ def checked_path(path):
 
 
 def sources(root):
-    app = root / 'cua-helper-build' / 'workbuddy-cua.app'
-    files = [root / 'cua-mcp-bridge' / name for name in ('server.py', 'browser_events.py', 'recovery.py', 'task_lifecycle.py', 'stdio_transport.py', 'host_lifecycle.py', 'assets/logo-64.png')]
-    binary = app / 'Contents/MacOS/workbuddy-cua-native'
+    app = root / 'apps/macos' / 'QuietBridge.app'
+    mapping = bridge_sources(root)
+    files = list(mapping.values())
+    binary = app / 'Contents/MacOS/quietbridge-native'
     if not all(p.is_file() for p in files + [binary, app / 'Contents/Info.plist']):
-        raise ValueError('缺少组件；请保持 install.py、cua-mcp-bridge 和 cua-helper-build 同级')
+        raise ValueError('缺少组件；请保持 install.py、services/mcp 和 apps/macos 同级')
     # Reject source links too; no traversal into arbitrary user locations.
-    for base in (app, root / 'cua-mcp-bridge'):
+    for base in (app, root / 'services/mcp'):
         checked_path(base)
     for directory, dirs, names in os.walk(app, followlinks=False):
         for name in dirs + names:
@@ -69,7 +73,7 @@ def owned(entry, source, runtime):
     for arg in args:
         if isinstance(arg, str):
             path = Path(arg)
-            if path == source / 'cua-mcp-bridge/server.py':
+            if path in (source / 'services/mcp/server.py', source / 'cua-mcp-bridge/server.py'):
                 return True
             if path.name == 'server.py' and runtime in path.parents:
                 return True
@@ -82,7 +86,7 @@ def extension_step(root, home, apply=False, launch=False):
     扩展本体无法程序化装载：Chrome 从 137 起移除了 --load-extension。
     所以这里只自动化宿主这一半，「加载已解压」和点授权仍归本人。
     """
-    directory = root / 'browser-observer-extension'
+    directory = root / 'extensions/chromium'
     if not (directory / 'manifest.json').is_file():
         raise ValueError('缺少浏览器扩展目录：' + str(directory))
     # 必须早于 import：模块内再禁用已来不及阻止本模块的缓存写入。
@@ -113,21 +117,21 @@ def install(root, home, apply=False, verify_signature=True, with_extension=False
         raise ValueError('需要 Python 3.9 或以上；本版不会自动下载解释器')
     root, home = checked_path(root), checked_path(home)
     app, files, digest = sources(root)
-    runtime = checked_path(home / 'Library/Application Support/workbuddy-cua')
+    runtime = checked_path(runtime_root(home))
     releases = runtime / 'releases'
     destination = releases / digest
     config = checked_path(home / '.workbuddy/mcp.json')
     data, original = read_config(config)
     servers = data.setdefault('mcpServers', {})
-    key = 'workbuddy-cua'
+    key = 'quietbridge'
     # Preserve an existing legacy connection key when it is demonstrably ours.
     if key in servers and not owned(servers[key], root, runtime):
-        raise ValueError('workbuddy-cua 配置键已由其他组件占用，未覆盖')
-    if key not in servers and 'cua' in servers and owned(servers['cua'], root, runtime):
-        key = 'cua'
+        raise ValueError('quietbridge 配置键已由其他组件占用，未覆盖')
+    if key not in servers:
+        key = next((alias for alias in LEGACY_SERVER_NAMES if alias in servers and owned(servers[alias], root, runtime)), key)
     if verify_signature:
         subprocess.run(['/usr/bin/codesign', '--verify', '--strict', str(app)], check=True, capture_output=True)
-    helper = destination / 'workbuddy-cua.app/Contents/MacOS/workbuddy-cua-native'
+    helper = destination / 'QuietBridge.app/Contents/MacOS/quietbridge-native'
     if public_helper is not None:
         public_helper = checked_path(public_helper)
         public_root = Path('/Library/Application Support/WorkBuddyCUAHelper/releases')
@@ -138,15 +142,16 @@ def install(root, home, apply=False, verify_signature=True, with_extension=False
             if info.st_uid != 0 or info.st_mode & 0o022:
                 raise ValueError('公开 helper 目录归属或权限不安全: ' + str(node))
         subprocess.run(['/usr/bin/codesign', '--verify', '--strict', '-R',
-                        '=anchor apple generic and identifier "com.workbuddy.cua.helper" and certificate leaf[subject.OU] = "62RNP54C47"',
+                        '=anchor apple generic and identifier "com.quietbridge.helper" and certificate leaf[subject.OU] = "62RNP54C47"',
                         str(public_helper)], check=True, capture_output=True)
-        helper = public_helper / 'Contents/MacOS/workbuddy-cua-native'
+        helper = public_helper / 'Contents/MacOS/quietbridge-native'
     old = servers.get(key, {})
     entry = dict(old)
     env = dict(old.get('env', {}))
-    env['CUA_HELPER_PATH'] = str(helper)
+    env.pop('CUA_HELPER_PATH', None)
+    env['QUIETBRIDGE_HELPER_PATH'] = str(helper)
     entry.update(command=sys.executable, args=['-B', str(destination / 'bridge/server.py')],
-                 env=env, description='workbuddy-cua：macOS 原生界面观察与操作（AX/坐标/键盘），网页任务默认严格后台，通过扩展 CDP 操作固定标签，断连等待且不回退桌面输入；需已授权辅助功能与屏幕录制')
+                 env=env, description='QuietBridge：macOS 原生界面观察与操作（AX/坐标/键盘），网页任务默认严格后台，通过扩展 CDP 操作固定标签，断连等待且不回退桌面输入；需已授权辅助功能与屏幕录制')
     servers[key] = entry
     rendered = (json.dumps(data, ensure_ascii=False, indent=2) + '\n').encode()
     plan = {'mode': 'install' if apply else 'preview', 'release': str(destination),
@@ -165,10 +170,10 @@ def install(root, home, apply=False, verify_signature=True, with_extension=False
     if not destination.exists():
         releases.mkdir(parents=True, exist_ok=True, mode=0o700)
         stage = Path(tempfile.mkdtemp(prefix='.install-', dir=releases))
-        shutil.copytree(app, stage / 'workbuddy-cua.app')
+        shutil.copytree(app, stage / 'QuietBridge.app')
         (stage / 'bridge').mkdir()
         for path in files:
-            target = stage / 'bridge' / path.relative_to(root / 'cua-mcp-bridge')
+            target = stage / 'bridge' / next(relative for relative, source in bridge_sources(root).items() if source == path)
             target.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(path, target)
         (stage / 'install-receipt.json').write_text(json.dumps({'digest': digest}), encoding='utf-8')
@@ -177,17 +182,17 @@ def install(root, home, apply=False, verify_signature=True, with_extension=False
         receipt = destination / 'install-receipt.json'
         if not receipt.is_file() or json.loads(receipt.read_text()).get('digest') != digest:
             raise ValueError('现有版本目录无法核验；未修改配置')
-        pairs = [(path, destination / 'bridge' / path.relative_to(root / 'cua-mcp-bridge')) for path in files] + [
-                 (app / 'Contents/MacOS/workbuddy-cua-native', helper),
-                 (app / 'Contents/Info.plist', destination / 'workbuddy-cua.app/Contents/Info.plist')]
+        pairs = [(path, destination / 'bridge' / next(relative for relative, source in bridge_sources(root).items() if source == path)) for path in files] + [
+                 (app / 'Contents/MacOS/quietbridge-native', helper),
+                 (app / 'Contents/Info.plist', destination / 'QuietBridge.app/Contents/Info.plist')]
         if any(not b.is_file() or a.read_bytes() != b.read_bytes() for a, b in pairs):
             raise ValueError('现有版本内容与源文件不一致；未修改配置')
     # Verify the deployed MCP handshake without launching helper or interacting with UI.
     request = json.dumps({'id': 1, 'method': 'initialize', 'params': {}}) + '\n'
     reply = subprocess.run([sys.executable, '-B', str(destination / 'bridge/server.py')],
                            input=request, capture_output=True, text=True, timeout=15,
-                           env=dict(os.environ, CUA_HELPER_PATH=str(helper)))
-    if reply.returncode != 0 or json.loads(reply.stdout)['result']['serverInfo']['name'] != 'workbuddy-cua':
+                           env=dict(os.environ, QUIETBRIDGE_HELPER_PATH=str(helper)))
+    if reply.returncode != 0 or json.loads(reply.stdout)['result']['serverInfo']['name'] != 'quietbridge':
         raise ValueError('安装副本握手失败；配置未修改，保留版本用于诊断')
     if original != rendered:
         config.parent.mkdir(parents=True, exist_ok=True, mode=0o700)

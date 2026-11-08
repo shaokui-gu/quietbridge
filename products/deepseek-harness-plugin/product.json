@@ -1,0 +1,9 @@
+{
+  "schemaVersion": 1,
+  "id": "quietbridge-deepseek-harness",
+  "name": "QuietBridge for DeepSeek Harness",
+  "adapter": "deepseek-harness",
+  "distribution": "shared-macos-pkg",
+  "status": "planned",
+  "marketManifestStatus": "unverified"
+}

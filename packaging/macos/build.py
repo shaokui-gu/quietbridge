@@ -9,13 +9,19 @@ from pathlib import Path
 import plistlib
 import shutil
 import subprocess
+import sys
 import zipfile
 import xml.etree.ElementTree as ET
 
 ROOT = Path(__file__).resolve().parents[2]
-IDENTIFIER = "com.workbuddy.cua.menubar"
+sys.path[:0] = [str(ROOT / 'tools'), str(ROOT / 'services/mcp')]
+from release_layout import copy_bridge
+from compatibility import MENU_IDENTIFIER, HELPER_IDENTIFIER, PLUGIN_IDENTIFIER
+from signing_profiles import load_profile
+PRODUCT = json.loads((ROOT / 'project.json').read_text())
+IDENTIFIER = MENU_IDENTIFIER
 LAUNCH_IDENTIFIER = IDENTIFIER + ".launch"
-APPLICATION_PATH = "Applications/Workbuddy CUA.app"
+APPLICATION_PATH = "Applications/QuietBridge.app"
 
 
 def run(*args):
@@ -29,7 +35,7 @@ def build_app_icon(resources):
 
 def write_distribution(destination, version):
     document = ET.Element("installer-gui-script", minSpecVersion="2")
-    ET.SubElement(document, "title").text = "Workbuddy CUA"
+    ET.SubElement(document, "title").text = "QuietBridge"
     ET.SubElement(document, "options", customize="always", **{
         "require-scripts": "false", "hostArchitectures": "arm64",
     })
@@ -39,19 +45,19 @@ def write_distribution(destination, version):
     outline = ET.SubElement(document, "choices-outline")
     ET.SubElement(outline, "line", choice="application")
     ET.SubElement(outline, "line", choice="launch")
-    application = ET.SubElement(document, "choice", id="application", title="Workbuddy CUA", **{
+    application = ET.SubElement(document, "choice", id="application", title="QuietBridge", **{
         "description": "安装应用、原生宿主与浏览器扩展文件。浏览器扩展可稍后在应用面板内加载。",
         "start_selected": "true", "start_enabled": "false",
     })
     ET.SubElement(application, "pkg-ref", id=IDENTIFIER)
     launch = ET.SubElement(document, "choice", id="launch", title="安装完成后立即运行", **{
-        "description": "安装完成后打开 Workbuddy CUA 并显示菜单栏图标。未勾选时，可稍后从应用程序文件夹打开。",
+        "description": "安装完成后打开 QuietBridge 并显示菜单栏图标。未勾选时，可稍后从应用程序文件夹打开。",
         "start_selected": "false",
     })
     ET.SubElement(launch, "pkg-ref", id=LAUNCH_IDENTIFIER)
     # Package order follows the choices: deploy the application before running
     # the optional scripts-only launch component.
-    for identifier, name in ((IDENTIFIER, "WorkbuddyCUA.pkg"), (LAUNCH_IDENTIFIER, "LaunchWorkbuddyCUA.pkg")):
+    for identifier, name in ((IDENTIFIER, "QuietBridge.pkg"), (LAUNCH_IDENTIFIER, "LaunchQuietBridge.pkg")):
         ET.SubElement(document, "pkg-ref", id=identifier, version=version, onConclusion="none").text = name
     ET.ElementTree(document).write(destination, encoding="utf-8", xml_declaration=True)
 
@@ -107,8 +113,17 @@ def main():
     parser.add_argument("--version", required=True)
     parser.add_argument("--build", required=True)
     parser.add_argument("--identity", required=True)
+    parser.add_argument("--profiles-dir", type=Path,
+                        help="Directory containing matching QuietBridge profiles and signing certificate")
     args = parser.parse_args()
-    release = ROOT / "cua-helper-build/.build/release/workbuddy-cua-native"
+    profiles = {}
+    if args.profiles_dir is not None:
+        certificate = (args.profiles_dir / 'developerID_application.cer').read_bytes()
+        for name, identifier in (('QuietBridgeApp', MENU_IDENTIFIER), ('QuietBridgeHelper', HELPER_IDENTIFIER),
+                                 ('QuietBridgeAuthp', PLUGIN_IDENTIFIER)):
+            profiles[identifier] = load_profile(args.profiles_dir / (name + '.provisionprofile'),
+                                                identifier, '62RNP54C47', certificate)
+    release = ROOT / "apps/macos/.build/release/quietbridge-native"
     if not release.is_file():
         raise SystemExit("Build the Swift release executable first")
     work = ROOT / "dist" / ("package-" + args.version)
@@ -117,84 +132,98 @@ def main():
     app = payload / APPLICATION_PATH
     contents = app / "Contents"
     (contents / "MacOS").mkdir(parents=True)
-    shutil.copy2(release, contents / "MacOS/workbuddy-cua-native")
+    shutil.copy2(release, contents / "MacOS/quietbridge-native")
     info = {
-        "CFBundleDisplayName": "Workbuddy CUA", "CFBundleName": "Workbuddy CUA",
+        "CFBundleDisplayName": PRODUCT["displayName"], "CFBundleName": PRODUCT["displayName"],
         "CFBundleIconFile": "AppIcon",
-        "CFBundleIdentifier": IDENTIFIER, "CFBundleExecutable": "workbuddy-cua-native",
+        "CFBundleIdentifier": IDENTIFIER, "CFBundleExecutable": "quietbridge-native",
         "CFBundlePackageType": "APPL", "CFBundleShortVersionString": args.version,
         "CFBundleVersion": args.build, "LSMinimumSystemVersion": "14.0",
         "LSUIElement": True, "NSHighResolutionCapable": True,
-        "NSHumanReadableCopyright": "workbuddy-cua local macOS helper",
+        "NSHumanReadableCopyright": "quietbridge local macOS helper",
     }
     (contents / "Info.plist").write_bytes(plistlib.dumps(info))
+    if MENU_IDENTIFIER in profiles:
+        (contents / 'embedded.provisionprofile').write_bytes(profiles[MENU_IDENTIFIER])
     resources = contents / "Resources"
     resources.mkdir()
     build_app_icon(resources)
     localized = resources / "en.lproj"
     localized.mkdir()
     (localized / "InfoPlist.strings").write_bytes(plistlib.dumps({
-        "CFBundleName": "Workbuddy CUA", "CFBundleDisplayName": "Workbuddy CUA",
+        "CFBundleName": "QuietBridge", "CFBundleDisplayName": "QuietBridge",
     }))
     bridge = resources / "bridge"
     bridge.mkdir()
-    for name in ("server.py", "browser_events.py", "recovery.py", "connector.py", "task_lifecycle.py", "stdio_transport.py", "host_lifecycle.py"):
-        shutil.copy2(ROOT / "cua-mcp-bridge" / name, bridge / name)
-    shutil.copytree(ROOT / 'cua-mcp-bridge/assets', bridge / 'assets')
-    support = payload / "Library/Application Support/workbuddy-cua"
+    copy_bridge(ROOT, bridge)
+    support = payload / "Library/Application Support/QuietBridge"
     support.mkdir(parents=True)
+    shutil.copy2(ROOT / 'services/mcp/compatibility.py', support / 'compatibility.py')
+    shutil.copytree(ROOT / 'adapters', support / 'adapters', ignore=shutil.ignore_patterns('__pycache__', 'tests', '*.pyc'))
     # Same executable, separate signing identities. The authorization plug-in
     # trusts only the helper; the menu app must never become its server.
-    helper_stage = work / "helper/workbuddy-cua.app"
+    helper_stage = work / "helper/QuietBridge.app"
     (helper_stage / "Contents/MacOS").mkdir(parents=True)
-    shutil.copy2(release, helper_stage / "Contents/MacOS/workbuddy-cua-native")
-    helper_info = dict(info, CFBundleIdentifier="com.workbuddy.cua.helper",
-                       CFBundleName="workbuddy-cua", CFBundleDisplayName="workbuddy-cua")
+    shutil.copy2(release, helper_stage / "Contents/MacOS/quietbridge-native")
+    helper_info = dict(info, CFBundleIdentifier=HELPER_IDENTIFIER,
+                       CFBundleName=PRODUCT["displayName"], CFBundleDisplayName=PRODUCT["displayName"])
     helper_info.pop("CFBundleIconFile")
     (helper_stage / "Contents/Info.plist").write_bytes(plistlib.dumps(helper_info))
+    if HELPER_IDENTIFIER in profiles:
+        (helper_stage / 'Contents/embedded.provisionprofile').write_bytes(profiles[HELPER_IDENTIFIER])
     run("/usr/bin/codesign", "--force", "--options", "runtime", "--timestamp=none",
         "--sign", args.identity, helper_stage)
     run("/usr/bin/codesign", "--verify", "--strict", "-R",
-        '=anchor apple generic and identifier "com.workbuddy.cua.helper" and certificate leaf[subject.OU] = "62RNP54C47"', helper_stage)
-    helper_digest = hashlib.sha256((helper_stage / "Contents/MacOS/workbuddy-cua-native").read_bytes()).hexdigest()[:16]
-    helper_relative = Path("Library/Application Support/WorkBuddyCUAHelper/releases") / helper_digest / "workbuddy-cua.app"
+        '=anchor apple generic and identifier "' + HELPER_IDENTIFIER + '" and certificate leaf[subject.OU] = "62RNP54C47"', helper_stage)
+    helper_digest = hashlib.sha256((helper_stage / "Contents/MacOS/quietbridge-native").read_bytes()).hexdigest()[:16]
+    helper_relative = Path("Library/Application Support/WorkBuddyCUAHelper/releases") / helper_digest / "QuietBridge.app"
     shutil.copytree(helper_stage, payload / helper_relative)
     (support / "installation.plist").write_bytes(plistlib.dumps({
         "version": args.version, "build": args.build,
-        "helper": str(Path("/") / helper_relative / "Contents/MacOS/workbuddy-cua-native"),
+        "helper": str(Path("/") / helper_relative / "Contents/MacOS/quietbridge-native"),
     }))
     for name in ("deploy.py", "runtime.sh", "恢复安装.command"):
         shutil.copy2(Path(__file__).with_name(name), support / name)
-    plugin_source = ROOT / "cua-auth-plugin/build/WorkBuddyCUAAuthorizationPlugin.bundle"
+    plugin_source = ROOT / "system/authorization-plugin/build/WorkBuddyCUAAuthorizationPlugin.bundle"
     if not plugin_source.is_dir():
         raise SystemExit("Build and sign the authorization plug-in first")
+    if PLUGIN_IDENTIFIER in profiles:
+        embedded = plugin_source / 'Contents/embedded.provisionprofile'
+        if not embedded.is_file() or embedded.read_bytes() != profiles[PLUGIN_IDENTIFIER]:
+            raise SystemExit('Rebuild the authorization plug-in with the matching supplied provisioning profile')
     plugin_info = plistlib.loads((plugin_source / "Contents/Info.plist").read_bytes())
-    if (plugin_info.get("CUADenyOnly") is not False or
-            plugin_info.get("CUAServerCodeIdentifier") != "com.workbuddy.cua.helper" or
+    if (plugin_info.get("CFBundleExecutable") != "QuietBridgeAuthorizationPlugin" or
+            plugin_info.get("CUADenyOnly") is not False or
+            plugin_info.get("CUAServerCodeIdentifier") != HELPER_IDENTIFIER or
+            plugin_info.get("CFBundleIdentifier") != PLUGIN_IDENTIFIER or
             plugin_info.get("CUAServerTeamIdentifier") != "62RNP54C47"):
         raise SystemExit("The plug-in must use the production helper identity and grant mode")
     run("/usr/bin/codesign", "--verify", "--strict", "-R",
-        '=anchor apple generic and identifier "com.workbuddy.cua.AuthorizationPlugin" and certificate leaf[subject.OU] = "62RNP54C47"', plugin_source)
+        '=anchor apple generic and identifier "' + PLUGIN_IDENTIFIER + '" and certificate leaf[subject.OU] = "62RNP54C47"', plugin_source)
     plugin = support / "plugin"
     (plugin / "build").mkdir(parents=True)
     shutil.copytree(plugin_source, plugin / "build" / plugin_source.name)
-    shutil.copy2(ROOT / "cua-auth-plugin/install.py", plugin / "install.py")
+    shutil.copy2(ROOT / "system/authorization-plugin/install.py", plugin / "install.py")
     shutil.copy2(Path(__file__).with_name("manage-plugin.command"), plugin / "manage-plugin.command")
     extension = support / "extension"
     extension.mkdir(parents=True)
     extension_stage = extension / "extension-stage"
-    shutil.copytree(ROOT / "browser-observer-extension", extension_stage,
+    shutil.copytree(ROOT / "extensions/chromium", extension_stage,
                     ignore=shutil.ignore_patterns("__pycache__", ".DS_Store", "._*", "*.test.mjs",
                                                   "native-host-config.json", "native-host-launcher.sh"))
     for name in ("native_host.py", "install_native_host.py"):
         shutil.copy2(extension_stage / name, extension / name)
-    shutil.copy2(ROOT / "cua-mcp-bridge/browser_events.py", extension / "browser_events.py")
-    shutil.copy2(ROOT / "cua-mcp-bridge/browser_events.py", extension_stage / "browser_events.py")
+    shutil.copy2(ROOT / "services/mcp/browser_events.py", extension / "browser_events.py")
+    shutil.copy2(ROOT / "services/mcp/browser_events.py", extension_stage / "browser_events.py")
+    for destination in (extension, extension_stage):
+        shutil.copy2(ROOT / 'services/mcp/compatibility.py', destination / 'compatibility.py')
+        for module in ('session_registry.py', 'lifecycle_store.py'):
+            shutil.copy2(ROOT / 'services/mcp' / module, destination / module)
     extension_version = json.loads((extension_stage / "manifest.json").read_text())["version"]
     for name in ("popup.html", "popup.css", "popup.js", "service-worker.js", "content.js", "installer/index.html"):
         if not (extension_stage / name).is_file():
             raise SystemExit("Missing extension component: " + name)
-    with zipfile.ZipFile(extension / ("WorkbuddyExtension-" + extension_version + ".zip"), "w", zipfile.ZIP_DEFLATED) as archive:
+    with zipfile.ZipFile(extension / ("QuietBridgeBrowser-" + extension_version + ".zip"), "w", zipfile.ZIP_DEFLATED) as archive:
         for path in sorted(extension_stage.rglob("*")):
             if path.is_file():
                 archive.write(path, path.relative_to(extension_stage))
@@ -202,6 +231,8 @@ def main():
     scripts.mkdir()
     for name in ("preinstall", "postinstall", "deploy.py"):
         shutil.copy2(Path(__file__).with_name(name), scripts / name)
+    shutil.copy2(ROOT / 'services/mcp/compatibility.py', scripts / 'compatibility.py')
+    shutil.copytree(ROOT / 'adapters', scripts / 'adapters', ignore=shutil.ignore_patterns('__pycache__', 'tests', '*.pyc'))
     for name in ("preinstall", "postinstall", "launch-postinstall", "runtime.sh", "manage-plugin.command", "恢复安装.command"):
         run("/bin/bash", "-n", Path(__file__).with_name(name))
     run("/usr/bin/codesign", "--force", "--options", "runtime", "--timestamp=none",
@@ -210,7 +241,9 @@ def main():
     components = [{
         "RootRelativeBundlePath": APPLICATION_PATH,
         "BundleIsRelocatable": False, "BundleIsVersionChecked": True,
-        "BundleHasStrictIdentifier": True, "BundleOverwriteAction": "upgrade",
+        # Preinstall verifies either recognised signed identity at this exact
+        # non-relocatable path. Allow PackageKit to cross the old/new ID boundary.
+        "BundleHasStrictIdentifier": False, "BundleOverwriteAction": "upgrade",
     }, {
         "RootRelativeBundlePath": str(helper_relative),
         "BundleIsRelocatable": False, "BundleIsVersionChecked": False,
@@ -218,7 +251,7 @@ def main():
     }]
     component_file = work / "components.plist"
     component_file.write_bytes(plistlib.dumps(components))
-    package = ROOT / "dist" / ("workbuddy-cua-" + args.version + ".pkg")
+    package = ROOT / "dist" / ("quietbridge-" + args.version + ".pkg")
     if package.exists():
         raise SystemExit("Refusing to overwrite " + str(package))
     # Suppress AppleDouble metadata, which Chrome rejects in extension folders.
@@ -231,7 +264,7 @@ def main():
     run("/usr/bin/pkgbuild", "--root", payload, "--scripts", scripts, "--ownership", "recommended",
         "--component-plist", component_file, "--identifier", IDENTIFIER,
         "--version", args.version, "--install-location", "/", raw_package)
-    application_package = work / "WorkbuddyCUA.pkg"
+    application_package = work / "QuietBridge.pkg"
     remove_appledouble(raw_package, work, application_package)
     listed = subprocess.run(["/usr/sbin/pkgutil", "--payload-files", str(application_package)],
                             check=True, capture_output=True, text=True).stdout.splitlines()
@@ -244,7 +277,7 @@ def main():
     run("/usr/bin/xattr", "-cr", launch_scripts)
     run("/usr/bin/pkgbuild", "--nopayload", "--scripts", launch_scripts,
         "--identifier", LAUNCH_IDENTIFIER, "--version", args.version,
-        "--install-location", "/", work / "LaunchWorkbuddyCUA.pkg")
+        "--install-location", "/", work / "LaunchQuietBridge.pkg")
     distribution = work / "Distribution.xml"
     write_distribution(distribution, args.version)
     run("/usr/bin/productbuild", "--distribution", distribution, "--package-path", work,

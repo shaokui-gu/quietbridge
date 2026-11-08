@@ -1,0 +1,11 @@
+{
+  "schemaVersion": 1,
+  "id": "quietbridge-workbuddy",
+  "name": "QuietBridge for Workbuddy",
+  "adapter": "workbuddy",
+  "transport": "mcp-stdio",
+  "serverName": "quietbridge",
+  "entrypoint": "services/mcp/connector.py",
+  "distribution": "shared-macos-pkg",
+  "marketManifestStatus": "not-submitted"
+}

@@ -28,10 +28,22 @@ import tempfile
 import time
 import uuid
 
-LABEL = 'com.workbuddy.cua.menubar'
-APP = Path('/Applications/Workbuddy CUA.app')
+# One adapter implementation is used from source and from packaged support.
+_module_root = Path(__file__).resolve().parents[2]
+if (_module_root / 'services/mcp').is_dir():
+    sys.path[:0] = [str(_module_root / 'services/mcp'), str(_module_root)]
+from compatibility import (LEGACY_APP_NAMES, LEGACY_SERVER_NAMES, PUBLISHED_CONNECTOR_DIGESTS,
+                           MENU_IDENTIFIER, HELPER_IDENTIFIER,
+                           LEGACY_MENU_IDENTIFIER, LEGACY_HELPER_IDENTIFIER, runtime_root)
+from adapters.workbuddy import configuration as workbuddy
+
+# Keep the existing launchd storage key so upgrades can stop/restore the same job.
+# It is independent of the new code-signing bundle identifier.
+LABEL = LEGACY_MENU_IDENTIFIER
+APP = Path('/Applications/QuietBridge.app')
 LEGACY_APP = Path('/Applications/workbuddy-cua.app')
-SUPPORT = Path('/Library/Application Support/workbuddy-cua')
+APP_PATHS = (APP, *(Path('/Applications') / name for name in LEGACY_APP_NAMES))
+SUPPORT = Path('/Library/Application Support/QuietBridge')
 PUBLIC = Path('/Library/Application Support/WorkBuddyCUAHelper/releases')
 TEAM = '62RNP54C47'
 EXTENSION_IGNORES = ('native-host-config.json', 'native-host-launcher.sh', '__pycache__',
@@ -59,7 +71,7 @@ def read(path):
 def atomic(path, data, mode=0o600):
     path = checked(path)
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    fd, temporary = tempfile.mkstemp(prefix='.cua-', dir=path.parent)
+    fd, temporary = tempfile.mkstemp(prefix='.quietbridge-', dir=path.parent)
     try:
         with os.fdopen(fd, 'wb') as stream:
             os.fchmod(stream.fileno(), mode)
@@ -88,99 +100,15 @@ def tree_digest(directory, ignore=()):
 
 
 def owned(entry, home):
-    if not isinstance(entry, dict) or not isinstance(entry.get('args'), list):
-        return False
-    runtime = home / 'Library/Application Support/workbuddy-cua/releases'
-    connector = home / 'Library/Application Support/workbuddy-cua/connector/connector.py'
-    for arg in entry['args']:
-        if not isinstance(arg, str):
-            continue
-        path = Path(arg)
-        if (path == connector or path in (APP / 'Contents/Resources/bridge/server.py',
-                     LEGACY_APP / 'Contents/Resources/bridge/server.py') or
-                (path.name == 'server.py' and runtime in path.parents)):
-            return True
-        # Recognise source installs created by install.py without baking one
-        # developer's checkout location into the distributed installer.
-        if (path.name == 'server.py' and path.parent.name == 'cua-mcp-bridge' and home in path.parents
-                and isinstance(entry.get('description'), str) and entry['description'].startswith('workbuddy-cua：')):
-            source = read(path)
-            if source is not None and b'SERVER_NAME = "workbuddy-cua"' in source:
-                return True
-    return False
+    return workbuddy.owned(entry, home, read=read, app_paths=APP_PATHS)
 
 
 def config_plan(home, bridge, helper, stable=False):
-    config = checked(home / '.workbuddy/mcp.json')
-    original = read(config)
-    data = json.loads(original) if original is not None else {}
-    if not isinstance(data, dict) or not isinstance(data.get('mcpServers', {}), dict):
-        raise ValueError('mcp.json 格式无法识别；未修改')
-    servers = data.setdefault('mcpServers', {})
-    key = 'workbuddy-cua'
-    if key in servers and not owned(servers[key], home):
-        raise ValueError('workbuddy-cua 配置键已被其他组件占用；未覆盖')
-    if key not in servers and 'cua' in servers and owned(servers['cua'], home):
-        key = 'cua'
-    entry = dict(servers.get(key, {}))
-    if not isinstance(entry.get('env', {}), dict):
-        raise ValueError('现有连接 env 格式错误；未修改')
-    env = dict(entry.get('env', {}))
-    if stable:
-        # The active manifest owns the helper version; keep the transport hash
-        # fixed across upgrades so the host retains trust and enabled state.
-        env.pop('CUA_HELPER_PATH', None)
-    else:
-        env['CUA_HELPER_PATH'] = str(helper)
-    entry.update(command=sys.executable, args=['-B', str(bridge)], env=env)
-    servers[key] = entry
-    return config, original, (json.dumps(data, ensure_ascii=False, indent=2) + '\n').encode()
+    return workbuddy.mcp_plan(home, bridge, helper, stable, checked=checked, read=read, owns=owned)
 
 
 def lifecycle_plan(home, connector, config):
-    """Merge supported Workbuddy hooks without replacing the person's hooks."""
-    settings = checked(home / '.workbuddy/settings.json')
-    original = read(settings)
-    data = json.loads(original) if original else {}
-    if not isinstance(data, dict) or not isinstance(data.get('hooks', {}), dict):
-        raise ValueError('settings.json hooks 格式无法识别；未修改')
-    entry = next(value for value in json.loads(config)['mcpServers'].values()
-                 if str(connector) in value.get('args', []))
-    runtime = Path(entry.get('env', {}).get('CUA_CONFIG_DIR') or
-                   home / 'Library/Application Support/WorkbuddyExtension/cua-helper-config')
-    if not runtime.is_absolute():
-        raise ValueError('CUA_CONFIG_DIR 必须是绝对路径')
-    script = connector.with_name('host_lifecycle.py')
-    command = ' '.join(shlex.quote(str(part)) for part in
-                       (sys.executable, '-B', script, '--config-dir', runtime))
-    hooks = data.setdefault('hooks', {})
-    for event in ('PostToolUse', 'FinalStop', 'SessionEnd'):
-        groups = hooks.get(event, [])
-        if not isinstance(groups, list):
-            raise ValueError('settings.json hook 事件必须是数组')
-        retained = []
-        for group in groups:
-            if not isinstance(group, dict) or not isinstance(group.get('hooks'), list):
-                raise ValueError('settings.json hook 组格式无法识别')
-            remaining = []
-            for hook in group['hooks']:
-                if not isinstance(hook, dict):
-                    raise ValueError('settings.json hook 格式无法识别')
-                try:
-                    parts = shlex.split(hook.get('command', ''))
-                except ValueError:
-                    parts = []
-                ours = hook.get('type') == 'command' and len(parts) >= 3 and parts[1:3] == ['-B', str(script)]
-                if not ours:
-                    remaining.append(hook)
-            if remaining:
-                retained.append(dict(group, hooks=remaining))
-        group = {'hooks': [{'type': 'command', 'command': command, 'timeout': 5}]}
-        if event == 'PostToolUse':
-            group['matcher'] = r'^(?:mcp__)?(?:workbuddy-cua|cua)__cua_task$'
-        retained.append(group)
-        hooks[event] = retained
-    return settings, original, (json.dumps(data, ensure_ascii=False, indent=2) + '\n').encode()
+    return workbuddy.lifecycle_plan(home, connector, config, checked=checked, read=read)
 
 
 def preflight(home):
@@ -192,7 +120,7 @@ def preflight(home):
     if home.stat().st_uid != os.getuid() or os.geteuid() == 0:
         raise ValueError('用户组件必须以桌面用户身份安装')
     config_plan(home, APP / 'Contents/Resources/bridge/server.py', APP)
-    runtime = checked(home / 'Library/Application Support/workbuddy-cua')
+    runtime = checked(runtime_root(home))
     for relative in ('extension/extension-stage', 'releases', 'transactions'):
         checked(runtime / relative)
     agent = checked(home / 'Library/LaunchAgents' / (LABEL + '.plist'))
@@ -201,8 +129,8 @@ def preflight(home):
         value = plistlib.loads(previous_agent)
         args = value.get('ProgramArguments', [])
         if (value.get('Label') != LABEL or not isinstance(args, list) or not args or
-                not (Path(args[0]) in (APP / 'Contents/MacOS/workbuddy-cua-native',
-                                       LEGACY_APP / 'Contents/MacOS/workbuddy-cua-native') or
+                not (Path(args[0]) in tuple(app / 'Contents/MacOS' / name for app in APP_PATHS
+                         for name in ('quietbridge-native', 'workbuddy-cua-native')) or
                      runtime / 'releases' in Path(args[0]).parents)):
             raise ValueError('登录启动项被其他组件占用；未覆盖')
     for journal in sorted((runtime / 'transactions').glob('*/journal.json')):
@@ -320,14 +248,15 @@ class MenuBarService:
     def owns_process(self, executable, owner, arguments):
         if owner != str(os.getuid()):
             return False
-        system_binaries = {app / 'Contents/MacOS/workbuddy-cua-native' for app in (APP, LEGACY_APP)}
-        releases = self.agent.parents[1] / 'Application Support/workbuddy-cua/releases'
+        system_binaries = {app / 'Contents/MacOS' / name for app in APP_PATHS
+                           for name in ('quietbridge-native', 'workbuddy-cua-native')}
+        releases = runtime_root(self.agent.parents[2]) / 'releases'
         if executable in system_binaries:
             # proc_pidpath follows the renamed bundle, while argv retains the
             # path used at launch. Only these two system paths are aliases.
             launch_paths = system_binaries
         elif (executable.parent.name == 'MacOS' and executable.parent.parent.name == 'Contents'
-              and executable.name == 'workbuddy-cua-native' and releases in executable.parents):
+              and executable.name in ('quietbridge-native', 'workbuddy-cua-native') and releases in executable.parents):
             launch_paths = {executable}
         else:
             return False
@@ -424,7 +353,7 @@ def user_processes():
 
 def legacy_bridges(home):
     """A rewritten mcp.json does not replace a host's cached live transport."""
-    releases = home / 'Library/Application Support/workbuddy-cua/releases'
+    releases = runtime_root(home) / 'releases'
     found = []
     for pid, executable in user_processes():
         if not executable.name.lower().startswith('python'):
@@ -437,9 +366,12 @@ def legacy_bridges(home):
                 continue
             script = Path(command[len(prefix):])
             if (script.parts[-4:] == ('Contents', 'Resources', 'bridge', 'server.py') and
-                    (releases in script.parents or script in (
-                        APP / 'Contents/Resources/bridge/server.py', LEGACY_APP / 'Contents/Resources/bridge/server.py'))):
-                verify_code(script.parents[3], LABEL)
+                    (releases in script.parents or script in tuple(app / 'Contents/Resources/bridge/server.py' for app in APP_PATHS))):
+                app = script.parents[3]
+                identifier = plistlib.loads((app / 'Contents/Info.plist').read_bytes()).get('CFBundleIdentifier')
+                if identifier not in (MENU_IDENTIFIER, LEGACY_MENU_IDENTIFIER):
+                    raise ValueError('旧连接的应用标识无法识别')
+                verify_code(app, identifier)
                 found.append({'pid': pid, 'bridge': str(script)})
                 break
     return found
@@ -450,16 +382,16 @@ def retire_previous_helpers(helper, build):
     candidates = []
     verified = set()
     for pid, executable in user_processes():
-        if executable == helper or PUBLIC not in executable.parents or executable.parts[-3:] != (
-                'Contents', 'MacOS', 'workbuddy-cua-native'):
+        if executable == helper or PUBLIC not in executable.parents or executable.parts[-3:-1] != ('Contents', 'MacOS') or executable.name not in ('quietbridge-native', 'workbuddy-cua-native'):
             continue
         app = checked(executable.parents[2])
         info = plistlib.loads((app / 'Contents/Info.plist').read_bytes())
-        if (info.get('CFBundleIdentifier') != 'com.workbuddy.cua.helper' or
+        identifier = info.get('CFBundleIdentifier')
+        if (identifier not in (HELPER_IDENTIFIER, LEGACY_HELPER_IDENTIFIER) or
                 not str(info.get('CFBundleVersion', '')).isdigit() or int(info['CFBundleVersion']) >= int(build)):
             continue
         if app not in verified:
-            verify_code(app, 'com.workbuddy.cua.helper')
+            verify_code(app, identifier)
             verified.add(app)
         candidates.append((pid, executable))
     def alive(identity):
@@ -481,8 +413,8 @@ def retire_previous_helpers(helper, build):
 def handshake(bridge, helper):
     request = json.dumps({'id': 1, 'method': 'initialize', 'params': {}}) + '\n'
     reply = subprocess.run([sys.executable, '-B', str(bridge)], input=request, capture_output=True,
-                           text=True, timeout=15, env=dict(os.environ, CUA_HELPER_PATH=str(helper)))
-    if reply.returncode or json.loads(reply.stdout)['result']['serverInfo']['name'] != 'workbuddy-cua':
+                           text=True, timeout=15, env=dict(os.environ, QUIETBRIDGE_HELPER_PATH=str(helper)))
+    if reply.returncode or json.loads(reply.stdout)['result']['serverInfo']['name'] != 'quietbridge':
         raise ValueError('安装副本 MCP 握手失败；未提交用户配置')
 
 
@@ -495,36 +427,36 @@ def verify_helper(helper):
         info = path.stat()
         if info.st_uid != 0 or info.st_mode & 0o022:
             raise ValueError('helper 路径权限不安全: ' + str(path))
-    verify_code(helper_app, 'com.workbuddy.cua.helper')
+    verify_code(helper_app, HELPER_IDENTIFIER)
 
 
 def deploy(home, helper, app=APP, support=SUPPORT, service=None):
     runtime = preflight(home)
     verify_helper(helper)
-    verify_code(app, LABEL)
+    verify_code(app, MENU_IDENTIFIER)
     menu_info = plistlib.loads((app / 'Contents/Info.plist').read_bytes())
     helper_info = plistlib.loads((helper.parents[2] / 'Contents/Info.plist').read_bytes())
     if any(helper_info.get(key) != menu_info.get(key) for key in ('CFBundleShortVersionString', 'CFBundleVersion')):
         raise ValueError('独立 helper 与菜单栏版本不一致；停止安装')
     extension_source = support / 'extension/extension-stage'
-    digest = hashlib.sha256((tree_digest(app) + tree_digest(extension_source, EXTENSION_IGNORES)).encode()).hexdigest()[:20]
+    digest = hashlib.sha256((tree_digest(app, ('__pycache__', '*.pyc')) + tree_digest(extension_source, EXTENSION_IGNORES)).encode()).hexdigest()[:20]
     release = checked(runtime / 'releases' / digest)
     if not release.exists():
         release.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         stage = Path(tempfile.mkdtemp(prefix='.release-', dir=release.parent))
         try:
-            shutil.copytree(app, stage / 'workbuddy-cua.app')
+            shutil.copytree(app, stage / 'QuietBridge.app', ignore=shutil.ignore_patterns('__pycache__', '*.pyc'))
             shutil.copytree(extension_source, stage / 'extension', ignore=shutil.ignore_patterns(*EXTENSION_IGNORES))
             stage.rename(release)
         finally:
             if stage.exists():
                 shutil.rmtree(stage)
-    if (tree_digest(release / 'workbuddy-cua.app') != tree_digest(app) or
+    if (tree_digest(release / 'QuietBridge.app', ('__pycache__', '*.pyc')) != tree_digest(app, ('__pycache__', '*.pyc')) or
             tree_digest(release / 'extension') != tree_digest(extension_source, EXTENSION_IGNORES)):
         raise ValueError('版本目录内容不一致；停止安装')
-    menu_app = release / 'workbuddy-cua.app'
-    verify_code(menu_app, LABEL)
-    binary = menu_app / 'Contents/MacOS/workbuddy-cua-native'
+    menu_app = release / 'QuietBridge.app'
+    verify_code(menu_app, MENU_IDENTIFIER)
+    binary = menu_app / 'Contents/MacOS/quietbridge-native'
     bridge = menu_app / 'Contents/Resources/bridge/server.py'
     connector = checked(runtime / 'connector/connector.py')
     config, original, rendered = config_plan(home, connector, helper, stable=True)
@@ -534,7 +466,12 @@ def deploy(home, helper, app=APP, support=SUPPORT, service=None):
     sys.path.insert(0, str(release / 'extension'))
     spec = importlib.util.spec_from_file_location('package_native_host', release / 'extension/install_native_host.py')
     host = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(host)
+    previous_bytecode = sys.dont_write_bytecode
+    sys.dont_write_bytecode = True
+    try:
+        spec.loader.exec_module(host)
+    finally:
+        sys.dont_write_bytecode = previous_bytecode
     plan = host.plan(home=home)
     registration = Path(plan['manifestPath'])
     previous = read(registration)
@@ -549,14 +486,24 @@ def deploy(home, helper, app=APP, support=SUPPORT, service=None):
     active = json.dumps({'generation': generation, 'bridge': str(bridge), 'helper': str(helper),
                          'version': menu_info['CFBundleShortVersionString']}).encode()
     files = [(config, original, rendered, 0o600),
-             (connector, read(connector), (bridge.parent / 'connector.py').read_bytes(), 0o600),
-             (connector.with_name('stdio_transport.py'), read(connector.with_name('stdio_transport.py')),
-              (bridge.parent / 'stdio_transport.py').read_bytes(), 0o600),
-             (connector.with_name('host_lifecycle.py'), read(connector.with_name('host_lifecycle.py')),
-              (bridge.parent / 'host_lifecycle.py').read_bytes(), 0o600),
              (settings, old_settings, rendered_settings, 0o600)]
-    for source, target in ((release / 'extension/native_host.py', Path(plan['hostPath'])),
-                           (release / 'extension/browser_events.py', Path(plan['bridgePath']))):
+    stable_modules = ['connector.py', 'stdio_transport.py', 'compatibility.py', 'lifecycle_store.py',
+                      'session_routing.py', 'session_registry.py', 'browser_events.py']
+    stable_modules += [str(path.relative_to(bridge.parent)) for path in sorted((bridge.parent / 'adapters').rglob('*.py'))]
+    transport_changed = False
+    for relative in stable_modules:
+        target = connector.parent / relative
+        prior_module = read(target)
+        replacement = (bridge.parent / relative).read_bytes()
+        if relative == 'connector.py' and prior_module is not None:
+            if hashlib.sha256(prior_module).hexdigest() in PUBLISHED_CONNECTOR_DIGESTS:
+                replacement = prior_module
+            transport_changed = prior_module != replacement
+        files.append((target, prior_module, replacement, 0o600))
+    extension_modules = [(release / 'extension/native_host.py', Path(plan['hostPath']))]
+    extension_modules += [(release / 'extension' / name, Path(plan['bridgePath']).with_name(name))
+                          for name in ('browser_events.py', 'compatibility.py', 'session_registry.py', 'lifecycle_store.py')]
+    for source, target in extension_modules:
         files.append((target, read(target), source.read_bytes(), 0o600))
     launcher = Path(plan['launcherPath'])
     files.append((launcher, read(launcher), host.launcher_script(sys.executable, Path(plan['hostPath'])).encode(), 0o700))
@@ -618,19 +565,24 @@ def deploy(home, helper, app=APP, support=SUPPORT, service=None):
     transaction.values['lifecycleHooks'] = {'installed': True,
         'events': ['PostToolUse', 'FinalStop', 'SessionEnd'], 'settings': str(settings)}
     previous_servers = json.loads(original).get('mcpServers', {}) if original else {}
-    previous_entry = next((v for k, v in previous_servers.items() if k in ('workbuddy-cua', 'cua') and owned(v, home)), None)
+    previous_entry = next((v for k, v in previous_servers.items() if k in ('quietbridge', *LEGACY_SERVER_NAMES) and owned(v, home)), None)
     stable_before = previous_entry is not None and str(connector) in previous_entry.get('args', [])
     connection = {'state': 'pending_connection' if stable_before else
                   'host_refresh_required' if previous_entry else 'first_install',
                   'automaticUpdates': True}
+    if stable_before and transport_changed:
+        connection.update(state='host_refresh_required', transportChanged=True)
     if running_legacy:
         connection.update(state='host_refresh_required', legacyBridgePids=[item['pid'] for item in running_legacy])
     elif running_legacy is None:
         connection['state'] = 'verification_unavailable'
     if connection['state'] == 'host_refresh_required':
         connection['message'] = ('Workbuddy 仍缓存旧连接的启动命令，普通重连不会重新读取配置。'
-                                 '请保存当前工作后完整退出并重新打开 Workbuddy，再连接 workbuddy-cua；'
+                                 '请保存当前工作后完整退出并重新打开 Workbuddy，再连接 quietbridge；'
                                  '迁移到固定入口后，后续覆盖安装和升级自动加载新版。')
+        if connection.get('transportChanged'):
+            connection['message'] = ('已更新无法识别的旧连接入口。请在 Workbuddy 中重新确认 QuietBridge 连接的信任与启用状态；'
+                                     '确认后只读核实权限和目标，不能重放旧输入。')
     if stable_before and connection['state'] == 'pending_connection':
         until = time.monotonic() + 8
         while time.monotonic() < until:
@@ -676,7 +628,7 @@ def main():
         preflight(home)
         print('环境与现有连接配置检查通过')
         return
-    runtime = checked(home / 'Library/Application Support/workbuddy-cua')
+    runtime = checked(runtime_root(home))
     runtime.mkdir(parents=True, exist_ok=True, mode=0o700)
     lock = checked(runtime / '.install.lock')
     fd = os.open(lock, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)

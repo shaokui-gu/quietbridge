@@ -20,25 +20,48 @@ if [[ -z "$python" ]]; then
     echo '需要 Python 3.9 或更高版本。请先安装 Python，再运行此安装包。' >&2
     exit 1
 fi
-/usr/bin/sudo -H -u "$user" "$python" -B - --check < "$(dirname "$0")/deploy.py"
-# Migrate the old user-visible bundle name before the new payload is unpacked.
-# The project, bundle identifier and executable keep their existing names.
-legacy='/Applications/workbuddy-cua.app'
-current='/Applications/Workbuddy CUA.app'
-if [[ -L "$legacy" || -L "$current" ]]; then
-    echo '应用程序路径不能是符号链接。' >&2
-    exit 1
-fi
-if [[ -e "$legacy" && -e "$current" ]]; then
-    echo '同时发现新旧应用目录；请先移除旧的 workbuddy-cua.app。' >&2
-    exit 1
-fi
-if [[ -e "$legacy" ]]; then
-    identifier="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$legacy/Contents/Info.plist")"
-    if [[ "$identifier" != 'com.workbuddy.cua.menubar' ]] || ! /usr/bin/codesign --verify --strict -R \
-        '=anchor apple generic and identifier "com.workbuddy.cua.menubar" and certificate leaf[subject.OU] = "62RNP54C47"' "$legacy"; then
+# Installer's private Scripts directory may not be traversable by the desktop
+# user. Stage read-only, root-owned preflight code; never run their Python as root.
+preflight="$(/usr/bin/mktemp -d /private/tmp/quietbridge-preflight.XXXXXX)"
+trap '/bin/rm -rf "$preflight"' EXIT
+/bin/cp "$(dirname "$0")/deploy.py" "$(dirname "$0")/compatibility.py" "$preflight/"
+/bin/cp -R "$(dirname "$0")/adapters" "$preflight/adapters"
+/bin/chmod -R a+rX "$preflight"
+/usr/bin/sudo -H -u "$user" "$python" -B "$preflight/deploy.py" --check
+# Only signed copies of our old/new identity may occupy the fixed install path.
+verify_existing_app() {
+    local identifier requirement
+    identifier="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$1/Contents/Info.plist")"
+    case "$identifier" in
+        com.quietbridge.app)
+            requirement='=anchor apple generic and identifier "com.quietbridge.app" and certificate leaf[subject.OU] = "62RNP54C47"' ;;
+        com.workbuddy.cua.menubar)
+            requirement='=anchor apple generic and identifier "com.workbuddy.cua.menubar" and certificate leaf[subject.OU] = "62RNP54C47"' ;;
+        *) echo '现有应用标识无法识别；未替换应用。' >&2; return 1 ;;
+    esac
+    /usr/bin/codesign --verify --strict -R "$requirement" "$1"
+}
+current='/Applications/QuietBridge.app'
+legacy=''
+for candidate in '/Applications/Workbuddy CUA.app' '/Applications/workbuddy-cua.app'; do
+    if [[ -L "$candidate" || -L "$current" ]]; then
+        echo '应用程序路径不能是符号链接。' >&2
+        exit 1
+    fi
+    if [[ -e "$candidate" ]]; then
+        if [[ -n "$legacy" || -e "$current" ]]; then
+            echo '发现多个 QuietBridge 新旧应用副本；请保留一个已验证副本后重试。' >&2
+            exit 1
+        fi
+        legacy="$candidate"
+    fi
+done
+if [[ -n "$legacy" ]]; then
+    if ! verify_existing_app "$legacy"; then
         echo '旧应用签名或标识无法验证；未移动应用目录。' >&2
         exit 1
     fi
     /bin/mv "$legacy" "$current"
+elif [[ -e "$current" ]]; then
+    verify_existing_app "$current"
 fi

@@ -1,13 +1,15 @@
-# macOS installation package
+# QuietBridge macOS installation package
 
 Build the Swift release executable and the signed authorization plug-in, then:
 
 ```sh
-env CLANG_MODULE_CACHE_PATH=/private/tmp/cua-ui-module-cache \
-    SWIFT_MODULECACHE_PATH=/private/tmp/cua-ui-module-cache \
-    swift build --package-path cua-helper-build --configuration release --disable-sandbox
-python3 packaging/macos/build.py --version 0.5.49 --build 77 \
-  --identity 'Developer ID Application: shaokui gu (62RNP54C47)'
+env CLANG_MODULE_CACHE_PATH=/private/tmp/quietbridge-ui-module-cache \
+    SWIFT_MODULECACHE_PATH=/private/tmp/quietbridge-ui-module-cache \
+    swift build --package-path apps/macos --configuration release --disable-sandbox
+make -C system/authorization-plugin all \
+  PROVISIONING_PROFILE="$PWD/sign/QuietBridgeAuthp.provisionprofile"
+python3 packaging/macos/build.py --version 0.6.0 --build 83 \
+  --identity 'Developer ID Application: shaokui gu (62RNP54C47)' --profiles-dir sign
 ```
 
 Building writes only to `dist/`. It does not install applications, launch services,
@@ -21,16 +23,23 @@ ownership, symlinks and unfinished installation journals before replacing payloa
 files. Python is not bundled or automatically downloaded. macOS permissions and
 connector trust still require the user's confirmation.
 
-The menu app keeps identifier `com.workbuddy.cua.menubar`. A separate app signed
-as `com.workbuddy.cua.helper` is installed into an immutable, root-owned release
+The menu app uses identifier `com.quietbridge.app`. A separate app signed
+as `com.quietbridge.helper` is installed into an immutable, root-owned release
 under `/Library/Application Support/WorkBuddyCUAHelper/releases/`. The plug-in's
 strict identifier/team checks remain enabled. Both apps carry the same version.
-Bundle relocation is disabled.
+Bundle relocation is disabled. Preinstall verifies the existing app against
+the exact known old/new identifier and developer team before allowing replacement
+at the fixed path. The launchd job key remains `com.workbuddy.cua.menubar` so an
+upgrade can stop and restore the existing job without creating a second one;
+it is a storage key, not the new app's signing identity.
 
-The user-visible bundle is installed as `/Applications/Workbuddy CUA.app`. During
-an upgrade, the preinstall check verifies the old `workbuddy-cua.app` bundle's
-identifier and Developer ID signature before moving it to the new visible name.
-The helper bundle and executable names remain unchanged.
+The user-visible bundle is installed as `/Applications/QuietBridge.app`. During
+an upgrade, preinstall recognizes `Workbuddy CUA.app` and `workbuddy-cua.app`,
+verifies their signing identity, and migrates one old bundle to the new name.
+The new executable is `quietbridge-native`. New bundle identifiers intentionally
+change the TCC identity: verify/regrant Accessibility and Screen Recording in the
+first-run wizard. Authorization mechanism names remain compatible. Duplicate app copies abort the
+automatic migration rather than deleting a bundle.
 When stopping an old menu process, the installer accepts either system bundle
 name in its original launch arguments: macOS updates the process executable path
 after a directory rename while retaining the original arguments. User ownership,
@@ -61,13 +70,13 @@ until the person opens the app again. Reopening creates a fresh session and does
 not resume old browser commands.
 Deployment failures restore user configuration, native-host
 registration, the extension directory and the previous LaunchAgent.
-The journal stays under `~/Library/Application Support/workbuddy-cua/transactions`.
+The journal stays under `~/Library/Application Support/quietbridge/transactions`.
 If automatic recovery was interrupted, double-click
-`/Library/Application Support/workbuddy-cua/恢复安装.command` before retrying.
+`/Library/Application Support/quietbridge/恢复安装.command` before retrying.
 Recovery preserves intervening user edits and reports conflicts.
 
 From 0.5.49 the MCP transport uses the fixed user entrypoint
-`~/Library/Application Support/workbuddy-cua/connector/connector.py`.
+`~/Library/Application Support/quietbridge/connector/connector.py`.
 The transaction publishes `active.json` last. The connected process checks it
 between complete requests, loads the new bridge and helper path, and emits
 `notifications/tools/list_changed` without dropping stdio. In-flight requests
@@ -90,7 +99,7 @@ same command/arguments/environment and require no manual off/on.
 
 This transaction does **not** roll back system files installed by PackageKit. In
 particular, when upgrading from a release whose old LaunchAgent points directly
-to `/Applications/workbuddy-cua.app`, restoring that agent cannot restore its
+to `/Applications/QuietBridge.app`, restoring that agent cannot restore its
 previous executable. Versioned menu releases prevent that issue on later upgrades.
 A failed postinstall is reported as failure; retry the package after resolving it.
 
@@ -100,14 +109,24 @@ to load the unpacked extension and grant site access. The browser task panel's
 Chrome's extension manager, copy the deployed directory and reveal it in Finder.
 Installation does not open Terminal, a local HTTP server or a completion dialog.
 
-The optional authorization plug-in is carried as a signed bundle with its manager
-under `/Library/Application Support/workbuddy-cua/plugin/`. The main package
+The optional authorization plug-in is signed as
+`com.quietbridge.AuthorizationPlugin` and trusts only `com.quietbridge.helper`.
+None of these binaries requests restricted entitlements, so Developer ID signing
+does not require a provisioning profile. When `--profiles-dir` is supplied,
+the build embeds the matching QuietBridge App/Helper/Authorization profiles.
+Their bundle identifier, team, expiration and included signing certificate are
+verified before packaging. Old profiles tied to old identifiers are rejected.
+The plug-in is carried as a signed bundle with its manager
+under `/Library/Application Support/quietbridge/plugin/`. The main package
 never activates it. The menu panel opens the packaged manager rather than asking
 for a source checkout. Installation, update, enable, status and restore/uninstall
 are available there. System changes require the user's menu selection and local
 administrator authentication. An update requires a recognised committed policy,
 keeps the original authorization backup, and restores its binary/receipt on
-failure. Unknown or unfinished authorization transactions must be inspected and
+failure. An upgrade recognises the old signed-identity ledger and updates it to
+the new identity while preserving the original policy backup and current policies.
+Until updated, the old plug-in remains unavailable to the new helper and the app
+shows an update prompt. Unknown or unfinished authorization transactions must be inspected and
 restored, rather than overwritten. After updating a loaded plug-in, log out and
 back in. Installing the plug-in never switches on the menu's lock-screen capability.
 
@@ -115,26 +134,32 @@ Validation (no real system installation):
 
 ```sh
 python3 -B -m unittest discover -s packaging/macos -p 'test_*.py'
-python3 -B -m unittest discover -s cua-auth-plugin/tests -p 'test_install.py'
-python3 -B -m unittest discover -s cua-mcp-bridge -p 'test_installer.py'
-python3 -B -m unittest discover -s cua-mcp-bridge -p 'test_browser_events.py'
-python3 cua-helper-build/tests/test_swift.py --disable-sandbox --filter MenuBar
+python3 -B -m unittest discover -s system/authorization-plugin/tests -p 'test_install.py'
+python3 -B -m unittest discover -s services/mcp -p 'test_installer.py'
+python3 -B -m unittest discover -s services/mcp -p 'test_browser_events.py'
+python3 apps/macos/tests/test_swift.py --disable-sandbox --filter MenuBar
 ```
 
 Exercise the real permission executor and its background session watchdog in an
 isolated runtime directory without requesting consent or starting the menu app:
 
 ```sh
-CUA_PERMISSION_SMOKE_EXECUTABLE="$PWD/cua-helper-build/.build/release/workbuddy-cua-native" \
-  python3 -B cua-helper-build/tests/test_permission_service.py
+QUIETBRIDGE_PERMISSION_SMOKE_EXECUTABLE="$PWD/apps/macos/.build/release/quietbridge-native" \
+  python3 -B apps/macos/tests/test_permission_service.py
 ```
 
 0.5.50 includes task cancellation and lease cleanup. The stable connector now installs its sibling `stdio_transport.py` transactionally before publishing `active.json`; releases include `task_lifecycle.py`. A connector process still executing the 0.5.49 entrypoint can hot-load the bridge and its watchdog, but concurrent cancellation reading takes effect on its next normal reconnection. Crash detection and the 120-second idle fallback remain available without forcing a host restart.
 
-0.5.51 verifies live legacy bridge processes independently of the configuration file. A cached old server requires Workbuddy to reload its configuration; a normal connector reconnect can reuse the cached startup command. The installer reports that explicitly instead of treating a previous configuration migration as a successful reconnect. After commit it retires only previous signed CUA helper versions owned by the desktop user; a versioned application session prevents those older helpers from reconnecting. Workbuddy and target applications are never terminated by this cleanup.
+0.5.51 verifies live legacy bridge processes independently of the configuration file. A cached old server requires Workbuddy to reload its configuration; a normal connector reconnect can reuse the cached startup command. The installer reports that explicitly instead of treating a previous configuration migration as a successful reconnect. After commit it retires only previous signed QuietBridge helper versions owned by the desktop user; a versioned application session prevents those older helpers from reconnecting. Workbuddy and target applications are never terminated by this cleanup.
 
 0.5.52 (build 80) updates legacy migration guidance. A subsequent test showed that cancelling between tool calls can leave the MCP transport open: Workbuddy cancelled at 16:23:21 and reclaimed the worker at 16:24:44, when native resources were finally released. Transport cancellation alone therefore does not guarantee immediate preview cleanup.
 
 0.5.53 (build 81) installs the stable `host_lifecycle.py` entrypoint and merges Workbuddy's supported PostToolUse, FinalStop and SessionEnd hooks into `~/.workbuddy/settings.json` in the same rollback transaction. Existing settings and unrelated hooks are preserved. Task receipts associate an exact task/lease owner with a host session and turn; FinalStop revokes only that association even while MCP remains connected. The bridge polls this bounded state every 500ms and cancels active native waits as well as idle previews. The independent 120-second fallback remains for hosts without callbacks. Protocol and hook tests do not drive the user's desktop.
 
 The signed bridge includes a 64×64 PNG derived from the application Logo. MCP initialize/serverInfo and tools/list expose it through the standard icons field as a data URI. Rendering support is controlled by the Agent client.
+
+QuietBridge migration keeps known published stable connector bytes, in addition
+to their paths and owned connection keys, so the rename does not deliberately
+change the host trust fingerprint. These original loaders can load the new MCP
+core and its release-local compatibility modules. An unknown modified bootstrap
+is replaced with the packaged entry and reports that host trust must be checked.

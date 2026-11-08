@@ -1,0 +1,8 @@
+{
+  "id": "deepseek-harness",
+  "status": "planned",
+  "transport": null,
+  "trustedContext": [],
+  "supportsConcurrentAgents": false,
+  "blockingRequirements": ["Verify host plugin API", "Obtain trusted agent and execution identities", "Implement independent cancellation and preview ownership"]
+}
