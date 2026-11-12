@@ -1,7 +1,6 @@
 """独立的浏览器观察存储；不接触 helper、输入权限或系统窗口映射。"""
 import copy
 import fcntl
-import itertools
 import json
 import os
 from compatibility import application_runtime, browser_layout, browser_runtime_root, environment
@@ -190,24 +189,113 @@ CREATED_FIELDS = {'requestId', 'browserWindowId', 'tabId'}
 COMMAND_TTL = 8
 CANDIDATE_TTL = 20
 CANDIDATE_REFRESH_TIMEOUT = 3
+CANDIDATE_QUERY_TIMEOUT = 3
+NAVIGATION_OBSERVATION_TIMEOUT = 3
 MAX_RESULTS = 8
 MAX_SEEN = 64
-OPERATIONS = ('snapshot', 'click', 'fill', 'select', 'scroll', 'navigate', 'diagnostics', 'screenshot', 'keypress')
+OPERATIONS = ('snapshot', 'read', 'click', 'fill', 'select', 'scroll', 'navigate', 'diagnostics', 'screenshot', 'keypress', 'render_probe')
+OBSERVATIONS = ('snapshot', 'read', 'diagnostics', 'screenshot', 'render_probe')
+RENDER_PROBE_STAGES = ('inspect', 'attach', 'enable', 'layout', 'capture')
 MAX_ELEMENTS = 300
 MAX_LABEL = 80
-ACTION_FIELDS = ('ref', 'value', 'deltaY', 'direction', 'lines', 'url', 'snapshotId', 'key')
+ACTION_FIELDS = ('ref', 'value', 'deltaY', 'direction', 'lines', 'url', 'snapshotId', 'key',
+                 'mode', 'offset', 'limit', 'maxChars', 'readId', 'stage')
+
+
+def verification_next(peer):
+    verify = peer.get('pendingVerify')
+    return ('navigation_observation' if verify.get('operation') == 'navigate' and
+            not verify.get('destinationChanged') else 'snapshot') if verify else 'done'
+
+
+def mark_navigation_destination(peer, pending, record, outcome):
+    """A valid observation of a redirected page needs explicit snapshot review."""
+    verify = peer.get('pendingVerify') or {}
+    event = (record or {}).get('event') or {}
+    if (verify.get('operation') == 'navigate' and record and
+            all(verify.get(k) == pending.get(k) == record.get(k)
+                for k in ('taskId', 'bindingId', 'tabId', 'browserWindowId')) and
+            event.get('documentId') == pending.get('documentId') and
+            event.get('navigationEpoch') == pending.get('navigationEpoch') and
+            event.get('navigationEpoch', 0) > verify.get('navigationEpoch', 0) and
+            event.get('domReady') and event.get('readyState') in ('interactive', 'complete') and
+            event.get('url') != verify.get('url') and
+            (pending['operation'] == 'screenshot' or outcome.get('url') == event.get('url'))):
+        verify['destinationChanged'] = True
+        verify['observedUrl'] = event['url']
+
+
+def finish_pending(peer, status, now):
+    command = peer.get('command')
+    if not command:
+        return
+    terminal = {'commandId': command['requestId'], 'status': status, 'at': now,
+                'operation': command['operation'], 'taskId': command['taskId'],
+                'mayHaveExecuted': bool(command.get('delivered'))}
+    peer['commandTerminals'] = (peer.get('commandTerminals', []) + [terminal])[-MAX_SEEN:]
+    if status == 'expired':
+        peer['commandExpired'] = command['requestId']  # Read old stores compatibly.
+    else:
+        peer['commandCanceled'] = {**terminal, 'delivered': terminal['mayHaveExecuted']}
+    if command.get('delivered') and command['operation'] not in OBSERVATIONS:
+        # Unknown input outcomes still require a snapshot, including navigation
+        # whose dispatch outcome is unknown. Never infer success or replay it.
+        peer['pendingVerify'] = {'commandId': command['requestId'], 'taskId': command['taskId']}
+    peer['command'] = None
+
+
+def expire_pending(peer, now):
+    command = peer.get('command')
+    if command and now >= command.get('expiresAt', 0):
+        finish_pending(peer, 'expired', now)
+
+
+def redacted_url(value):
+    parsed = urlsplit(value)
+    return parsed.scheme + '://' + parsed.netloc + (parsed.path or '/')
+
+
+def navigation_verified(peer, pending, record, outcome):
+    verify = peer.get('pendingVerify') or {}
+    event = (record or {}).get('event') or {}
+    if not (verify.get('operation') == 'navigate' and record and
+            all(verify.get(k) == pending.get(k) == record.get(k)
+                for k in ('taskId', 'bindingId', 'tabId', 'browserWindowId')) and
+            event.get('documentId') == pending.get('documentId') and
+            event.get('navigationEpoch') == pending.get('navigationEpoch') and
+            event.get('navigationEpoch', 0) > verify.get('navigationEpoch', 0) and
+            event.get('domReady') and event.get('readyState') in ('interactive', 'complete') and
+            event.get('url') == verify.get('url')):
+        return False
+    # A screenshot attests only to this current viewport, never the entire page
+    # or the business outcome. Other observations also attest their own URL.
+    return pending['operation'] == 'screenshot' or (
+        outcome.get('url') == event['url'] and (pending['operation'] == 'read' or
+        outcome.get('readyState') in ('interactive', 'complete')))
 
 
 def command_params(args, operation):
-    allowed = {'snapshot': set(), 'click': {'ref'}, 'fill': {'ref', 'value'},
+    allowed = {'snapshot': set(), 'read': {'mode', 'offset', 'limit', 'maxChars', 'readId'},
+               'click': {'ref'}, 'fill': {'ref', 'value'},
                'select': {'ref', 'value'}, 'scroll': {'ref', 'direction', 'lines'},
-               'navigate': {'url'}, 'diagnostics': set(), 'screenshot': set(), 'keypress': {'key'}}[operation]
+               'navigate': {'url'}, 'diagnostics': set(), 'screenshot': set(), 'keypress': {'key'},
+               'render_probe': {'stage'}}[operation]
     if operation == 'scroll' and 'deltaY' in args:
         raise ValueError('浏览器滚动请使用 direction=down/up 和 lines，不接受有符号 deltaY')
     if operation in ('click', 'fill', 'select', 'scroll'):
         allowed.add('snapshotId')
     given = {key for key in ACTION_FIELDS if key in args}
     require(given <= allowed, '该命令不接受这些参数')
+    if operation == 'render_probe':
+        require(args.get('stage') in RENDER_PROBE_STAGES, 'render_probe 需要固定 stage')
+    if operation == 'read':
+        require(args.get('mode', 'content') in ('links', 'content'), 'read mode 必须为 links/content')
+        for key, low, high, default in (('offset', 0, 2000, 0), ('limit', 1, 100, 30),
+                                        ('maxChars', 4000, 16000, 10000)):
+            require(valid_int(args.get(key, default), low, high), 'read %s 超出范围' % key)
+        require('readId' not in args or (type(args['readId']) is str and 0 < len(args['readId']) <= 180),
+                'readId 格式错误')
+        require(args.get('offset', 0) == 0 or 'readId' in args, '分页必须传原 readId')
     if 'snapshotId' in args:
         require(type(args['snapshotId']) is str and 0 < len(args['snapshotId']) <= 160, '快照标识错误')
     if operation == 'keypress':
@@ -255,6 +343,37 @@ def validate_diagnostics(result):
     return copy.deepcopy(result)
 
 
+def validate_render_probe(result, params):
+    base = {'stage', 'startedAt', 'completedAt', 'performed', 'attachedBefore', 'pageEnabledBefore',
+            'attachedAfter', 'pageEnabledAfter'}
+    stage = params.get('stage')
+    require(stage in RENDER_PROBE_STAGES, '呈现探针阶段错误')
+    extra = {'viewportWidth', 'viewportHeight'} if stage == 'layout' else {'captureDataLength'} if stage == 'capture' else set()
+    require(type(result) is dict and set(result) == base | extra and result.get('stage') == stage,
+            '呈现探针回执阶段或字段错误')
+    for key in ('performed', 'attachedBefore', 'pageEnabledBefore', 'attachedAfter', 'pageEnabledAfter'):
+        require(type(result[key]) is bool, '呈现探针状态格式错误')
+    for key in ('startedAt', 'completedAt'):
+        require(type(result[key]) in (int, float) and 0 < result[key] < 4102444800, '呈现探针时间错误')
+    require(result['startedAt'] <= result['completedAt'] and result['completedAt'] - result['startedAt'] <= COMMAND_TTL,
+            '呈现探针执行时间错误')
+    for key in extra:
+        require(type(result[key]) in (int, float) and 0 < result[key] <= (100000 if stage == 'layout' else 34000000),
+                '呈现探针数值错误')
+    a, b = result['attachedBefore'], result['attachedAfter']
+    e, f = result['pageEnabledBefore'], result['pageEnabledAfter']
+    require((not e or a) and (not f or b), '呈现探针连接状态矛盾')
+    expected = {'inspect': (a, e, False), 'attach': (True, e, not a),
+                'enable': (True, True, not e), 'layout': (True, True, True),
+                'capture': (True, True, True)}[stage]
+    require((b, f, result['performed']) == expected and
+            (stage not in ('enable', 'layout', 'capture') or a) and
+            (stage not in ('layout', 'capture') or e), '呈现探针阶段状态矛盾')
+    if stage == 'capture':
+        require(type(result['captureDataLength']) is int, '呈现探针长度必须是整数')
+    return copy.deepcopy(result)
+
+
 def validate_action_result(result, operation):
     require(type(result) is dict and {'performed', 'verified', 'observed'} <= set(result) <= {'performed', 'verified', 'observed', 'children'},
             '动作结果字段错误')
@@ -277,7 +396,7 @@ def validate_action_result(result, operation):
 
 
 def validate_snapshot(result):
-    require(type(result) is dict and {'url', 'readyState', 'elementCount', 'elements'} <= set(result) <= {'url', 'readyState', 'elementCount', 'elements', 'snapshotId'},
+    require(type(result) is dict and {'url', 'readyState', 'elementCount', 'elements'} <= set(result) <= {'url', 'readyState', 'elementCount', 'elements', 'snapshotId', 'coverage'},
             '快照字段错误')
     require(type(result['url']) is str and 0 < len(result['url']) <= 8192, '快照 URL 错误')
     require(result['readyState'] in ('loading', 'interactive', 'complete'), '快照文档状态错误')
@@ -286,10 +405,22 @@ def validate_snapshot(result):
         require(type(result['snapshotId']) is str and 0 < len(result['snapshotId']) <= 160, '快照标识错误')
     elements = result['elements']
     require(type(elements) is list and len(elements) <= MAX_ELEMENTS, '快照元素数量错误')
+    if 'coverage' in result:
+        coverage = result['coverage']
+        require(type(coverage) is dict and set(coverage) ==
+                {'returnedElements', 'limit', 'truncated', 'scope', 'elementCountScope'} and
+                type(coverage['returnedElements']) is int and coverage['returnedElements'] == len(elements) and
+                type(coverage['limit']) is int and coverage['limit'] == MAX_ELEMENTS and
+                type(coverage['truncated']) is bool and (not coverage['truncated'] or len(elements) == MAX_ELEMENTS) and
+                coverage['scope'] == 'visible_interactive_top_and_accessible_frames' and
+                coverage['elementCountScope'] == 'top_document_dom_nodes_capped_10000', '快照覆盖范围错误')
     seen = set()
     for element in elements:
-        require(type(element) is dict and set(element) ==
-                {'ref', 'tag', 'role', 'name', 'disabled', 'x', 'y', 'width', 'height'}, '快照元素字段错误')
+        base = {'ref', 'tag', 'role', 'name', 'disabled', 'x', 'y', 'width', 'height'}
+        require(type(element) is dict and (set(element) == base or
+                set(element) == base | {'href', 'urlHasQuery', 'urlHasFragment'}), '快照元素字段错误')
+        if 'href' in element:
+            validate_link(element)
         require(valid_int(element['ref'], 1) and element['ref'] not in seen, '快照元素引用重复或非法')
         seen.add(element['ref'])
         require(type(element['tag']) is str and 1 <= len(element['tag']) <= 32, '元素标签错误')
@@ -298,6 +429,53 @@ def validate_snapshot(result):
         require(type(element['disabled']) is bool, '元素禁用状态错误')
         for key in ('x', 'y', 'width', 'height'):
             require(type(element[key]) is int and -100000 <= element[key] <= 100000, '元素几何错误')
+    return copy.deepcopy(result)
+
+
+def validate_link(item):
+    require(type(item.get('href')) is str and 0 < len(item['href']) <= 2048, '链接长度错误')
+    url = urlsplit(item['href'])
+    base = authorized_origin(url.scheme + '://' + url.netloc)
+    require(item['href'] == base + url.path and url.path.startswith('/') and
+            not url.query and not url.fragment, '链接必须为脱敏 HTTP(S) URL')
+    require(type(item.get('urlHasQuery')) is bool and type(item.get('urlHasFragment')) is bool, '链接脱敏标记错误')
+
+
+def validate_read(result, params):
+    fields = {'readId', 'mode', 'url', 'title', 'offset', 'nextOffset', 'totalItems',
+              'sourceTruncated', 'domOnly', 'observedAt', 'items'}
+    require(type(result) is dict and set(result) == fields, '正文读取字段错误')
+    require(type(result['readId']) is str and 0 < len(result['readId']) <= 180, '读取标识错误')
+    require(result['mode'] == params.get('mode', 'content'), '读取模式不符')
+    if params.get('readId'):
+        require(result['readId'] == params['readId'], '读取分页标识已变化')
+    require(type(result['url']) is str and len(result['url']) <= 8192 and
+            type(result['title']) is str and len(result['title']) <= 200, '读取页面信息错误')
+    require(valid_int(result['offset'], 0, 2000) and result['offset'] == params.get('offset', 0) and
+            valid_int(result['totalItems'], result['offset'], 2000), '读取范围错误')
+    items = result['items']
+    require(type(items) is list and len(items) <= params.get('limit', 30), '读取条目超限')
+    end = result['offset'] + len(items)
+    require(end <= result['totalItems'] and
+            ((end == result['totalItems'] and result['nextOffset'] is None) or
+             (end < result['totalItems'] and items and type(result['nextOffset']) is int and result['nextOffset'] == end)),
+            '读取分页不连续')
+    require(type(result['sourceTruncated']) is bool and result['domOnly'] is True and
+            valid_int(result['observedAt'], 0, 4102444800000), '读取范围或时间标记错误')
+    cost = 0
+    for item in items:
+        if result['mode'] == 'links':
+            require(type(item) is dict and set(item) == {'name', 'href', 'urlHasQuery', 'urlHasFragment'} and
+                    type(item['name']) is str and len(item['name']) <= 160, '读取链接字段错误')
+            validate_link(item)
+        else:
+            require(type(item) is dict and set(item) == {'id', 'kind', 'text', 'textOffset', 'textComplete'} and
+                    item['kind'] in ('article', 'text') and type(item['id']) is str and 0 < len(item['id']) <= 120 and
+                    type(item['text']) is str and 0 < len(item['text']) <= 2000 and
+                    valid_int(item['textOffset'], 0, 262144) and type(item['textComplete']) is bool,
+                    '读取正文字段错误')
+        cost += len(json.dumps(item, ensure_ascii=False, separators=(',', ':')))
+    require(cost <= params.get('maxChars', 10000), '读取字符超限')
     return copy.deepcopy(result)
 
 
@@ -434,15 +612,28 @@ def bound_native_target(task):
             type(task.get('sessionId')) is str and bool(task['sessionId']))
 
 
+LIFECYCLE_STAGES = {'observer_load', 'observer_configure', 'observer_stop', 'guard_stop', 'guard_install',
+                    'target_release', 'debugger_detach', 'probe_attach', 'document_lookup', 'assignment_lookup',
+                    'window_evidence', 'candidate_lookup'}
+LIFECYCLE_CODES = {'BROWSER_LIFECYCLE_TIMEOUT', 'BROWSER_LIFECYCLE_FAILED'}
+
+
+def current_observer_status(peer, record):
+    observation = peer.get('observerStatus')
+    event = (record or {}).get('event') or {}
+    if (observation and record and observation['bindingId'] == record['bindingId'] and
+            observation['documentId'] == event.get('documentId') and
+            observation['navigationEpoch'] == event.get('navigationEpoch')):
+        return observation
+    return None
+
+
 def sync_peer(message, origin, task_file, event_file):
     session = application_session()
     require(session is not None, 'APP_NOT_RUNNING: 请先打开 QuietBridge')
     base = {'action', 'enabled', 'permission'}
-    optional = ('candidates', 'created', 'commandResult', 'clientVersion', 'assignmentTitle', 'capabilities', 'panelState', 'panelResult', 'applicationSession')
-    allowed = {frozenset(base | set(combo))
-               for size in range(len(optional) + 1)
-               for combo in itertools.combinations(optional, size)}
-    require(frozenset(message) in allowed, '握手字段错误')
+    optional = ('candidates', 'created', 'commandResult', 'clientVersion', 'assignmentTitle', 'capabilities', 'panelState', 'panelResult', 'applicationSession', 'windowEvidence', 'observerStatus', 'lifecycleError', 'previewFrame')
+    require(type(message) is dict and base <= message.keys() <= base | set(optional), '握手字段错误')
     require(type(message['enabled']) is bool and type(message['permission']) is bool, '权限类型错误')
     require('applicationSession' not in message or message['applicationSession'] is None or
             (type(message['applicationSession']) is str and 0 < len(message['applicationSession']) <= 128), '应用会话格式错误')
@@ -527,6 +718,45 @@ def sync_peer(message, origin, task_file, event_file):
             require(type(title) is str and 0 < len(title) <= 200 and
                     not any(ord(c) < 32 for c in title), '标签标题不合法')
             peer['assignmentTitle'] = title
+        if 'windowEvidence' in message:
+            evidence = message['windowEvidence']
+            if evidence is not None:
+                require(type(evidence) is dict and set(evidence) == {'bindingId', 'browserWindowId', 'tabId', 'title'} and
+                        type(evidence['bindingId']) is str and re.fullmatch('[a-f0-9]{32}', evidence['bindingId']) and
+                        valid_int(evidence['browserWindowId']) and valid_int(evidence['tabId']) and
+                        type(evidence['title']) is str and 0 < len(evidence['title']) <= 200 and
+                        evidence['title'].strip() and not any(ord(c) < 32 for c in evidence['title']),
+                        '浏览器窗口证据格式错误')
+            assignment_now = current_assignment(data, task_file)
+            if (message['enabled'] and message['permission'] and evidence is not None and assignment_now and
+                    evidence['bindingId'] == assignment_now['bindingId'] and
+                    evidence['browserWindowId'] == assignment_now['browserWindowId']):
+                peer['windowEvidence'] = {**copy.deepcopy(evidence), 'at': now}
+            else:
+                peer.pop('windowEvidence', None)
+        if 'lifecycleError' in message:
+            issue = message['lifecycleError']
+            require(issue is None or (type(issue) is dict and set(issue) == {'stage', 'code', 'at'} and
+                    type(issue['stage']) is str and issue['stage'] in LIFECYCLE_STAGES and
+                    type(issue['code']) is str and issue['code'] in LIFECYCLE_CODES and
+                    type(issue['at']) in (int, float) and 0 < issue['at'] <= now + 60),
+                    '生命周期诊断格式错误')
+            peer['lifecycleError'] = copy.deepcopy(issue)
+        if 'observerStatus' in message:
+            observation = message['observerStatus']
+            require(observation is None or (type(observation) is dict and set(observation) ==
+                    {'state', 'bindingId', 'documentId', 'navigationEpoch', 'attempt', 'stage', 'code', 'at'} and
+                    observation['state'] in ('initializing', 'ready', 'failed') and
+                    type(observation['bindingId']) is str and re.fullmatch('[a-f0-9]{32}', observation['bindingId']) and
+                    type(observation['documentId']) is str and 0 < len(observation['documentId']) <= 128 and
+                    valid_int(observation['navigationEpoch'], low=1) and valid_int(observation['attempt'], low=1, high=2) and
+                    observation['stage'] in ('observer_load', 'observer_configure') and
+                    (type(observation['code']) is str and observation['code'] in LIFECYCLE_CODES if observation['state'] == 'failed' else observation['code'] is None) and
+                    type(observation['at']) in (int, float) and 0 < observation['at'] <= now + 60),
+                    '页面观察状态格式错误')
+            assignment_now = current_assignment(data, task_file)
+            peer['observerStatus'] = (copy.deepcopy(observation) if observation and message['enabled'] and
+                message['permission'] and assignment_now and observation['bindingId'] == assignment_now['bindingId'] else None)
         active_id, active_record = active_task(task_file)
         prune_creation(peer, active_id, active_record)
         if (isinstance(message.get('created'), dict) and
@@ -570,79 +800,112 @@ def sync_peer(message, origin, task_file, event_file):
         active_id, _ = active_task(task_file)
         peer['createdTargets'] = [t for t in peer.get('createdTargets', [])
                                   if t.get('taskId') == active_id]
+        command_ack = None
+        pending_assignment = current_assignment(data, task_file)
+        command = peer.get('command')
+        if command and (not pending_assignment or command.get('bindingId') != pending_assignment['bindingId']):
+            finish_pending(peer, 'canceled', now)
+        expire_pending(peer, now)
         if 'commandResult' in message:
             reply = message['commandResult']
-            require(type(reply) is dict and set(reply) in
-                    ({'requestId', 'status', 'error'}, {'requestId', 'status', 'result'}),
-                    '命令结果字段错误')
-            canceled = peer.get('commandCanceled')
-            accepted_reply = reply.get('requestId') in peer.get('commandSeen', [])
-            if accepted_reply or (canceled and reply['requestId'] == canceled.get('commandId')) or reply['requestId'] == peer.get('commandExpired'):
-                # 已取消命令的迟到结果不采信、不记为成功，但允许扩展清空待回传。
-                if canceled and reply['requestId'] == canceled.get('commandId'):
-                    peer['commandCanceled'] = {**canceled, 'lateResult': True}
+            require(type(reply) is dict and type(reply.get('requestId')) is str and
+                    re.fullmatch('[a-f0-9]{32}', reply['requestId']), '命令结果标识错误')
+            terminal_ids = [t['commandId'] for t in peer.get('commandTerminals', [])]
+            canceled = peer.get('commandCanceled') or {}
+            known = (reply['requestId'] in peer.get('commandSeen', []) or
+                     reply['requestId'] in terminal_ids or reply['requestId'] == canceled.get('commandId') or
+                     reply['requestId'] == peer.get('commandExpired'))
+            if known:
+                command_ack = {'requestId': reply['requestId'], 'status': 'discarded'}
             else:
                 pending = peer.get('command')
                 require(type(pending) is dict and reply['requestId'] == pending.get('requestId'),
                         '未被请求的命令结果')
-                require(reply['status'] in ('ok', 'error'), '命令结果状态错误')
                 latency = (round((now - pending['deliveredAt']) * 1000, 1)
                            if pending.get('deliveredAt') else None)
                 assignment_now = current_assignment(data, task_file)
                 event_now = (assignment_now or {}).get('event') or {}
-                if reply['status'] == 'ok' and pending.get('documentId') and pending['operation'] in ('snapshot', 'screenshot') and (
-                        not assignment_now or assignment_now['bindingId'] != pending.get('bindingId') or
-                        event_now.get('documentId') != pending.get('documentId') or
-                        event_now.get('navigationEpoch') != pending.get('navigationEpoch')):
-                    reply = {'requestId': reply['requestId'], 'status': 'error', 'error': 'STALE_DOCUMENT：观察结果所属文档已变化'}
-                if reply['status'] == 'ok':
-                    if pending['operation'] == 'snapshot':
-                        outcome = validate_snapshot(reply['result'])
-                        peer['pendingVerify'] = None
-                        peer['snapshot'] = {k: pending.get(k) for k in
-                                            ('tabId', 'documentId', 'navigationEpoch', 'bindingId')}
-                        peer['snapshot']['snapshotId'] = outcome.get('snapshotId')
-                    elif pending['operation'] == 'screenshot':
-                        outcome = reply['result']
-                        require(type(outcome) is dict and set(outcome) == {'mimeType', 'data', 'tabId', 'documentId'} and
-                                outcome['mimeType'] == 'image/jpeg' and type(outcome['data']) is str and
-                                0 < len(outcome['data']) <= 500000 and re.fullmatch(r'[A-Za-z0-9+/]+={0,2}', outcome['data']) and
-                                outcome['tabId'] == pending['tabId'] and outcome['documentId'] == pending['documentId'], '截图身份或数据错误')
-                        # Keep one image; do not grow the JSON store with old screenshots.
-                        for previous in peer.get('commandResults', []):
-                            if previous.get('operation') == 'screenshot':
-                                previous['result'] = {'expiredImage': True}
-                    elif pending['operation'] == 'diagnostics':
-                        outcome = validate_diagnostics(reply['result'])
+                try:
+                    require(set(reply) in ({'requestId', 'status', 'error'}, {'requestId', 'status', 'result'}) and
+                            reply.get('status') in ('ok', 'error') and
+                            ('result' if reply['status'] == 'ok' else 'error') in reply, '命令结果字段错误')
+                    if reply['status'] == 'ok' and pending.get('documentId') and pending['operation'] in OBSERVATIONS and (
+                            not assignment_now or assignment_now['bindingId'] != pending.get('bindingId') or
+                            event_now.get('documentId') != pending.get('documentId') or
+                            event_now.get('navigationEpoch') != pending.get('navigationEpoch')):
+                        reply = {'requestId': reply['requestId'], 'status': 'error', 'error': 'STALE_DOCUMENT：观察结果所属文档已变化'}
+                    if reply['status'] == 'ok':
+                        if pending['operation'] == 'snapshot':
+                            outcome = validate_snapshot(reply['result'])
+                            peer['pendingVerify'] = None
+                            peer['snapshot'] = {k: pending.get(k) for k in
+                                                ('tabId', 'documentId', 'navigationEpoch', 'bindingId')}
+                            peer['snapshot']['snapshotId'] = outcome.get('snapshotId')
+                        elif pending['operation'] == 'screenshot':
+                            outcome = reply['result']
+                            require(type(outcome) is dict and set(outcome) == {'mimeType', 'data', 'tabId', 'documentId'} and
+                                    outcome['mimeType'] == 'image/jpeg' and type(outcome['data']) is str and
+                                    0 < len(outcome['data']) <= 500000 and re.fullmatch(r'[A-Za-z0-9+/]+={0,2}', outcome['data']) and
+                                    outcome['tabId'] == pending['tabId'] and outcome['documentId'] == pending['documentId'], '截图身份或数据错误')
+                            # Keep one image; do not grow the JSON store with old screenshots.
+                            for previous in peer.get('commandResults', []):
+                                if previous.get('operation') == 'screenshot':
+                                    previous['result'] = {'expiredImage': True}
+                        elif pending['operation'] == 'read':
+                            outcome = validate_read(reply['result'], pending.get('params') or {})
+                        elif pending['operation'] == 'diagnostics':
+                            outcome = validate_diagnostics(reply['result'])
+                        elif pending['operation'] == 'render_probe':
+                            outcome = validate_render_probe(reply['result'], pending.get('params') or {})
+                        else:
+                            outcome = validate_action_result(reply['result'], pending['operation'])
+                            if outcome.get('children'):
+                                require(assignment_now is not None, '子标签所属任务已失效')
+                                owned = copy.deepcopy(assignment_now.get('ownedTabs', [{'tabId': assignment_now['tabId'],
+                                    'browserWindowId': assignment_now['browserWindowId']}]))
+                                for child in outcome['children']:
+                                    require(child['browserWindowId'] == assignment_now['browserWindowId'] and
+                                            not any(other.get('tabId') == child['tabId'] for other in owned), '子标签必须属于固定任务窗口且不能重复')
+                                    require(len(owned) < 64, '任务子标签数量达到上限')
+                                    owned.append(copy.deepcopy(child))
+                                assignment_now['ownedTabs'] = owned
+                            # 只有真正执行过的动作才要求复核；失败或无效引用不制造虚假闭环。
+                            peer['pendingVerify'] = ({'commandId': reply['requestId'],
+                                                      'operation': pending['operation'],
+                                                      'taskId': pending['taskId'],
+                                                      **({k: pending.get(k) for k in ('bindingId', 'tabId', 'browserWindowId', 'navigationEpoch')} |
+                                                         {'url': redacted_url(pending['params']['url'])} if pending['operation'] == 'navigate' else {})}
+                                                     if outcome['performed'] else None)
+                        if pending['operation'] in ('read', 'diagnostics', 'screenshot'):
+                            if navigation_verified(peer, pending, assignment_now, outcome):
+                                peer['pendingVerify'] = None
+                            else:
+                                mark_navigation_destination(peer, pending, assignment_now, outcome)
+                        peer['commandResult'] = {'requestId': reply['requestId'], 'status': 'ok',
+                                                 'operation': pending['operation'],
+                                                 'latencyMs': latency,
+                                                 'result': outcome, 'at': now}
                     else:
-                        outcome = validate_action_result(reply['result'], pending['operation'])
-                        if outcome.get('children'):
-                            require(assignment_now is not None, '子标签所属任务已失效')
-                            owned = assignment_now.setdefault('ownedTabs', [{'tabId': assignment_now['tabId'],
-                                'browserWindowId': assignment_now['browserWindowId']}])
-                            for child in outcome['children']:
-                                require(child['browserWindowId'] == assignment_now['browserWindowId'] and
-                                        not any(other.get('tabId') == child['tabId'] for other in owned), '子标签必须属于固定任务窗口且不能重复')
-                                require(len(owned) < 64, '任务子标签数量达到上限')
-                                owned.append(copy.deepcopy(child))
-                        # 只有真正执行过的动作才要求复核；失败或无效引用不制造虚假闭环。
-                        peer['pendingVerify'] = ({'commandId': reply['requestId'],
-                                                  'operation': pending['operation'],
-                                                  'taskId': pending['taskId']}
-                                                 if outcome['performed'] else None)
-                    peer['commandResult'] = {'requestId': reply['requestId'], 'status': 'ok',
-                                             'operation': pending['operation'],
-                                             'latencyMs': latency,
-                                             'result': outcome, 'at': now}
-                else:
-                    error = reply['error']
-                    require(type(error) is str and 0 < len(error) <= 200, '命令错误信息不合法')
-                    if pending['operation'] not in ('snapshot', 'diagnostics', 'screenshot'):
-                        peer['pendingVerify'] = {'commandId': reply['requestId'], 'taskId': pending['taskId']}
+                        error = reply['error']
+                        require(type(error) is str and 0 < len(error) <= 200, '命令错误信息不合法')
+                        if pending['operation'] not in OBSERVATIONS:
+                            peer['pendingVerify'] = {'commandId': reply['requestId'], 'taskId': pending['taskId']}
+                        peer['commandResult'] = {'requestId': reply['requestId'], 'status': 'error',
+                                                 'operation': pending['operation'],
+                                                 'latencyMs': latency,
+                                                 'error': error, 'at': now}
+                except (ValueError, TypeError, KeyError, OverflowError):
+                    # A known command's malformed result must not poison all later
+                    # heartbeats. Reject its content, record an error and acknowledge
+                    # consumption. Unknown IDs still reject the entire request.
                     peer['commandResult'] = {'requestId': reply['requestId'], 'status': 'error',
-                                             'operation': pending['operation'],
-                                             'latencyMs': latency,
-                                             'error': error, 'at': now}
+                        'operation': pending['operation'], 'latencyMs': latency, 'at': now,
+                        'error': 'INVALID_BROWSER_RESULT：扩展回执格式或身份不合法；未采信结果，请核实原目标'}
+                    if pending['operation'] not in OBSERVATIONS:
+                        peer['pendingVerify'] = {'commandId': reply['requestId'], 'taskId': pending['taskId']}
+                    command_ack = {'requestId': reply['requestId'], 'status': 'rejected', 'code': 'INVALID_BROWSER_RESULT'}
+                else:
+                    command_ack = {'requestId': reply['requestId'], 'status': 'accepted'}
                 peer['commandResults'] = (peer.get('commandResults', []) +
                                           [peer['commandResult']])[-MAX_RESULTS:]
                 # Status needs metadata only; keep large screenshot data once.
@@ -694,23 +957,22 @@ def sync_peer(message, origin, task_file, event_file):
             assignment.pop('mapping', None)
         command = peer.get('command')
         if command and (not assignment or command.get('bindingId', assignment['bindingId']) != assignment['bindingId']):
-            peer['commandCanceled'] = {'commandId': command['requestId'], 'delivered': bool(command.get('delivered'))}
-            peer['command'] = None
-            command = None
-        if command and now > command.get('expiresAt', 0):
-            peer['commandExpired'] = command['requestId']
-            if command.get('delivered') and command['operation'] not in ('snapshot', 'diagnostics', 'screenshot'):
-                peer['pendingVerify'] = {'commandId': command['requestId'], 'taskId': command['taskId']}
-            peer['command'] = None
+            finish_pending(peer, 'canceled', now)
             command = None
         if command:
             # 记录已投递，取消时才能诚实区分「可能已执行」与「尚未下发」。
             command['delivered'] = True
             command.setdefault('deliveredAt', now)
             peer['command'] = command
+        from browser_preview import sync_preview
+        preview_lease = sync_preview(peer, record, message, now)
+        if len(json.dumps(data, ensure_ascii=False).encode('utf-8')) > MAX_BYTES * 9 // 10:
+            peer.pop('previewFrame', None)
         return {'ok': True, 'protocolVersion': 2, 'heartbeatAt': now,
+                'previewLease': preview_lease,
                 'applicationSession': session,
                 'sessionReset': session_reset,
+                'commandAck': command_ack,
                 'panelBridge': True,
                 'activeTaskId': task_id,
                 'requestCandidates': bool(peer.get('requestCandidates')),
@@ -732,6 +994,41 @@ class CandidateEvidenceExpired(ValueError):
                          'candidatesAt': peer.get('candidatesAt', 0)}
 
 
+class NavigationDocumentPending(ValueError):
+    def __init__(self, record, task, peer):
+        super().__init__('BACKGROUND_WAITING：等待原标签导航就绪；未下发观察命令，不需重新 assign')
+        self.expected = {k: copy.deepcopy(record[k]) for k in
+                         ('taskId', 'bindingId', 'assignmentVersion', 'tabId', 'browserWindowId')}
+        self.target = target_identity(task)
+        self.session = peer.get('applicationSession')
+
+
+def wait_navigation_observation(args, waiting, task_file, event_file, revalidate, check_cancelled):
+    deadline = time.monotonic() + NAVIGATION_OBSERVATION_TIMEOUT
+    while True:
+        if check_cancelled:
+            check_cancelled()
+        data = read_file(event_file)
+        record = current_assignment(data, task_file)
+        _, task = active_task(task_file)
+        require(record is not None and not record.get('paused') and
+                all(record.get(k) == v for k, v in waiting.expected.items()) and
+                task is not None and target_identity(task) == waiting.target and
+                application_session() == waiting.session, 'STALE_TARGET：等待期间任务或绑定已变化，未下发命令')
+        event = record.get('event') or {}
+        ready = (args['operation'] == 'snapshot' or
+                 (event.get('domReady') and event.get('readyState') in ('interactive', 'complete')))
+        if event.get('documentId') and event.get('phase') not in ('before', 'paused', 'error') and ready:
+            if revalidate:
+                revalidate(args['taskId'])
+            # No command existed while waiting. Revalidate and pin the current
+            # document under the lock, rather than retargeting a queued command.
+            return _internal_action(args, task_file, event_file, observation=waiting)
+        if time.monotonic() >= deadline:
+            raise waiting
+        time.sleep(0.1)
+
+
 def validate_candidate_refresh(data, expected, task_file):
     peer = data.get('peer', {})
     task_id, task = active_task(task_file)
@@ -744,13 +1041,98 @@ def validate_candidate_refresh(data, expected, task_file):
             '刷新期间应用会话、扩展连接或授权已变化，未分配标签')
 
 
+def candidate_response(peer, session):
+    now = time.time()
+    live = 0 <= now - peer.get('lastSeen', 0) < CANDIDATE_TTL
+    available = (session is not None and live and peer.get('enabled') and peer.get('permission') and
+                 peer.get('applicationSession') == session)
+    age = now - peer.get('candidatesAt', 0)
+    pending = bool(available and peer.get('requestCandidates'))
+    return {'nativeConnection': 'connected' if live else 'host_unavailable',
+            'clientVersion': peer.get('clientVersion') if live and peer.get('applicationSession') == session else None,
+            'capabilities': copy.deepcopy(peer.get('capabilities', [])) if available else [],
+            'globalPermission': bool(peer.get('permission')) if live else None,
+            'candidates': copy.deepcopy(peer.get('candidates', [])) if available and 0 <= age < CANDIDATE_TTL else [],
+            'refreshPending': pending, 'mappingVerified': False,
+            'refreshStatus': 'pending' if pending else 'ready' if available else 'unavailable',
+            'retryAfterMs': 1000 if pending else None,
+            'candidateAgeMs': round(max(0, age) * 1000) if peer.get('candidatesAt') else None,
+            'candidateTtlMs': CANDIDATE_TTL * 1000}
+
+
+def connected_peer(event_file):
+    """A current handshake is distinct from enabled/permission checks."""
+    data = read_file(event_file, {'version': 1, 'tasks': {}})
+    peer = data.get('peer') if isinstance(data, dict) else None
+    session = application_session()
+    if isinstance(peer, dict) and session is not None and peer.get('applicationSession') == session:
+        seen = peer.get('lastSeen')
+        if type(seen) in (int, float) and 0 <= time.time() - seen < CANDIDATE_TTL and peer.get('clientVersion'):
+            return peer
+    return {}
+
+
+def extension_presence(event_file):
+    """Global consent/heartbeat only; never grants a private task assignment."""
+    peer = connected_peer(event_file)
+    return bool(peer.get('enabled') and peer.get('permission'))
+
+
+def preflight_candidates(event_file, check_cancelled=None):
+    """Request root metadata without admitting a task or touching its records."""
+    if check_cancelled:
+        check_cancelled()
+    with event_store(event_file) as data:
+        peer = data.setdefault('peer', {})
+        peer['requestCandidates'] = True
+        session = application_session()
+        result = candidate_response(peer if session is not None and peer.get('applicationSession') == session else {}, session)
+    result = wait_for_candidates({'action': 'candidates'}, result, None, event_file, check_cancelled)
+    return dict(result, connectionScope='extension_preflight', taskChannelReady=False)
+
+
+def wait_for_private_channel(task_file, event_file, root_event_file, task_id, check_cancelled):
+    """Wait only for the extension's first sync; never copy root task evidence."""
+    deadline = time.monotonic() + CANDIDATE_QUERY_TIMEOUT
+    while True:
+        if check_cancelled:
+            check_cancelled()
+        require(active_task(task_file)[0] == task_id, 'BROWSER_TARGET_CHANGED: 等待通道期间任务已变化')
+        if connected_peer(event_file) or not extension_presence(root_event_file) or time.monotonic() >= deadline:
+            return
+        time.sleep(0.1)
+
+
+def wait_for_candidates(args, result, task_file, event_file, check_cancelled):
+    # Release the file lock while the extension answers. Waiting only for
+    # metadata is safe; no input, creation, assignment or navigation is retried.
+    if not result['refreshPending'] or result['candidates']:
+        return result
+    deadline = time.monotonic() + CANDIDATE_QUERY_TIMEOUT
+    while True:
+        if check_cancelled:
+            check_cancelled()
+        if 'taskId' in args:
+            require(active_task(task_file)[0] == args['taskId'], '需要当前活动任务的 taskId')
+        peer = (read_file(event_file) or {}).get('peer', {})
+        result = candidate_response(peer, application_session())
+        if not result['refreshPending'] or time.monotonic() >= deadline:
+            return result
+        time.sleep(0.1)
+
+
 def internal_action(args, task_file=TASK_FILE, event_file=EVENT_FILE, revalidate=None, check_cancelled=None):
     if check_cancelled:
         check_cancelled()
     try:
-        return _internal_action(args, task_file, event_file)
+        result = _internal_action(args, task_file, event_file)
+        if args.get('action') == 'candidates':
+            return wait_for_candidates(args, result, task_file, event_file, check_cancelled)
+        return result
     except CandidateEvidenceExpired as expired:
         expected = expired.expected
+    except NavigationDocumentPending as waiting:
+        return wait_navigation_observation(args, waiting, task_file, event_file, revalidate, check_cancelled)
     # Refresh only metadata for an already selected candidate. No input,
     # navigation, creation or assignment has been dispatched by the failed check.
     with event_store(event_file) as data:
@@ -774,7 +1156,7 @@ def internal_action(args, task_file=TASK_FILE, event_file=EVENT_FILE, revalidate
             check_cancelled()
 
 
-def _internal_action(args, task_file, event_file, refreshed=None):
+def _internal_action(args, task_file, event_file, refreshed=None, observation=None):
     action = args.get('action')
     require(action in ('candidates', 'assign', 'create_target', 'command', 'result', 'cancel',
                        'annotate', 'annotations', 'verify_mapping', 'tabs', 'select_tab'), '内部操作错误')
@@ -796,10 +1178,18 @@ def _internal_action(args, task_file, event_file, refreshed=None):
             (', '.join(sorted(missing)), ', '.join(sorted(unexpected))))
     with event_store(event_file) as data:
         peer = data.get('peer', {})
+        expire_pending(peer, time.time())
         # 单活动任务模型：其他任务的浏览器分配一律淘汰（assign 可能早于下一次 sync）。
         active_now, active_record = active_task(task_file)
         prune_creation(peer, active_now, active_record)
         data['tasks'] = {k: v for k, v in data.get('tasks', {}).items() if k == active_now}
+        if observation:
+            record = current_assignment(data, task_file)
+            require(record is not None and not record.get('paused') and active_record is not None and
+                    all(record.get(k) == v for k, v in observation.expected.items()) and
+                    target_identity(active_record) == observation.target and
+                    application_session() == observation.session,
+                    'STALE_TARGET：等待后的绑定校验失败，未下发命令')
         live = time.time() - peer.get('lastSeen', 0) < 20
         session = application_session()
         available = (session is not None and live and peer.get('enabled') and peer.get('permission') and
@@ -810,15 +1200,8 @@ def _internal_action(args, task_file, event_file, refreshed=None):
                         '需要当前活动任务的 taskId')
             peer['requestCandidates'] = True
             data['peer'] = peer
-            return {'nativeConnection': 'connected' if live else 'host_unavailable',
-                    'globalPermission': bool(peer.get('permission')) if live else None,
-                    'candidates': copy.deepcopy(peer.get('candidates', [])) if available and
-                        0 <= time.time() - peer.get('candidatesAt', 0) < CANDIDATE_TTL else [],
-                    'refreshPending': True, 'mappingVerified': False,
-                    'candidateAgeMs': round(max(0, time.time() - peer['candidatesAt']) * 1000)
-                        if peer.get('candidatesAt') else None,
-                    'candidateTtlMs': CANDIDATE_TTL * 1000}
-        require(session is not None and live and peer.get('applicationSession') == session,
+            return candidate_response(peer, session)
+        require(session is not None and (live or action in ('result', 'cancel')) and peer.get('applicationSession') == session,
                 'BROWSER_HOST_UNAVAILABLE: 扩展未连接，请用户恢复扩展连接')
         require(peer.get('permission'), 'BROWSER_PERMISSION_MISSING: 浏览器能力未授权，请用户完成授权')
         require(peer.get('enabled'), 'BROWSER_DISABLED: 浏览器能力已关闭，请用户在控制面板开启')
@@ -856,7 +1239,12 @@ def _internal_action(args, task_file, event_file, refreshed=None):
                     '需要已绑定的活动任务')
             record = current_assignment(data, task_file)
             require(record is not None, '任务目标未绑定')
-            title = peer.get('assignmentTitle')
+            evidence = peer.get('windowEvidence') or {}
+            verified_evidence = (evidence.get('bindingId') == record['bindingId'] and
+                evidence.get('browserWindowId') == record['browserWindowId'] and
+                0 <= time.time() - evidence.get('at', 0) < CANDIDATE_TTL)
+            title = evidence['title'] if verified_evidence else peer.get('assignmentTitle')
+            method = 'window_active_title' if verified_evidence else 'title'
             require(type(title) is str and title, '扩展尚未回传标签标题')
             windows = args['windows']
             require(type(windows) is list and len(windows) <= 200, '窗口证据数量错误')
@@ -866,17 +1254,22 @@ def _internal_action(args, task_file, event_file, refreshed=None):
                         len(window['title']) <= 200, '窗口证据格式错误')
             hits = [w for w in windows if w['title'].strip() == title.strip()]
             if len(hits) == 1:
+                visibility = ({'windowActiveTabId': evidence['tabId'],
+                               'targetTabActiveAtVerification': evidence['tabId'] == record['tabId'],
+                               'previewLimitation': '原生窗口共享显示活动标签；后台任务标签的内容请用其 snapshot/screenshot 复核，不切换标签。'}
+                              if verified_evidence else {})
                 record['mappingVerified'] = True
-                record['mapping'] = {'windowId': hits[0]['windowId'], 'method': 'title',
-                                     'title': title, 'at': time.time()}
-                return {'verified': True, 'windowId': hits[0]['windowId'], 'method': 'title',
-                        'candidates': 1}
+                record['mapping'] = {'windowId': hits[0]['windowId'], 'method': method,
+                                     'title': title, 'at': time.time(), **visibility}
+                return {'verified': True, 'windowId': hits[0]['windowId'], 'method': method,
+                        'candidates': 1, **visibility}
             record['mappingVerified'] = False
-            record['mapping'] = {'verified': False, 'method': 'title', 'title': title,
+            record['mapping'] = {'verified': False, 'method': method, 'title': title,
                                  'reason': 'no_match' if not hits else 'ambiguous',
                                  'candidates': len(hits), 'at': time.time()}
-            return {'verified': False, 'method': 'title',
-                    'reason': 'no_match' if not hits else 'ambiguous', 'candidates': len(hits)}
+            return {'verified': False, 'method': method,
+                    'reason': 'no_match' if not hits else 'ambiguous', 'candidates': len(hits),
+                    'limitation': '仅接受唯一原生窗口标题匹配；后台标签可用其所在窗口的活动标签标题作证据，不激活或切换标签。'}
         if action in ('annotate', 'annotations'):
             require(args['taskId'] == task_id and task and
                     task.get('state') in ('awaiting_window', 'bound'), '需要当前活动任务')
@@ -914,13 +1307,28 @@ def _internal_action(args, task_file, event_file, refreshed=None):
         if action == 'command':
             require(args['operation'] in OPERATIONS, '不支持的命令')
             require(record is not None and not record.get('paused'), '任务目标未绑定或已暂停')
+            observation = current_observer_status(peer, record)
+            require(not observation or observation['state'] == 'ready',
+                    'BROWSER_OBSERVER_NOT_READY：原标签观察尚未就绪；先只读查询状态，持续失败时通知用户')
             require(mapping_conflict(record, task) is not True,
                     '映射窗口与任务绑定窗口不一致：先重新 verify_mapping')
-            if args['operation'] not in ('snapshot', 'diagnostics', 'screenshot'):
+            if args['operation'] not in OBSERVATIONS:
                 verify = peer.get('pendingVerify')
                 require(not verify or verify.get('taskId') != task_id,
-                        '上一个动作尚未用 snapshot 复核')
+                        '导航落地地址已变化：请获取当前 snapshot 核实一次；保留原绑定，不需重新分配标签' if (verify or {}).get('destinationChanged') else
+                        '上一个动作尚未用 snapshot 复核' if verification_next(peer) == 'snapshot' else
+                        '上次导航尚未复核：等待原标签新文档就绪，再用 screenshot/read/diagnostics 或 snapshot 复核')
             event = record.get('event') or {}
+            if args['operation'] == 'render_probe':
+                require(not peer.get('pendingVerify'), 'RENDER_PROBE_NOT_READY: 先完成原动作的正常复核；探针不能代替复核')
+                require(event.get('domReady') and event.get('readyState') in ('interactive', 'complete'),
+                        'RENDER_PROBE_NOT_READY: 等待原文档就绪；未执行探针')
+            waiting_document = not event.get('documentId') or event.get('phase') == 'before'
+            waiting_ready = (args['operation'] in ('screenshot', 'read', 'diagnostics') and
+                             event.get('phase') != 'error' and
+                             (not event.get('domReady') or event.get('readyState') not in ('interactive', 'complete')))
+            if (waiting_document or waiting_ready) and args['operation'] in OBSERVATIONS and (peer.get('pendingVerify') or {}).get('operation') == 'navigate':
+                raise NavigationDocumentPending(record, task, peer)
             require(event.get('documentId') and event.get('phase') not in ('before', 'paused', 'error'), 'BACKGROUND_WAITING：等待原标签文档就绪')
             params = command_params(args, args['operation'])
             if args['operation'] in ('click', 'fill', 'select', 'scroll'):
@@ -931,21 +1339,31 @@ def _internal_action(args, task_file, event_file, refreshed=None):
             if task.get('interactionMode', 'background_browser') == 'background_browser':
                 require({'cdp_input', 'document_binding', 'background_popups'} <= set(peer.get('capabilities', [])),
                         'BACKGROUND_WAITING：扩展版本不支持严格后台输入，请重载 0.3.0 或更新版本，不回落桌面输入')
+            if args['operation'] == 'render_probe':
+                require('render_probe' in peer.get('capabilities', []),
+                        'EXTENSION_UPGRADE_REQUIRED: 分阶段呈现诊断需要 QuietBridge Browser 0.4.7，旧扩展未执行探针')
+            if args['operation'] == 'read':
+                require('paged_read' in peer.get('capabilities', []),
+                        'EXTENSION_UPGRADE_REQUIRED: 分页正文读取需要 QuietBridge Browser 0.4.3 或更新版本')
             pending = peer.get('command')
-            require(not pending or time.time() > pending.get('expiresAt', 0), '已有未完成的命令')
+            require(not pending, '已有未完成的命令')
             request = {'requestId': secrets.token_hex(16), 'taskId': task_id,
                        'operation': args['operation'], 'params': params,
                        'bindingId': record['bindingId'], 'assignmentVersion': record['assignmentVersion'],
                        'tabId': record['tabId'], 'browserWindowId': record['browserWindowId'],
                        'documentId': event['documentId'], 'navigationEpoch': event['navigationEpoch'],
                        'issuedAt': time.time(), 'expiresAt': time.time() + COMMAND_TTL}
-            peer.update(command=request, commandResult=None, commandExpired=None)
+            peer.update(command=request, commandResult=None)
             return {'commandId': request['requestId'], 'status': 'queued',
                     'expiresInSeconds': COMMAND_TTL,
                     'target': {k: request[k] for k in ('tabId', 'browserWindowId', 'documentId', 'navigationEpoch')},
                     'route': 'background_browser',
-                    'limitation': '输入只走固定标签的 CDP/DOM；不激活窗口，不回落桌面输入。performed 不代表业务成功，须后续 snapshot 复核'}
+                    'limitation': '输入只走固定标签的 CDP/DOM；不激活窗口，不回落桌面输入。导航可用新文档 screenshot/read/diagnostics 复核；其他输入须 snapshot 复核。performed 不代表业务成功'}
         if action == 'result':
+            terminal = next((t for t in reversed(peer.get('commandTerminals', []))
+                             if t['commandId'] == args['commandId']), None)
+            if terminal:
+                return copy.deepcopy(terminal) | {'nextAction': verification_next(peer)}
             if peer.get('commandExpired') == args['commandId']:
                 return {'commandId': args['commandId'], 'status': 'expired'}
             pending = peer.get('command')
@@ -965,11 +1383,22 @@ def _internal_action(args, task_file, event_file, refreshed=None):
                     reply['latencyMs'] = done['latencyMs']
                 if done['status'] == 'ok':
                     reply['result'] = copy.deepcopy(done['result'])
-                    reply['nextAction'] = ('snapshot' if peer.get('pendingVerify') else
-                                           'observe' if done.get('operation') in ('snapshot', 'diagnostics')
+                    reply['nextAction'] = (verification_next(peer) if peer.get('pendingVerify') else
+                                           'observe' if done.get('operation') in ('snapshot', 'read', 'diagnostics', 'render_probe')
                                            else 'done')
+                    verify = peer.get('pendingVerify') or {}
+                    if verify.get('destinationChanged'):
+                        reply['verification'] = {'reason': 'navigation_destination_changed',
+                            'expectedUrl': verify['url'], 'observedUrl': verify['observedUrl'],
+                            'nextAction': 'snapshot', 'bindingPreserved': True,
+                            'message': '原标签已落地到不同地址（可能为重定向或规范化）；获取当前 snapshot 核实一次即可继续，不需重新分配标签。'}
                 else:
                     reply['error'] = copy.deepcopy(done['error'])
+                    message = done['error']
+                    code = re.match(r'^([A-Z][A-Z0-9_]{1,63})[:：]', message)
+                    reply['errorCode'] = ('BROWSER_DEBUGGER_RESTRICTED' if
+                        'Cannot access a chrome-extension:// URL of different extension' in message else
+                        code.group(1) if code else 'BROWSER_COMMAND_FAILED')
                     reply['nextAction'] = 'stop'
                 return reply
             if args['commandId'] in peer.get('commandSeen', []):
@@ -977,13 +1406,13 @@ def _internal_action(args, task_file, event_file, refreshed=None):
                         'note': '结果已被后续命令挤出保留窗口'}
             return {'commandId': args['commandId'], 'status': 'unknown'}
         if action == 'cancel':
+            terminal = next((t for t in reversed(peer.get('commandTerminals', []))
+                             if t['commandId'] == args['commandId']), None)
+            if terminal:
+                return copy.deepcopy(terminal) | {'nextAction': verification_next(peer)}
             command = peer.get('command')
             if command and command['requestId'] == args['commandId']:
-                peer['commandCanceled'] = {'commandId': command['requestId'], 'at': time.time(),
-                                           'delivered': bool(command.get('delivered'))}
-                peer['command'] = None
-                if command.get('delivered') and command['operation'] not in ('snapshot', 'diagnostics', 'screenshot'):
-                    peer['pendingVerify'] = {'commandId': command['requestId'], 'taskId': command['taskId']}
+                finish_pending(peer, 'canceled', time.time())
                 return {'commandId': command['requestId'], 'status': 'canceled',
                         'mayHaveExecuted': bool(command.get('delivered')),
                         'nextAction': 'snapshot' if peer.get('pendingVerify') else 'done'}
@@ -1079,16 +1508,22 @@ def status(task_id, task_file=TASK_FILE, event_file=EVENT_FILE):
     task = active_task(task_file)[1] or {}
     capabilities = {'cdp_input', 'document_binding', 'background_popups'} <= set(peer.get('capabilities', []))
     created = next((t for t in peer.get('createdTargets', []) if t.get('taskId') == task_id), None)
+    observation = current_observer_status(peer, record)
     waiting = (reason if not live or not peer.get('permission') or not peer.get('enabled') else
                'extension_upgrade_required' if not capabilities else 'target_not_assigned' if not record else
-               'target_paused' if record.get('paused') else 'document_pending' if not (record.get('event') or {}).get('documentId') else None)
+               'target_paused' if record.get('paused') else 'document_pending' if not (record.get('event') or {}).get('documentId') else
+               'observer_not_ready' if observation and observation['state'] != 'ready' else None)
     return public_status(record) | {'nativeConnection': 'connected' if live else 'host_unavailable',
         'lastHeartbeatAt': peer.get('lastSeen'), 'globalPermission': peer.get('permission') if live else None,
         'commandState': {'pendingOperation': pending.get('operation') if pending else None,
                          'verificationRequired': bool(verify),
                          'verificationOperation': verify.get('operation') if verify else None,
+                         'verificationNextAction': verification_next(peer),
+                         'verificationReason': 'navigation_destination_changed' if (verify or {}).get('destinationChanged') else None,
                          'lastResultStatus': (peer.get('commandResult') or {}).get('status')},
         'clientVersion': peer.get('clientVersion'),
+        'observerStatus': copy.deepcopy(observation),
+        'lifecycleError': copy.deepcopy(peer.get('lifecycleError')),
         'createdTarget': copy.deepcopy(created),
         'capabilities': copy.deepcopy(peer.get('capabilities', [])),
         'observationOnly': bool(waiting),
@@ -1161,11 +1596,7 @@ def dispatch(message, origin, allowed_origins, task_file=TASK_FILE, event_file=E
             peer = data.setdefault('peer', {})
             command = peer.get('command')
             if command and command.get('taskId') == task_id:
-                peer['command'] = None
-                peer['commandCanceled'] = {'commandId': command['requestId'], 'taskId': task_id,
-                                           'delivered': bool(command.get('delivered'))}
-                if command.get('delivered') and command.get('operation') not in ('snapshot', 'diagnostics', 'screenshot'):
-                    peer['pendingVerify'] = {'commandId': command['requestId'], 'taskId': task_id}
+                finish_pending(peer, 'canceled', time.time())
         else:
             event = validate_event(message['event'])
             require(event['tabId'] == record['tabId'] and event['browserWindowId'] == record['browserWindowId'], '事件不属于任务配对标签')
@@ -1199,7 +1630,7 @@ def dispatch(message, origin, allowed_origins, task_file=TASK_FILE, event_file=E
         return {'ok': True, 'mappingVerified': False}
 
 
-def make_tool(task_file, validate_task=None, check_cancelled=None):
+def make_tool(task_file, validate_task=None, check_cancelled=None, preflight_root=None):
     def shape(action, required=(), optional=(), operation=None):
         fields = {'action': {'const': action}, **{key: {} for key in (*required, *optional)}}
         needed = ['action', *required]
@@ -1215,7 +1646,8 @@ def make_tool(task_file, validate_task=None, check_cancelled=None):
               shape('annotate', ('taskId', 'ref', 'note')), shape('annotations', ('taskId',)),
               shape('verify_mapping', ('taskId',)), shape('tabs', ('taskId',)), shape('select_tab', ('taskId', 'tabId'))]
     for operation, required, optional in (
-            ('snapshot', (), ()), ('diagnostics', (), ()), ('screenshot', (), ()), ('keypress', ('key',), ()),
+            ('snapshot', (), ()), ('read', (), ('mode', 'readId', 'offset', 'limit', 'maxChars')),
+            ('diagnostics', (), ()), ('screenshot', (), ()), ('render_probe', ('stage',), ()), ('keypress', ('key',), ()),
             ('click', ('ref', 'snapshotId'), ()), ('fill', ('ref', 'snapshotId'), ('value',)),
             ('select', ('ref', 'snapshotId'), ('value',)),
             ('scroll', ('snapshotId', 'direction'), ('ref', 'lines')),
@@ -1224,21 +1656,49 @@ def make_tool(task_file, validate_task=None, check_cancelled=None):
 
     def handler(args):
         require(type(args) is dict, '参数必须是对象')
+        root_events = Path(preflight_root()) / 'browser-events.json' if preflight_root else None
+        private_tasks = task_file()
+        private_events = Path(private_tasks).with_name('browser-events.json')
+        if root_events is not None and args == {'action': 'candidates'} and not active_task(private_tasks)[1]:
+            return json.dumps(preflight_candidates(root_events, check_cancelled), ensure_ascii=False)
         if args.get('action') in ('candidates', 'assign', 'create_target', 'command', 'result',
                                   'cancel', 'annotate', 'annotations', 'verify_mapping', 'tabs', 'select_tab'):
+            if root_events is not None and args.get('action') in ('candidates', 'create_target'):
+                current_id, current = active_task(private_tasks)
+                if current and ('taskId' not in args or args['taskId'] == current_id):
+                    wait_for_private_channel(private_tasks, private_events, root_events, current_id, check_cancelled)
+                    if args['action'] == 'create_target' and not connected_peer(private_events) and extension_presence(root_events):
+                        raise ValueError('BROWSER_CHANNEL_STARTING: 扩展已连接，会话通道尚未就绪；只读复查 candidates，不重建任务或重载扩展')
             if args.get('action') == 'assign' and validate_task:
                 validate_task(args.get('taskId'))
-            options = {'revalidate': validate_task} if args.get('action') == 'assign' else {}
-            return json.dumps(internal_action(args, task_file=task_file(), check_cancelled=check_cancelled, **options), ensure_ascii=False)
+            options = {'revalidate': validate_task} if args.get('action') in ('assign', 'command') else {}
+            result = internal_action(args, task_file=private_tasks, event_file=private_events,
+                                     check_cancelled=check_cancelled, **options)
+            if root_events is not None and args.get('action') == 'candidates':
+                ready = extension_presence(private_events)
+                result = dict(result, connectionScope='task_channel', taskChannelReady=ready)
+                if not connected_peer(private_events) and extension_presence(root_events):
+                    result.update(extensionConnection='connected', refreshStatus='channel_pending',
+                                  refreshPending=True, retryAfterMs=1000,
+                                  executionPolicy={'waitingReason': 'browser_channel_starting'})
+            return json.dumps(result, ensure_ascii=False)
         require(set(args) == {'action', 'taskId'} and args['action'] == 'status', '状态查询需要 taskId')
-        return json.dumps(status(args['taskId'], task_file=task_file()), ensure_ascii=False)
-    return {'name': 'quietbridge_browser_events', 'description': '网页操作必须不抢焦点并使用共享窗口能力。保持用户的前台应用、键盘窗口、物理鼠标和当前 Space；只走固定标签扩展通道，禁止 activate/AXRaise、切换 Space、前台键鼠或原生输入兜底。bind+assign 后用 verify_mapping 核验系统窗口与标签对应关系，再调用 quietbridge_windows action=share source=window，确认共享目标与视频首帧后开始网页输入；后续复用同一共享流。映射或预览未就绪时报告并等待；扩展 screenshot 仅为标签观察证据，不能冒充实时共享窗口。'
-                                                          '通过已授权扩展观察及操作固定浏览器标签。优先 candidates（可带当前 taskId；refreshPending 表示异步刷新），先 quietbridge_task bind 真实系统窗口，再以候选中的 browserWindowId/tabId 显式 assign；ID 不能用 CGWindowID 代替。候选超过 20 秒时 assign 自动等待至多 3 秒获取新证据，原标签、窗口、地址及任务目标均未变化才分配；不必反复刷新候选，不自动重建窗口。绑定后持续复用同一标签，不按前台焦点换目标。create_target 仅用于尚无窗口的活动任务，可带 url，focused=false；同一任务重复申请复用原请求或结果，不因超时另开窗口。command 下发限定操作（snapshot/click/fill/select/scroll/navigate/diagnostics/screenshot/keypress，单飞，8 秒过期），result 轮询（pending/ok/error/expired/canceled/unknown，不重放，附 latencyMs），cancel 如实报告 mayHaveExecuted。动作执行过之后必须先用 snapshot 复核才能继续动作。performed 不代表业务成功，浏览器分配不授权桌面输入或 wait_ready 判定。'
-                                                          '前提：Chrome 已加载 QuietBridge Browser 并授予站点权限、原生宿主已登记（可在 quietbridge_permissions 或安装页核对）。后台网页任务仅走此通道，扩展未就绪时等待，禁止回落 AX 或桌面输入。snapshot 返回 snapshotId，click/fill/select/scroll 必须传该标识。滚动使用 direction=down/up、lines=6（1..10）；不要猜 deltaY 符号。到达边界与滚动未生效会分别报告，不把 performed 当作已移动。screenshot 直接截取该标签。tabs 列出任务归属标签，select_tab 只改逻辑目标，不激活标签或窗口。keypress 只支持页面按键。',
+        return json.dumps(status(args['taskId'], task_file=private_tasks, event_file=private_events), ensure_ascii=False)
+    return {'name': 'quietbridge_browser_events', 'description': 'render_probe 仅在用户明确同意呈现诊断时使用，stage 依次 inspect/attach/enable/layout/capture；各阶段是独立命令，非自动串联。inspect 不附加，attach 不 Page.enable，enable 不查询布局，layout 不截图，capture 仅对该文档 30 秒内 layout 的视口单次截图并丢弃图像，只返回时间/状态/长度。既有 attachedBefore=true 表示已有调试连接，不能假称首次附加对照。禁止任意 CDP、自动重复 capture、切桌、激活或将探针当作后台绘制修复；不会清除已有动作复核要求。网页操作必须不抢焦点并使用共享窗口能力。保持用户的前台应用、键盘窗口、物理鼠标和当前 Space；只走固定标签扩展通道，禁止 activate/AXRaise、切换 Space、前台键鼠或原生输入兜底。bind+assign 后用 verify_mapping 核验系统窗口与标签对应关系，再调用 quietbridge_windows action=share source=window 建立系统窗口连续视频。网页动作完成后扩展可能生成并立即丢弃一次有界绘制提醒，帮助离屏 Chrome 提交新画面；它受固定 task/tab/document 身份约束，不是预览帧、不证明动作成功、空闲时不运行。导航后的提醒等新文档身份确认后执行。单次 screenshot 仍是独立观察证据，不等于持续预览已建立。'
+                                                          '长页面阅读优先 command operation=read：mode=links 返回脱敏 href/name（query/fragment 只标记存在，不含原值），mode=content 返回当前已渲染正文 article/text。每页 limit<=100、maxChars=4000..16000；续读携带相同 mode/readId 和 nextOffset。sourceTruncated=true 表示采集达到上限，不能声称完整。正文分片按 URL+id 去重，textOffset/textComplete 用于拼接，同一帖子多片不能重复计数；text 块不等于评论数。只读当前已加载 DOM，无后台请求、不含未加载楼层；403/404/未登录应报告，不能猜接口或复制登录资料。read 不产生输入 ref；成功导航后可用新文档 read/screenshot/diagnostics 轻量复核，点击、填写等输入仍须 snapshot 复核。'
+                                                          '无活动任务时 candidates 仅查询全局扩展心跳与候选，connectionScope=extension_preflight、taskChannelReady=false 不表示扩展掉线或已允许任务输入；clientVersion 来自真实心跳。begin 后 candidates 使用独立任务通道，不能将全局候选当作 assign 证据。会话首个握手最多等待 3 秒；channel_pending/BROWSER_CHANNEL_STARTING 时按 retryAfterMs 最多两次只读复查，不重建任务或重载扩展。首次 candidates 无缓存时最多等待 3 秒；refreshPending=true 仅表示尚待扩展回传，按 retryAfterMs 只读复查，不推断无标签或权限失败。verify_mapping 可用目标窗口活动标签的标题核验后台任务标签的所属窗口，不切换焦点；系统窗口连续视频可能显示窗口当前活动标签，snapshot/screenshot 仍可独立复核逻辑绑定标签。BROWSER_DEBUGGER_RESTRICTED 表示 Chrome 拒绝调试其他扩展页面，通知用户处理冲突，不重复输入或自动换目标。'
+                                                          '通过已授权扩展观察及操作固定浏览器标签。优先 candidates（可带当前 taskId；refreshPending 表示异步刷新），先 quietbridge_task bind 真实系统窗口，再以候选中的 browserWindowId/tabId 显式 assign；ID 不能用 CGWindowID 代替。候选超过 20 秒时 assign 自动等待至多 3 秒获取新证据，原标签、窗口、地址及任务目标均未变化才分配；不必反复刷新候选，不自动重建窗口。绑定后持续复用同一标签，不按前台焦点换目标。create_target 仅用于尚无窗口的活动任务，可带 url，focused=false；同一任务重复申请复用原请求或结果，不因超时另开窗口。command 下发限定操作（snapshot/read/click/fill/select/scroll/navigate/diagnostics/screenshot/keypress，单飞，8 秒过期），result 轮询（pending/ok/error/expired/canceled/evicted/unknown，不重放，附 latencyMs），cancel 如实报告 mayHaveExecuted。navigate 成功受理后等待原标签新文档就绪，可用 screenshot/read/diagnostics 复核导航，不必每页完整 snapshot；navigation_observation 表示此步骤。仅当前绑定、新 epoch、就绪且地址匹配才解除导航等待；落地地址变化时返回 verification.reason=navigation_destination_changed、nextAction=snapshot；获取当前 snapshot 核实后继续原绑定，无需重新 assign。文档未就绪时继续只读等待。其他输入或结果未知仍须 snapshot 复核；获取输入 ref 也须 snapshot。performed 不代表业务成功，浏览器分配不授权桌面输入或 wait_ready 判定。'
+                                                          '前提：Chrome 已加载 QuietBridge Browser 并授予站点权限、原生宿主已登记（可在 quietbridge_permissions 或安装页核对）。网页内容在 task begin 声明 targetSurface=web_content，自动选 background_browser；导航使用本通道 navigate，不为导航操作地址栏。浏览器自身工具栏与真实原生打开/保存对话框属于 browser_ui/native_dialog 的独立原生阶段，不在本通道操作。网页里的弹窗、跨域 frame、受限 URL 或 AX 空树不是原生阶段证据。扩展未就绪时通知用户恢复，禁止回落 AX 或桌面输入。snapshot 返回 snapshotId 和 coverage：elementCount 是顶层 DOM 节点数（最多 10000），elements 是可见交互元素（最多 300），二者不必相等；coverage.truncated 表示交互元素确实被截断，长文改用 read。click/fill/select/scroll 必须传 snapshotId。滚动使用 direction=down/up、lines=6（1..10）；不要猜 deltaY 符号。到达边界与滚动未生效会分别报告，不把 performed 当作已移动。screenshot 直接截取该标签。tabs 列出任务归属标签，select_tab 只改逻辑目标，不激活标签或窗口。keypress 只支持页面按键。',
             'inputSchema': {'type': 'object', 'properties': {'action': {'type': 'string', 'enum': ['status', 'candidates', 'create_target', 'command', 'result', 'cancel', 'annotate', 'annotations', 'verify_mapping', 'assign', 'tabs', 'select_tab']},
                 'taskId': {'type': 'string'}, 'browserWindowId': {'type': 'integer'}, 'tabId': {'type': 'integer'},
                 'operation': {'type': 'string', 'enum': list(OPERATIONS)},
+                'stage': {'type': 'string', 'enum': list(RENDER_PROBE_STAGES)},
                 'snapshotId': {'type': 'string', 'minLength': 1, 'maxLength': 160},
+                'mode': {'type': 'string', 'enum': ['links', 'content'], 'description': 'read 的内容类型；默认 content'},
+                'readId': {'type': 'string', 'minLength': 1, 'maxLength': 180, 'description': '续读必须使用同一次读取返回的 readId；不是操作快照'},
+                'offset': {'type': 'integer', 'minimum': 0, 'maximum': 2000, 'description': 'read 的 nextOffset，首次为 0'},
+                'limit': {'type': 'integer', 'minimum': 1, 'maximum': 100, 'default': 30},
+                'maxChars': {'type': 'integer', 'minimum': 4000, 'maximum': 16000, 'default': 10000},
                 'key': {'type': 'string'},
                 'ref': {'type': 'integer', 'minimum': 1, 'description': '快照中的元素引用'},
                 'note': {'type': 'string', 'maxLength': 200, 'description': 'annotate 的标注文本'},

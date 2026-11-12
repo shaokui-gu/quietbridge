@@ -151,3 +151,68 @@ func rejectsMalformedApplicationIconPaths(_ value: String) throws {
     let request = try NativeRequest(data: Data("{\"id\":\"icons\",\"method\":\"applicationIcons\",\"params\":{\"paths\":\(value)}}".utf8))
     #expect(throws: NativeFailure.self) { try RequestParameters(request).strings("paths") }
 }
+
+@Test func admitsBrowserPreviewProducerMessagesAndRejectsMixedScopes() throws {
+    func admit(_ values: [String: JSONValue]) throws -> RequestParameters {
+        let encoded = try JSONEncoder().encode(JSONValue.object([
+            "id": .string("preview-contract"), "method": .string("preview"), "params": .object(values)]))
+        return try RequestParameters(NativeRequest(data: encoded))
+    }
+    let hold: [String: JSONValue] = ["action": .string("hold"), "appHandle": .string("app"),
+        "windowId": .number(207258), "source": .string("browser_content"), "leaseId": .string("lease"),
+        "durationSeconds": .number(600), "waitForFrame": .bool(false)]
+    let renew: [String: JSONValue] = ["action": .string("browserRenew"), "leaseId": .string("lease"),
+        "durationSeconds": .number(600)]
+    let clear: [String: JSONValue] = ["action": .string("browserFrame"), "leaseId": .string("lease"),
+        "documentKey": .string("document"), "sequence": .number(1)]
+    var frame = clear
+    frame.merge(["sequence": .number(2), "data": .string("ZmFrZQ=="), "capturedAt": .number(1794380125)]) { _, new in new }
+    for message in [hold, renew, clear, frame] { _ = try admit(message) }
+    var noLease = hold; noLease.removeValue(forKey: "leaseId")
+    var systemLease = hold; systemLease["source"] = .string("window")
+    var partial = frame; partial.removeValue(forKey: "capturedAt")
+    var fractional = clear; fractional["sequence"] = .number(1.5)
+    var crossScope = renew; crossScope["windowId"] = .number(8)
+    var oversized = frame; oversized["data"] = .string(String(repeating: "a", count: 180001))
+    for message in [noLease, systemLease, partial, fractional, crossScope, oversized] {
+        #expect(throws: NativeFailure.self) { try admit(message) }
+    }
+}
+
+// Exercise the real Python producer against Swift admission, without starting
+// the helper, a browser, a capture or the preview UI.
+@Test func pythonBrowserPreviewProducerPassesNativeAdmission() throws {
+    var root = URL(fileURLWithPath: #filePath)
+    for _ in 0..<5 { root.deleteLastPathComponent() }
+    let process = Process()
+    process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
+    process.arguments = ["python3", "-B", "-c", """
+import json,sys
+sys.path.insert(0,sys.argv[1])
+from test_browser_preview import BrowserPreviewTests
+case=BrowserPreviewTests()
+case.setUp()
+try:
+    lease=case.start()
+    case.start()
+    case.data['peer']['previewFrame']=case.frame(lease)
+    case.preview.tick()
+    case.preview.stop()
+    print(json.dumps([dict(id='contract',method=c.args[0],params=c.args[1]) for c in case.request.call_args_list]))
+finally:
+    case.doCleanups()
+""", root.appendingPathComponent("services/mcp").path]
+    let output = Pipe(), errors = Pipe()
+    process.standardOutput = output
+    process.standardError = errors
+    try process.run()
+    let data = output.fileHandleForReading.readDataToEndOfFile()
+    process.waitUntilExit()
+    #expect(process.terminationStatus == 0)
+    let messages = try JSONDecoder().decode([JSONValue].self, from: data)
+    #expect(messages.count == 5)
+    for message in messages {
+        let request = try NativeRequest(data: JSONEncoder().encode(message))
+        _ = try RequestParameters(request)
+    }
+}

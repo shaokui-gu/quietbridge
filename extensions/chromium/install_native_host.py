@@ -162,8 +162,8 @@ def launcher_script(python_path, host_path):
     host_name = Path(host_path).name
     require(host_name not in ('', '.', '..'), '主机文件名无效')
     command = shlex.quote(str(python_path)) + ' -B "$host" "$@"'
-    # 第一行日志必须在解析任何路径之前落盘：调用方（Chrome）根本没执行到这里时，
-    # 日志里就不会有 launch 行，可直接区分“没被拉起”和“拉起来后退出”。
+    # 正常单次 native message 会启动并正常退出一个宿主；默认只记错误，
+    # 避免把轮询写成重启风暴。显式调试时在路径解析前记录启动。
     return ('#!/bin/sh\n'
             'umask 077\n'
             'log=""\n'
@@ -174,7 +174,10 @@ def launcher_script(python_path, host_path):
             '  log="$TMPDIR/workbuddy-extension-native-host.log"\n'
             'fi\n'
             'if [ -n "$log" ] && { exec 3>> "$log"; } 2>/dev/null; then :; else exec 3>/dev/null; fi\n'
-            'printf "%s launch pid=%s argc=%s arg1=%s home=%s\\n" "$(/bin/date -u +%Y-%m-%dT%H:%M:%SZ)" "$$" "$#" "${1:-none}" "${HOME:-unset}" >&3\n'
+            'debug="${QUIETBRIDGE_NATIVE_HOST_DEBUG:-0}"\n'
+            'if [ "$debug" = 1 ]; then\n'
+            '  printf "%s launch pid=%s argc=%s arg1=%s home=%s\\n" "$(/bin/date -u +%Y-%m-%dT%H:%M:%SZ)" "$$" "$#" "${1:-none}" "${HOME:-unset}" >&3\n'
+            'fi\n'
             'script_dir=$(CDPATH= cd -P "$(/usr/bin/dirname "$0")" && pwd -P) || {\n'
             '  printf "%s script-dir-failed\\n" "$(/bin/date -u +%Y-%m-%dT%H:%M:%SZ)" >&3\n'
             '  exit 1\n'
@@ -185,10 +188,14 @@ def launcher_script(python_path, host_path):
             '  printf "%s\\n" "Native host missing beside launcher: $host" >&2\n'
             '  exit 1\n'
             'fi\n'
-            'printf "%s host-start pid=%s python=%s\\n" "$(/bin/date -u +%Y-%m-%dT%H:%M:%SZ)" "$$" ' + shlex.quote(str(python_path)) + ' >&3\n'
+            'if [ "$debug" = 1 ]; then\n'
+            '  printf "%s host-start pid=%s python=%s\\n" "$(/bin/date -u +%Y-%m-%dT%H:%M:%SZ)" "$$" ' + shlex.quote(str(python_path)) + ' >&3\n'
+            'fi\n'
             + command + ' 2>&3\n'
             'status=$?\n'
-            'printf "%s host-exit pid=%s code=%s\\n" "$(/bin/date -u +%Y-%m-%dT%H:%M:%SZ)" "$$" "$status" >&3\n'
+            'if [ "$status" -ne 0 ] || [ "$debug" = 1 ]; then\n'
+            '  printf "%s host-exit pid=%s code=%s\\n" "$(/bin/date -u +%Y-%m-%dT%H:%M:%SZ)" "$$" "$status" >&3\n'
+            'fi\n'
             'exit "$status"\n')
 
 

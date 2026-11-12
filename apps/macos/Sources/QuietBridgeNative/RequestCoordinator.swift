@@ -341,9 +341,11 @@ import Darwin
             guard let source = PreviewSource(rawValue: rawSource) else {
                 throw RequestParameters.invalid("source 必须为 application、desktop 或 window")
             }
+            let browserLeaseID = source == .browserContent ? try params.string("leaseId") : nil
             try resourceLease.acquire(clientID, resource: .preview)
             preview.track(pid: target.pid, windowID: target.windowID, source: source)
             let granted = preview.hold(seconds: seconds)
+            if let browserLeaseID { preview.configureBrowserLease(browserLeaseID) }
             // Browser CDP input is independent of native video availability.
             // Keep its preview lease without waiting for or requiring a frame.
             if try params.optionalBoolean("waitForFrame") ?? true {
@@ -355,6 +357,26 @@ import Darwin
                             "source": .string(source.rawValue),
                             "durationSeconds": .number(granted),
                             "preview": previewDiagnostics()])
+        case "browserRenew":
+            try resourceLease.require(clientID)
+            let seconds = try params.number("durationSeconds")
+            guard seconds >= 60, seconds <= SpacePreview.maximumHoldSeconds else {
+                throw RequestParameters.invalid("durationSeconds 无效")
+            }
+            try preview.renewBrowserLease(params.string("leaseId"), seconds: seconds)
+            resourceLease.touch(clientID)
+            return .object(["action": .string("browserRenew"), "preview": previewDiagnostics()])
+        case "browserFrame":
+            try resourceLease.require(clientID)
+            let sequence = try params.number("sequence")
+            guard let ordinal = Int(exactly: sequence), ordinal > 0 else {
+                throw RequestParameters.invalid("sequence 无效")
+            }
+            try preview.acceptBrowserFrame(leaseID: params.string("leaseId"),
+                documentKey: params.string("documentKey"), sequence: ordinal,
+                data: params.contains("data") ? params.string("data") : nil,
+                capturedAt: params.contains("capturedAt") ? params.number("capturedAt") : nil)
+            return .object(["action": .string("browserFrame"), "preview": previewDiagnostics()])
         case "release":
             if resourceLease.release(clientID, resource: .preview) { preview.release() }
             return .object(["action": .string("release"), "preview": previewDiagnostics()])
@@ -368,12 +390,18 @@ import Darwin
     }
 
     private func previewDiagnostics() -> JSONValue {
-        let values = preview.diagnostics()
+        Self.previewDiagnosticsSnapshot(preview.diagnostics(), holding: preview.isHolding,
+                                        holdRemainingSeconds: preview.holdRemainingSeconds)
+    }
+
+    // The native reply is a separate projection from operation-log events.
+    static func previewDiagnosticsSnapshot(_ values: [String: Any], holding: Bool,
+                                           holdRemainingSeconds: Double?) -> JSONValue {
         let targetOnCurrentSpace: JSONValue = (values["targetOnCurrentSpace"] as? Bool).map(JSONValue.bool) ?? .null
         let streamError: JSONValue = (values["streamError"] as? String).map(JSONValue.string) ?? .null
         let frameAge: JSONValue = (values["frameAgeMs"] as? Double).map(JSONValue.number) ?? .null
         let displayID = values["displayId"] as? Int ?? 0
-        let fields: [String: JSONValue] = [
+        var fields: [String: JSONValue] = [
             "visible": .bool(values["visible"] as? Bool ?? false),
             "status": .string(values["status"] as? String ?? ""),
             "videoFrames": .number(Double(values["videoFrames"] as? Int ?? 0)),
@@ -382,8 +410,8 @@ import Darwin
             "panelFrame": .string(values["panelFrame"] as? String ?? ""),
             "videoLayerReady": .bool(values["videoLayerReady"] as? Bool ?? false),
             "videoLayerFailed": .bool(values["videoLayerFailed"] as? Bool ?? false),
-            "holding": .bool(preview.isHolding),
-            "holdRemainingSeconds": preview.holdRemainingSeconds.map { .number($0) } ?? .null,
+            "holding": .bool(holding),
+            "holdRemainingSeconds": holdRemainingSeconds.map { .number($0) } ?? .null,
             "mode": .string(values["mode"] as? String ?? "window"),
             "scope": .string(values["scope"] as? String ?? "window"),
             "targetOnCurrentSpace": targetOnCurrentSpace,
@@ -405,6 +433,14 @@ import Darwin
             "panelSpaceVerified": .bool(values["panelSpaceVerified"] as? Bool ?? false),
             "panelPlacementError": (values["panelPlacementError"] as? String).map(JSONValue.string) ?? .null,
         ]
+        // These dictionaries originate in the fixed content-free diagnostics producers.
+        for key in ["frameProgress", "captureLifecycle", "captureStop"] {
+            guard let raw = values[key] as? [String: Any],
+                  JSONSerialization.isValidJSONObject(raw),
+                  let data = try? JSONSerialization.data(withJSONObject: raw),
+                  let value = try? JSONDecoder().decode(JSONValue.self, from: data) else { continue }
+            fields[key] = value
+        }
         return .object(fields)
     }
 

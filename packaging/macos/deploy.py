@@ -111,7 +111,7 @@ def lifecycle_plan(home, connector, config):
     return workbuddy.lifecycle_plan(home, connector, config, checked=checked, read=read)
 
 
-def preflight(home):
+def preflight(home, upgrade=None):
     if sys.version_info < (3, 9):
         raise ValueError('需要 Python 3.9 或更高版本')
     if sys.platform != 'darwin' or int(platform.mac_ver()[0].split('.')[0]) < 14 or platform.machine() != 'arm64':
@@ -121,6 +121,10 @@ def preflight(home):
         raise ValueError('用户组件必须以桌面用户身份安装')
     config_plan(home, APP / 'Contents/Resources/bridge/server.py', APP)
     runtime = checked(runtime_root(home))
+    pending = read_upgrade(home)
+    if pending and pending['phase'] not in ('committed', 'rolled-back') and (
+            not upgrade or pending['id'] != upgrade['id'] or pending['phase'] not in ('stopped', 'deploying')):
+        raise ValueError('发现替换文件前已暂停的安装；请先运行：' + str(upgrade_recovery_command(home, pending)))
     for relative in ('extension/extension-stage', 'releases', 'transactions'):
         checked(runtime / relative)
     agent = checked(home / 'Library/LaunchAgents' / (LABEL + '.plist'))
@@ -230,20 +234,30 @@ class MenuBarService:
         self.agent = home / 'Library/LaunchAgents' / (LABEL + '.plist')
 
     def is_running(self):
-        connection = http.client.HTTPConnection('127.0.0.1', 47631, timeout=0.5)
-        try:
-            connection.request('GET', '/')
-            service = json.loads(connection.getresponse().read(8192)).get('_service', {})
-            pid = service.get('pid')
-            if type(pid) is not int or pid <= 0:
-                return False
-            owner = subprocess.run(['/bin/ps', '-p', str(pid), '-o', 'uid='], capture_output=True, text=True)
+        return bool(self.processes())
+
+    def processes(self):
+        # Startup/wizard processes may not have opened the status port yet.
+        # Enumerate only this user's signed menu executables, never helpers.
+        found = []
+        verified = set()
+        for pid, executable in user_processes():
+            if not self.owns_process(executable, str(os.getuid()), str(executable)):
+                continue
             command = subprocess.run(['/bin/ps', '-p', str(pid), '-o', 'command='], capture_output=True, text=True)
-            return self.owns_process(Path(service.get('executable', '')), owner.stdout.strip(), command.stdout.strip())
-        except (OSError, ValueError, http.client.HTTPException):
-            return False
-        finally:
-            connection.close()
+            if command.returncode not in (0, 1):
+                raise RuntimeError('无法核对菜单栏进程')
+            if not command.stdout.strip() or not self.owns_process(executable, str(os.getuid()), command.stdout.strip()):
+                continue
+            app = checked(executable.parents[2])
+            if app not in verified:
+                identifier = plistlib.loads((app / 'Contents/Info.plist').read_bytes()).get('CFBundleIdentifier')
+                if identifier not in (MENU_IDENTIFIER, LEGACY_MENU_IDENTIFIER):
+                    raise ValueError('运行中应用标识无法识别；未终止进程')
+                verify_code(app, identifier)
+                verified.add(app)
+            found.append((pid, executable))
+        return found
 
     def owns_process(self, executable, owner, arguments):
         if owner != str(os.getuid()):
@@ -265,43 +279,32 @@ class MenuBarService:
                    for path in launch_paths)
 
     def stop(self):
+        owned = self.processes()
+        pids = subprocess.run(['/usr/sbin/lsof', '-nP', '-iTCP:47631', '-sTCP:LISTEN', '-t'],
+                              capture_output=True, text=True)
+        if pids.returncode not in (0, 1) or pids.stderr.strip():
+            raise RuntimeError('无法核对菜单栏状态端口: ' + pids.stderr.strip())
+        if any(int(pid) not in {item[0] for item in owned} for pid in pids.stdout.split()):
+            raise RuntimeError('状态端口被其他程序占用；未终止该进程')
         status = subprocess.run(['/bin/launchctl', 'print', self.name], capture_output=True)
         if status.returncode == 0:
             subprocess.run(['/bin/launchctl', 'bootout', self.name], check=True, capture_output=True)
         elif b'Could not find service' not in status.stderr:
             raise RuntimeError('无法读取菜单栏登录启动状态: ' + status.stderr.decode('utf-8', 'replace').strip())
-        # Also handle a copy previously opened from Finder, using exact identity,
-        # uid and executable checks rather than killing every helper process.
-        pids = subprocess.run(['/usr/sbin/lsof', '-nP', '-iTCP:47631', '-sTCP:LISTEN', '-t'],
-                              capture_output=True, text=True)
-        if pids.returncode not in (0, 1) or pids.stderr.strip():
-            raise RuntimeError('无法核对菜单栏状态端口: ' + pids.stderr.strip())
-        for text in set(pids.stdout.split()):
-            pid = int(text)
-            path = ctypes.create_string_buffer(4096)
-            library = ctypes.CDLL('/usr/lib/libproc.dylib')
-            if library.proc_pidpath(pid, path, len(path)) <= 0:
+        # bootout may return before the process exits. Include Finder/wizard
+        # instances and revalidate identity before every signal and final wait.
+        for pid, executable in owned:
+            if (pid, executable) not in self.processes():
                 continue
-            executable = Path(os.fsdecode(path.value))
-            owner = subprocess.run(['/bin/ps', '-p', text, '-o', 'uid='], capture_output=True, text=True)
-            command = subprocess.run(['/bin/ps', '-p', text, '-o', 'command='], capture_output=True, text=True)
-            if not owner.stdout.strip() or not command.stdout.strip():
-                continue  # The old process exited between lsof and ps.
-            if not self.owns_process(executable, owner.stdout.strip(), command.stdout.strip()):
-                raise RuntimeError('状态端口被其他程序占用；未终止该进程')
             try:
                 os.kill(pid, signal.SIGTERM)
             except ProcessLookupError:
                 continue
-            until = time.monotonic() + 5
-            while time.monotonic() < until:
-                try:
-                    os.kill(pid, 0)
-                except ProcessLookupError:
-                    break
-                time.sleep(0.1)
-            else:
-                raise RuntimeError('旧菜单栏程序未退出')
+        until = time.monotonic() + 5
+        while self.processes():
+            if time.monotonic() >= until:
+                raise RuntimeError('旧菜单栏程序未退出；未允许替换应用文件')
+            time.sleep(0.1)
 
     def start(self):
         subprocess.run(['/bin/launchctl', 'bootstrap', self.domain, str(self.agent)], check=True, capture_output=True)
@@ -331,6 +334,189 @@ class MenuBarService:
 def verify_code(app, identifier):
     requirement = '=anchor apple generic and identifier "' + identifier + '" and certificate leaf[subject.OU] = "' + TEAM + '"'
     subprocess.run(['/usr/bin/codesign', '--verify', '--strict', '-R', requirement, str(app)], check=True, capture_output=True)
+
+
+def upgrade_path(home):
+    return checked(runtime_root(home) / 'upgrade-state.json')
+
+
+def read_upgrade(home):
+    raw = read(upgrade_path(home))
+    if raw is None:
+        return None
+    if len(raw) > 262144:
+        raise ValueError('安装暂停记录超限；未覆盖')
+    value = json.loads(raw)
+    if (not isinstance(value, dict) or value.get('schemaVersion') != 1 or
+            not re.fullmatch(r'[0-9a-f]{32}', str(value.get('id', ''))) or
+            value.get('phase') not in ('preparing', 'stopped', 'deploying', 'recovery-required', 'committed', 'rolled-back') or
+            type(value.get('wasRunning')) is not bool):
+        raise ValueError('安装暂停记录格式错误；未覆盖')
+    return value
+
+
+def save_upgrade(home, value):
+    atomic(upgrade_path(home), json.dumps(value, ensure_ascii=False, indent=2).encode())
+
+
+def upgrade_recovery_command(home, value):
+    return checked(runtime_root(home) / 'upgrade-recovery' / value['id'] / '恢复安装.command')
+
+
+def stage_upgrade_recovery(home, value):
+    # PackageKit can fail before publishing the new support/deploy.py. Preserve
+    # the new recovery implementation outside the payload before stopping.
+    command = upgrade_recovery_command(home, value)
+    directory = command.parent
+    directory.mkdir(parents=True, mode=0o700)
+    shutil.copy2(Path(__file__), directory / 'deploy.py')
+    shutil.copy2(Path(sys.modules['compatibility'].__file__), directory / 'compatibility.py')
+    shutil.copytree(Path(workbuddy.__file__).parents[1], directory / 'adapters',
+                    ignore=shutil.ignore_patterns('__pycache__', '*.pyc', 'tests'))
+    text = '#!/bin/bash\nset -euo pipefail\n' + shlex.quote(sys.executable) + ' -B ' + \
+           shlex.quote(str(directory / 'deploy.py')) + ' --recover-latest\n' + \
+           "read -r -p '按回车关闭。' ignored\n"
+    atomic(command, text.encode(), 0o700)
+
+
+def restore_upgrade(home, value, service=None):
+    """Restore only the verified pre-payload menu copy, never system payloads."""
+    service = service or MenuBarService(home)
+    agent = checked(home / 'Library/LaunchAgents' / (LABEL + '.plist'))
+    try:
+        for journal in (checked(runtime_root(home)) / 'transactions').glob('*/journal.json'):
+            if json.loads(read(journal))['phase'] not in ('committed', 'rolled-back'):
+                raise ValueError('用户文件事务尚未恢复；请先运行“恢复安装.command”')
+        if value['wasRunning']:
+            original = bytes.fromhex(value['oldAgentHex']) if value['oldAgentHex'] is not None else None
+            resume = bytes.fromhex(value['resumeAgentHex'])
+            if read(agent) not in (original, resume):
+                raise ValueError('启动项在安装期间被修改；已保留修改与旧版备份')
+            binary = checked(value['restoreBinary'])
+            releases = checked(runtime_root(home) / 'releases')
+            if (releases not in binary.parents or binary.parent.name != 'MacOS' or
+                    binary.parent.parent.name != 'Contents' or
+                    binary.name not in ('quietbridge-native', 'workbuddy-cua-native')):
+                raise ValueError('旧版恢复路径无效')
+            app = binary.parents[2]
+            info = plistlib.loads((app / 'Contents/Info.plist').read_bytes())
+            identifier = info.get('CFBundleIdentifier')
+            if identifier not in (MENU_IDENTIFIER, LEGACY_MENU_IDENTIFIER) or info.get('CFBundleExecutable') != binary.name:
+                raise ValueError('旧版恢复应用标识无效')
+            verify_code(app, identifier)
+            launch = plistlib.loads(resume)
+            if launch.get('Label') != LABEL or launch.get('ProgramArguments') != [str(binary), '--menubar']:
+                raise ValueError('旧版恢复启动项无效')
+            service.stop()
+            atomic(agent, resume, 0o644)
+            service.start()
+            service.wait_ready(binary, info)
+        value['phase'] = 'rolled-back'
+        save_upgrade(home, value)
+    except Exception:
+        value['phase'] = 'recovery-required'
+        save_upgrade(home, value)
+        raise
+
+
+def prepare_install(home, version, build, service=None):
+    if not re.fullmatch(r'[0-9]+(?:\.[0-9]+){2}', version) or not re.fullmatch(r'[0-9]+', build):
+        raise ValueError('安装版本格式错误')
+    runtime = preflight(home)
+    service = service or MenuBarService(home)
+    processes = service.processes()
+    paths = {executable for _, executable in processes}
+    if len(paths) > 1:
+        raise ValueError('发现多个运行中的应用副本；未停止或替换，请保留一个后重试')
+    value = {'schemaVersion': 1, 'id': uuid.uuid4().hex, 'phase': 'preparing',
+             'version': version, 'build': build, 'wasRunning': bool(processes)}
+    if processes:
+        source = checked(next(iter(paths)).parents[2])
+        info = plistlib.loads((source / 'Contents/Info.plist').read_bytes())
+        identifier = info.get('CFBundleIdentifier')
+        if identifier not in (MENU_IDENTIFIER, LEGACY_MENU_IDENTIFIER):
+            raise ValueError('运行中应用身份无法验证')
+        verify_code(source, identifier)
+        # A directly launched /Applications copy will be replaced by PackageKit.
+        # Keep an independent signed copy even when there was no LaunchAgent.
+        backup = checked(runtime / 'releases' / ('rollback-' + value['id']) / 'QuietBridge.app')
+        backup.parent.mkdir(parents=True, mode=0o700)
+        shutil.copytree(source, backup, ignore=shutil.ignore_patterns('__pycache__', '*.pyc'))
+        if tree_digest(source, ('__pycache__', '*.pyc')) != tree_digest(backup):
+            raise ValueError('旧版备份与运行应用不一致；未停止应用')
+        verify_code(backup, identifier)
+        executable = info.get('CFBundleExecutable')
+        if executable not in ('quietbridge-native', 'workbuddy-cua-native') or not (backup / 'Contents/MacOS' / executable).is_file():
+            raise ValueError('旧版恢复执行文件无效')
+        binary = backup / 'Contents/MacOS' / executable
+        agent = checked(home / 'Library/LaunchAgents' / (LABEL + '.plist'))
+        original = read(agent)
+        resume = plistlib.loads(original) if original else {'Label': LABEL, 'ProcessType': 'Interactive'}
+        resume.update(ProgramArguments=[str(binary), '--menubar'], RunAtLoad=False, KeepAlive=False)
+        value.update(oldAgentHex=original.hex() if original is not None else None,
+                     resumeAgentHex=plistlib.dumps(resume).hex(), restoreBinary=str(binary))
+    stage_upgrade_recovery(home, value)
+    save_upgrade(home, value)
+    try:
+        service.stop()
+        value['phase'] = 'stopped'
+        save_upgrade(home, value)
+    except Exception as error:
+        try:
+            restore_upgrade(home, value, service)
+        except Exception as recovery:
+            raise RuntimeError(str(error) + '\n旧版恢复未完成，请运行：' + str(upgrade_recovery_command(home, value)) + '\n' + str(recovery)) from error
+        raise
+    return value
+
+
+def finish_install(home, helper, app=APP, support=SUPPORT, service=None):
+    value = read_upgrade(home)
+    info = plistlib.loads((app / 'Contents/Info.plist').read_bytes())
+    if (not value or value['phase'] != 'stopped' or
+            (value.get('version'), value.get('build')) !=
+            (info.get('CFBundleShortVersionString'), info.get('CFBundleVersion'))):
+        raise ValueError('缺少与此安装包匹配的安装前暂停记录；未继续部署')
+    value['phase'] = 'deploying'
+    save_upgrade(home, value)
+    try:
+        result = deploy(home, helper, app, support, service, upgrade=value)
+    except Exception as error:
+        try:
+            restore_upgrade(home, value, service)
+        except Exception as recovery:
+            raise RuntimeError(str(error) + '\n旧版恢复未完成，请运行：' + str(upgrade_recovery_command(home, value)) + '\n' + str(recovery)) from error
+        raise RuntimeError(str(error) + '\n已恢复安装前的应用运行状态；系统安装文件不在用户事务回滚范围内。') from error
+    value.update(phase='committed', deploymentJournal=result['journal'])
+    save_upgrade(home, value)
+    result['stoppedBeforePayload'] = True
+    return result
+
+
+def recover_latest(home, service=None):
+    runtime = checked(runtime_root(home))
+    records = [(path, json.loads(read(path))) for path in sorted((runtime / 'transactions').glob('*/journal.json'))]
+    journals = [path for path, value in records if value['phase'] not in ('committed', 'rolled-back')]
+    state = read_upgrade(home)
+    pending_upgrade = state and state['phase'] not in ('committed', 'rolled-back')
+    if pending_upgrade and not journals and any(value.get('upgradeId') == state['id'] and value['phase'] == 'committed'
+                                                for _, value in records):
+        # Deployment committed durably but the final stop receipt write was
+        # interrupted. Do not roll a healthy new release back to the old copy.
+        state['phase'] = 'committed'
+        save_upgrade(home, state)
+        return True
+    if not journals and not pending_upgrade:
+        return False
+    service = service or MenuBarService(home)
+    service.stop()
+    for journal in reversed(journals):
+        Transaction.reopen(journal.parent).rollback()
+    if pending_upgrade:
+        restore_upgrade(home, state, service)
+    elif service.agent.is_file() and any(json.loads(read(path)).get('wasRunning') is True for path in journals):
+        service.start()
+    return True
 
 
 def user_processes():
@@ -430,8 +616,8 @@ def verify_helper(helper):
     verify_code(helper_app, HELPER_IDENTIFIER)
 
 
-def deploy(home, helper, app=APP, support=SUPPORT, service=None):
-    runtime = preflight(home)
+def deploy(home, helper, app=APP, support=SUPPORT, service=None, upgrade=None):
+    runtime = preflight(home, upgrade)
     verify_helper(helper)
     verify_code(app, MENU_IDENTIFIER)
     menu_info = plistlib.loads((app / 'Contents/Info.plist').read_bytes())
@@ -488,7 +674,7 @@ def deploy(home, helper, app=APP, support=SUPPORT, service=None):
     files = [(config, original, rendered, 0o600),
              (settings, old_settings, rendered_settings, 0o600)]
     stable_modules = ['connector.py', 'stdio_transport.py', 'compatibility.py', 'lifecycle_store.py',
-                      'session_routing.py', 'session_registry.py', 'browser_events.py']
+                      'session_routing.py', 'session_registry.py', 'browser_events.py', 'browser_preview.py']
     stable_modules += [str(path.relative_to(bridge.parent)) for path in sorted((bridge.parent / 'adapters').rglob('*.py'))]
     transport_changed = False
     for relative in stable_modules:
@@ -502,7 +688,7 @@ def deploy(home, helper, app=APP, support=SUPPORT, service=None):
         files.append((target, prior_module, replacement, 0o600))
     extension_modules = [(release / 'extension/native_host.py', Path(plan['hostPath']))]
     extension_modules += [(release / 'extension' / name, Path(plan['bridgePath']).with_name(name))
-                          for name in ('browser_events.py', 'compatibility.py', 'session_registry.py', 'lifecycle_store.py')]
+                          for name in ('browser_events.py', 'compatibility.py', 'session_registry.py', 'lifecycle_store.py', 'browser_preview.py')]
     for source, target in extension_modules:
         files.append((target, read(target), source.read_bytes(), 0o600))
     launcher = Path(plan['launcherPath'])
@@ -525,7 +711,11 @@ def deploy(home, helper, app=APP, support=SUPPORT, service=None):
     directory = Path(tempfile.mkdtemp(prefix=datetime.datetime.now().strftime('%Y%m%d-%H%M%S-'), dir=transactions))
     transaction = Transaction(directory, files, extension, release / 'extension')
     service = service or MenuBarService(home)
-    was_running = service.is_running()
+    was_running = upgrade['wasRunning'] if upgrade is not None else service.is_running()
+    transaction.values['wasRunning'] = was_running
+    if upgrade is not None:
+        transaction.values['upgradeId'] = upgrade['id']
+    transaction.save()
     stopped = False
     try:
         stopped = True
@@ -547,7 +737,7 @@ def deploy(home, helper, app=APP, support=SUPPORT, service=None):
             transaction.rollback()
         except Exception as failure:
             recovery_errors.append(str(failure))
-        if stopped and was_running and old_agent is not None and not recovery_errors:
+        if upgrade is None and stopped and was_running and old_agent is not None and not recovery_errors:
             try:
                 service.start()
             except Exception as failure:
@@ -619,9 +809,15 @@ def deploy(home, helper, app=APP, support=SUPPORT, service=None):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--check', action='store_true')
+    actions = parser.add_mutually_exclusive_group()
+    actions.add_argument('--check', action='store_true')
+    actions.add_argument('--prepare-install', action='store_true')
+    actions.add_argument('--finish-install', action='store_true')
+    actions.add_argument('--abort-install', action='store_true')
+    actions.add_argument('--recover-latest', action='store_true')
+    parser.add_argument('--package-version')
+    parser.add_argument('--package-build')
     parser.add_argument('--helper', type=Path)
-    parser.add_argument('--recover-latest', action='store_true')
     args = parser.parse_args()
     home = Path.home()
     if args.check:
@@ -634,23 +830,29 @@ def main():
     fd = os.open(lock, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
     with os.fdopen(fd, 'w') as stream:
         fcntl.flock(stream, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        if args.recover_latest:
-            journals = [path for path in sorted((runtime / 'transactions').glob('*/journal.json'))
-                        if json.loads(read(path))['phase'] not in ('committed', 'rolled-back')]
-            if not journals:
+        if args.prepare_install:
+            if not args.package_version or not args.package_build:
+                parser.error('暂停安装需要包版本与构建号')
+            state = prepare_install(home, args.package_version, args.package_build)
+            print(json.dumps({'prepared': True, 'wasRunning': state['wasRunning'], 'stoppedBeforePayload': True,
+                              'recoveryCommand': str(upgrade_recovery_command(home, state))}, ensure_ascii=False))
+        elif args.abort_install:
+            state = read_upgrade(home)
+            if (not state or (state.get('version'), state.get('build')) != (args.package_version, args.package_build) or
+                    state['phase'] in ('committed', 'rolled-back')):
+                raise ValueError('没有与此安装包匹配的待恢复暂停记录')
+            restore_upgrade(home, state)
+            print('已恢复安装前的应用运行状态')
+        elif args.recover_latest:
+            if not recover_latest(home):
                 print('没有需要恢复的用户安装事务')
                 return
-            service = MenuBarService(home)
-            service.stop()
-            for journal in reversed(journals):
-                Transaction.reopen(journal.parent).rollback()
-            if service.agent.is_file():
-                service.start()
-            print('用户配置与扩展已恢复；请重新运行安装包')
+            print('安装状态已恢复；请核对应用版本后重新运行安装包')
         else:
             if not args.helper:
                 parser.error('需要 --helper')
-            print(json.dumps(deploy(home, args.helper), ensure_ascii=False, indent=2))
+            installer = finish_install if args.finish_install else deploy
+            print(json.dumps(installer(home, args.helper), ensure_ascii=False, indent=2))
 
 
 if __name__ == '__main__':

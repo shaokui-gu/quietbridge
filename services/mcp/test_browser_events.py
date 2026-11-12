@@ -41,7 +41,45 @@ DERIVED_ORIGIN = 'chrome-extension://' + DERIVED_ID + '/'
 
 
 class BrowserEventsTests(unittest.TestCase):
+    def test_observer_failure_is_connected_but_not_ready_and_does_not_queue_commands(self):
+        token = self.assign()
+        event = self.event()
+        self.request({'action': 'event', 'taskId': 'task', 'token': token, 'event': event})
+        observation = {'state': 'failed', 'bindingId': event['bindingId'], 'documentId': 'doc',
+            'navigationEpoch': 1, 'attempt': 2, 'stage': 'observer_configure',
+            'code': 'BROWSER_LIFECYCLE_TIMEOUT', 'at': events.time.time()}
+        issue = {k: observation[k] for k in ('stage', 'code', 'at')}
+        self.sync(observerStatus=observation, lifecycleError=issue)
+        status = events.status('task', **self.paths)
+        self.assertEqual(status['nativeConnection'], 'connected')
+        self.assertEqual(status['executionPolicy']['waitingReason'], 'observer_not_ready')
+        self.assertEqual(status['observerStatus'], observation)
+        self.assertEqual(status['lifecycleError'], issue)
+        with self.assertRaisesRegex(ValueError, 'BROWSER_OBSERVER_NOT_READY'):
+            events.internal_action({'action': 'command', 'taskId': 'task', 'operation': 'snapshot'}, **self.paths)
+        self.assertFalse(events.read_file(self.store)['peer'].get('command'))
+        self.sync(observerStatus={**observation, 'state': 'ready', 'code': None})
+        self.assertIsNone(events.status('task', **self.paths)['executionPolicy']['waitingReason'])
+        result = events.internal_action({'action': 'command', 'taskId': 'task', 'operation': 'snapshot'}, **self.paths)
+        self.assertTrue(result['commandId'])
+
+    def test_late_observer_status_does_not_describe_a_new_document(self):
+        token = self.assign()
+        event = self.event()
+        self.request({'action': 'event', 'taskId': 'task', 'token': token, 'event': event})
+        observation = {'state': 'failed', 'bindingId': event['bindingId'], 'documentId': 'old-doc',
+            'navigationEpoch': 1, 'attempt': 1, 'stage': 'observer_load',
+            'code': 'BROWSER_LIFECYCLE_TIMEOUT', 'at': events.time.time()}
+        self.sync(observerStatus=observation)
+        status = events.status('task', **self.paths)
+        self.assertIsNone(status['observerStatus'])
+        self.assertIsNone(status['executionPolicy']['waitingReason'])
+        self.assertEqual(status['nativeConnection'], 'connected')
+
     def setUp(self):
+        waiting = mock.patch.object(events, 'CANDIDATE_QUERY_TIMEOUT', 0)
+        waiting.start()
+        self.addCleanup(waiting.stop)
         session = mock.patch.object(events, 'application_session', return_value='test-app-session')
         session.start()
         self.addCleanup(session.stop)
@@ -92,6 +130,30 @@ class BrowserEventsTests(unittest.TestCase):
                 'bodyVisible': True, 'elementCount': 3, 'readyState': 'interactive',
                 'conditionMatched': None, 'bindingId': binding_id,
                 'sequence': sequence, 'mappingVerified': False}
+
+    def test_periodic_preview_sync_is_separate_from_commands_and_discards_stale_leases(self):
+        from browser_preview import identity
+        token = self.assign()
+        self.request({'action': 'event', 'taskId': 'task', 'token': token, 'event': self.event()})
+        with events.event_store(self.store) as data:
+            current = identity(data['tasks']['task'])
+            lease = {**current, 'leaseId': 'c' * 32, 'expiresAt': events.time.time() + 3}
+            data['peer']['previewLease'] = lease
+            data['peer']['pendingVerify'] = {'operation': 'click'}
+        frame = {'leaseId': lease['leaseId'], 'identity': current,
+                 'data': 'ZmFrZQ==', 'capturedAt': events.time.time()}
+        response = self.sync(previewFrame=frame)
+        self.assertEqual(response['previewLease'], lease)
+        peer = events.read_file(self.store)['peer']
+        self.assertEqual(peer['previewFrame'], frame)
+        self.assertEqual(peer['pendingVerify'], {'operation': 'click'})
+        self.assertFalse(peer.get('commandResults'))
+        self.assertNotIn('ZmFrZQ==', json.dumps(events.status('task', **self.paths)))
+        with events.event_store(self.store) as data:
+            data['peer']['previewLease']['expiresAt'] = 0
+        response = self.sync(previewFrame=frame)
+        self.assertIsNone(response['previewLease'])
+        self.assertNotIn('previewFrame', events.read_file(self.store)['peer'])
 
     def test_assign_event_status_unbind_full_chain(self):
         original = self.tasks.read_bytes()
@@ -281,6 +343,51 @@ class BrowserEventsTests(unittest.TestCase):
         self.assertFalse(result['globalPermission'])
         self.assertEqual(result['candidates'], [])
 
+    def test_candidates_waits_for_first_metadata_without_second_agent_call(self):
+        self.sync()
+        candidate = {'tabId': 7, 'browserWindowId': 2, 'url': 'https://example.org/path'}
+        def reply(_):
+            self.sync(candidates=[candidate])
+        with mock.patch.object(events, 'CANDIDATE_QUERY_TIMEOUT', 3), \
+                mock.patch.object(events.time, 'sleep', side_effect=reply) as wait:
+            result = events.internal_action({'action': 'candidates', 'taskId': 'task'}, **self.paths)
+        self.assertEqual(result['candidates'], [candidate])
+        self.assertFalse(result['refreshPending'])
+        self.assertEqual(result['refreshStatus'], 'ready')
+        wait.assert_called_once()
+
+    def test_candidates_distinguishes_pending_from_fresh_empty_and_can_cancel(self):
+        self.sync()
+        pending = events.internal_action({'action': 'candidates'}, **self.paths)
+        self.assertTrue(pending['refreshPending'])
+        self.assertEqual(pending['retryAfterMs'], 1000)
+        with mock.patch.object(events, 'CANDIDATE_QUERY_TIMEOUT', 3), \
+                mock.patch.object(events.time, 'sleep', side_effect=lambda _: self.sync(candidates=[])):
+            empty = events.internal_action({'action': 'candidates'}, **self.paths)
+        self.assertEqual(empty['candidates'], [])
+        self.assertFalse(empty['refreshPending'])
+        checks = mock.Mock(side_effect=[None, RuntimeError('canceled')])
+        with self.assertRaisesRegex(RuntimeError, 'canceled'):
+            events.internal_action({'action': 'candidates'}, **self.paths, check_cancelled=checks)
+
+    def test_candidates_wait_stops_when_current_task_changes(self):
+        self.sync()
+        def changed(_):
+            data = events.read_file(self.tasks)
+            data['activeTaskId'] = 'other'
+            self.tasks.write_text(json.dumps(data))
+        with mock.patch.object(events, 'CANDIDATE_QUERY_TIMEOUT', 3), \
+                mock.patch.object(events.time, 'sleep', side_effect=changed):
+            with self.assertRaisesRegex(ValueError, '当前活动任务'):
+                events.internal_action({'action': 'candidates', 'taskId': 'task'}, **self.paths)
+
+    def test_candidates_with_fresh_cache_never_waits_or_loses_results(self):
+        self.assign()
+        with mock.patch.object(events.time, 'sleep') as wait:
+            result = events.internal_action({'action': 'candidates'}, **self.paths)
+        self.assertEqual(result['candidates'][0]['tabId'], 7)
+        wait.assert_not_called()
+
     def test_bad_fields_report_names_without_values(self):
         with self.assertRaises(ValueError) as caught:
             events.internal_action({'action': 'assign', 'taskId': 'task', 'tabId': 7,
@@ -340,15 +447,17 @@ class BrowserEventsTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.sync(commandResult={'requestId': 'a' * 32, 'status': 'error', 'error': 'x'})
         self.prepare_command()
-        queued = events.internal_action({'action': 'command', 'taskId': 'task', 'operation': 'snapshot'},
-                                        **self.paths)
         broken = self.SNAPSHOT | {'elements': [self.SNAPSHOT['elements'][0] | {'ref': 0}]}
-        with self.assertRaises(ValueError):
-            self.sync(commandResult={'requestId': queued['commandId'], 'status': 'ok', 'result': broken})
         extra = self.SNAPSHOT | {'elements': [self.SNAPSHOT['elements'][0] | {'href': 'x'}]}
-        with self.assertRaises(ValueError):
-            self.sync(commandResult={'requestId': queued['commandId'], 'status': 'ok', 'result': extra})
-        self.assertEqual(self.sync()['command']['requestId'], queued['commandId'])
+        for result in (broken, extra):
+            queued = events.internal_action({'action': 'command', 'taskId': 'task', 'operation': 'snapshot'}, **self.paths)
+            reply = self.sync(commandResult={'requestId': queued['commandId'], 'status': 'ok', 'result': result})
+            self.assertEqual(reply['commandAck']['code'], 'INVALID_BROWSER_RESULT')
+            self.assertIsNone(reply['command'])
+            self.assertEqual(self.sync()['taskAssignment'], 'assigned', '坏回执不能毒化下次握手')
+            stored = events.read_file(self.store)['peer']['commandResults'][-1]
+            self.assertEqual(stored['status'], 'error')
+            self.assertNotIn('result', stored)
 
     def test_action_commands_validate_their_own_parameters(self):
         self.prepare_command()
@@ -408,18 +517,16 @@ class BrowserEventsTests(unittest.TestCase):
         self.assertEqual(self.sync()['command']['params'], {'snapshotId': 'snap-1', 'deltaY': -6})
 
     def test_malformed_action_result_is_rejected(self):
-        self.prepare_command()
-        queued = events.internal_action({'action': 'command', 'taskId': 'task',
-                                         'operation': 'scroll', 'snapshotId': 'snap-1',
-                                         'direction': 'down', 'lines': 3}, **self.paths)
-        with self.assertRaises(ValueError):
-            self.sync(commandResult={'requestId': queued['commandId'], 'status': 'ok',
-                                     'result': {'performed': True, 'verified': True,
-                                                'observed': {'before': 0, 'after': 80, 'extra': 1,
-                                                             'note': 'x' * 300}}})
-        with self.assertRaises(ValueError):
-            self.sync(commandResult={'requestId': queued['commandId'], 'status': 'ok',
-                                     'result': {'performed': 'yes', 'verified': True, 'observed': {}}})
+        for result in ({'performed': True, 'verified': True, 'observed': {'note': 'x' * 300}},
+                       {'performed': 'yes', 'verified': True, 'observed': {}}):
+            self.prepare_command()
+            queued = events.internal_action({'action': 'command', 'taskId': 'task',
+                                             'operation': 'scroll', 'snapshotId': 'snap-1',
+                                             'direction': 'down', 'lines': 3}, **self.paths)
+            reply = self.sync(commandResult={'requestId': queued['commandId'], 'status': 'ok', 'result': result})
+            self.assertEqual(reply['commandAck']['status'], 'rejected')
+            self.assertIsNone(self.sync()['command'], '拒绝后的动作不得重放')
+            self.assertTrue(events.status('task', **self.paths)['commandState']['verificationRequired'])
 
     def test_performed_action_requires_a_snapshot_before_the_next_action(self):
         self.prepare_command()
@@ -481,6 +588,96 @@ class BrowserEventsTests(unittest.TestCase):
         queued = submit(url='https://example.org/next')
         self.assertEqual(self.sync()['command']['params'], {'url': 'https://example.org/next'})
         self.assertTrue(queued['commandId'])
+
+    def test_read_is_bounded_and_does_not_clear_pending_input_verification(self):
+        self.prepare_command()
+        capabilities = ['cdp_input', 'document_binding', 'background_popups', 'paged_read']
+        self.sync(capabilities=capabilities)
+        with events.event_store(self.store) as data:
+            data['peer']['pendingVerify'] = {'taskId': 'task', 'commandId': 'old-input'}
+        queued = events.internal_action({'action': 'command', 'taskId': 'task', 'operation': 'read',
+                                        'mode': 'content', 'limit': 2, 'maxChars': 4000}, **self.paths)
+        result = {'readId': 'read-1', 'mode': 'content', 'url': 'https://example.org/path', 'title': 'Fixture',
+                  'offset': 0, 'nextOffset': None, 'totalItems': 1, 'sourceTruncated': False, 'domOnly': True,
+                  'observedAt': 1794210000000,
+                  'items': [{'id': 'post-1', 'kind': 'article', 'text': 'Rendered content',
+                             'textOffset': 0, 'textComplete': True}]}
+        self.sync(capabilities=capabilities, commandResult={'requestId': queued['commandId'], 'status': 'ok', 'result': result})
+        reply = events.internal_action({'action': 'result', 'taskId': 'task', 'commandId': queued['commandId']}, **self.paths)
+        self.assertEqual(reply['result'], result)
+        self.assertEqual(events.read_file(self.store)['peer']['pendingVerify']['commandId'], 'old-input')
+        with self.assertRaisesRegex(ValueError, '尚未用 snapshot'):
+            events.internal_action({'action': 'command', 'taskId': 'task', 'operation': 'click',
+                                    'snapshotId': 'snap-1', 'ref': 1}, **self.paths)
+
+    def test_read_requires_new_extension_and_valid_cursor_options(self):
+        self.prepare_command()
+        args = {'action': 'command', 'taskId': 'task', 'operation': 'read'}
+        with self.assertRaisesRegex(ValueError, 'EXTENSION_UPGRADE_REQUIRED'):
+            events.internal_action(args, **self.paths)
+        for change in ({'mode': 'html'}, {'offset': 1}, {'limit': 101}, {'limit': True},
+                       {'maxChars': 30000}, {'snapshotId': 'snapshot'}, {'readId': ''}):
+            with self.subTest(change=change), self.assertRaises(ValueError):
+                events.command_params(args | change, 'read')
+
+    def test_late_read_of_a_replaced_document_is_discarded_without_input_authorization(self):
+        self.prepare_command()
+        capabilities = ['cdp_input', 'document_binding', 'background_popups', 'paged_read']
+        self.sync(capabilities=capabilities)
+        queued = events.internal_action({'action': 'command', 'taskId': 'task', 'operation': 'read'}, **self.paths)
+        self.sync(capabilities=capabilities)  # Delivered for the original document.
+        with events.event_store(self.store) as data:
+            data['tasks']['task']['event']['documentId'] = 'replacement-document'
+            data['tasks']['task']['event']['navigationEpoch'] += 1
+            data['peer']['pendingVerify'] = {'taskId': 'task', 'commandId': 'prior-input'}
+        self.sync(capabilities=capabilities, commandResult={'requestId': queued['commandId'], 'status': 'ok',
+                  'result': {'syntheticOldDocument': True}})
+        reply = events.internal_action({'action': 'result', 'taskId': 'task', 'commandId': queued['commandId']}, **self.paths)
+        self.assertEqual(reply['status'], 'error')
+        self.assertEqual(reply['errorCode'], 'STALE_DOCUMENT')
+        self.assertNotIn('result', reply)
+        self.assertEqual(events.read_file(self.store)['peer']['pendingVerify']['commandId'], 'prior-input')
+
+    def test_read_result_rejects_oversized_or_inconsistent_page_evidence(self):
+        result = {'readId': 'read-1', 'mode': 'links', 'url': 'https://example.org/path', 'title': 'Fixture',
+                  'offset': 0, 'nextOffset': None, 'totalItems': 1, 'sourceTruncated': False, 'domOnly': True,
+                  'observedAt': 1794210000000, 'items': [{'name': 'Topic', 'href': 'https://example.org/t/1',
+                                                       'urlHasQuery': False, 'urlHasFragment': False}]}
+        params = {'mode': 'links', 'readId': 'read-1'}
+        self.assertEqual(events.validate_read(result, params), result)
+        for change in ({'readId': 'other'}, {'offset': 1}, {'totalItems': 2}, {'nextOffset': 0},
+                       {'domOnly': False}, {'extra': 'x'},
+                       {'items': [result['items'][0] | {'href': 'https://u:p@example.org/t/1'}]},
+                       {'items': [result['items'][0] | {'href': 'https://example.org/t/1?secret=1'}]}):
+            with self.subTest(change=change), self.assertRaises(ValueError):
+                events.validate_read(result | change, params)
+
+    def test_snapshot_allows_only_redacted_link_destinations(self):
+        element = self.SNAPSHOT['elements'][0] | {'href': 'https://example.org/t/topic/1',
+                                                  'urlHasQuery': True, 'urlHasFragment': False}
+        self.assertEqual(events.validate_snapshot(self.SNAPSHOT | {'elements': [element]})['elements'][0], element)
+        for change in ({'href': 'javascript:alert(1)'}, {'href': 'https://example.org/t/1?secret=x'},
+                       {'urlHasQuery': 1}, {'downloadPath': '/tmp/a'}):
+            with self.subTest(change=change), self.assertRaises(ValueError):
+                events.validate_snapshot(self.SNAPSHOT | {'elements': [element | change]})
+
+    def test_snapshot_coverage_is_optional_but_must_match_returned_elements(self):
+        coverage = {'returnedElements': len(self.SNAPSHOT['elements']), 'limit': 300, 'truncated': False,
+                    'scope': 'visible_interactive_top_and_accessible_frames',
+                    'elementCountScope': 'top_document_dom_nodes_capped_10000'}
+        snapshot = self.SNAPSHOT | {'coverage': coverage}
+        self.assertEqual(events.validate_snapshot(snapshot), snapshot)
+        self.assertEqual(events.validate_snapshot(self.SNAPSHOT), self.SNAPSHOT)
+        for change in ({'returnedElements': 300}, {'returnedElements': True}, {'limit': 301},
+                       {'truncated': True}, {'truncated': 1}, {'scope': 'all_dom'},
+                       {'elementCountScope': 'all_frames'}, {'extra': 'untrusted'}):
+            with self.subTest(change=change), self.assertRaises(ValueError):
+                events.validate_snapshot(snapshot | {'coverage': coverage | change})
+        elements = [self.SNAPSHOT['elements'][0] | {'ref': index + 1} for index in range(300)]
+        for truncated in (False, True):
+            result = snapshot | {'elements': elements, 'coverage': coverage |
+                                 {'returnedElements': 300, 'truncated': truncated}}
+            self.assertEqual(events.validate_snapshot(result), result)
 
     def test_cancel_before_delivery_reports_it_may_not_have_executed(self):
         self.prepare_command()
@@ -547,9 +744,11 @@ class BrowserEventsTests(unittest.TestCase):
         self.assertEqual(reply['nextAction'], 'observe')
         again = events.internal_action({'action': 'command', 'taskId': 'task',
                                         'operation': 'diagnostics'}, **self.paths)
-        with self.assertRaises(ValueError):
-            self.sync(commandResult={'requestId': again['commandId'], 'status': 'ok',
-                                     'result': self.DIAGNOSTICS | {'cookie': 'x'}})
+        rejected = self.sync(commandResult={'requestId': again['commandId'], 'status': 'ok',
+                                           'result': self.DIAGNOSTICS | {'cookie': 'x'}})
+        self.assertEqual(rejected['commandAck']['code'], 'INVALID_BROWSER_RESULT')
+        self.assertNotIn('cookie', self.store.read_text())
+        self.assertEqual(events.status('task', **self.paths)['nativeConnection'], 'connected')
 
     def test_annotation_registry_is_per_task_and_deduplicates_by_ref(self):
         self.prepare_assignment()
@@ -641,6 +840,46 @@ class BrowserEventsTests(unittest.TestCase):
         self.assertEqual(record['mapping']['method'], 'title')
         with self.assertRaises(ValueError):
             events.internal_action({'action': 'verify_mapping', 'taskId': 'task'}, **self.paths)
+
+    def test_window_mapping_uses_active_tab_metadata_without_changing_task_tab(self):
+        self.prepare_assignment()
+        assignment = self.sync()['assignment']
+        evidence = {'bindingId': assignment['bindingId'], 'browserWindowId': 2,
+                    'tabId': 8, 'title': 'Active document'}
+        self.sync(assignmentTitle='Inactive task document', windowEvidence=evidence)
+        args = {'action': 'verify_mapping', 'taskId': 'task',
+                'windows': [{'windowId': 900, 'title': 'Active document'}]}
+        result = events.internal_action(args, **self.paths)
+        self.assertTrue(result['verified'])
+        self.assertEqual(result['method'], 'window_active_title')
+        self.assertFalse(result['targetTabActiveAtVerification'])
+        self.assertEqual(result['windowActiveTabId'], 8)
+        self.assertEqual(self.sync()['assignment']['tabId'], 7)
+        duplicate = args | {'windows': args['windows'] + [{'windowId': 901, 'title': 'Active document'}]}
+        self.assertEqual(events.internal_action(duplicate, **self.paths)['reason'], 'ambiguous')
+        with events.event_store(self.store) as data:
+            data['peer']['windowEvidence']['at'] -= 21
+        self.assertFalse(events.internal_action(args, **self.paths)['verified'])
+        for change in ({'bindingId': '0' * 32}, {'browserWindowId': 3}):
+            self.sync(windowEvidence=evidence | change)
+            self.assertNotIn('windowEvidence', events.read_file(self.store)['peer'])
+            self.assertFalse(events.internal_action(args, **self.paths)['verified'])
+        self.sync(windowEvidence=evidence)
+        self.sync(windowEvidence=None)
+        self.assertFalse(events.internal_action(args, **self.paths)['verified'])
+
+    def test_foreign_extension_command_error_has_explicit_recovery_code(self):
+        self.prepare_command()
+        command = events.internal_action({'action': 'command', 'taskId': 'task',
+            'operation': 'click', 'snapshotId': 'snap-1', 'ref': 1}, **self.paths)
+        self.sync()
+        self.sync(commandResult={'requestId': command['commandId'], 'status': 'error',
+            'error': 'Cannot access a chrome-extension:// URL of different extension'})
+        result = events.internal_action({'action': 'result', 'taskId': 'task',
+            'commandId': command['commandId']}, **self.paths)
+        self.assertEqual(result['status'], 'error')
+        self.assertEqual(result['errorCode'], 'BROWSER_DEBUGGER_RESTRICTED')
+        self.assertEqual(result['nextAction'], 'stop')
 
     def test_mapping_evidence_is_host_local_and_does_not_break_observer_assignment(self):
         self.prepare_assignment()
@@ -877,10 +1116,32 @@ class BrowserEventsTests(unittest.TestCase):
         self.assertEqual(result.stderr, b'')
         log = self.base / 'Library' / 'Logs' / 'QuietBridgeBrowser-native-host.log'
         text = log.read_text()
-        self.assertIn('host-start', text)
+        self.assertNotIn('host-start', text)
         self.assertIn('synthetic diagnostic only', text)
         self.assertIn('code=7', text)
         self.assertEqual(log.stat().st_mode & 0o777, 0o600)
+
+    def test_launcher_success_is_quiet_unless_debug_is_explicit(self):
+        (self.base / 'Library' / 'Logs').mkdir(parents=True)
+        child = self.base / 'synthetic-host.py'
+        child.write_text('import sys\nsys.stdout.buffer.write(b"\\x02\\x00\\x00\\x00{}")\n')
+        launcher = self.base / 'launcher.sh'
+        launcher.write_text(installer.launcher_script(sys.executable, child))
+        env = {'HOME': str(self.base), 'PATH': '/usr/bin:/bin'}
+        log = self.base / 'Library' / 'Logs' / 'QuietBridgeBrowser-native-host.log'
+        for debug in (False, True):
+            result = subprocess.run(['/bin/sh', str(launcher)], capture_output=True,
+                                    env=env | ({'QUIETBRIDGE_NATIVE_HOST_DEBUG': '1'} if debug else {}), timeout=5)
+            self.assertEqual(result.returncode, 0)
+            self.assertEqual(result.stdout, b'\x02\x00\x00\x00{}')
+            self.assertEqual(result.stderr, b'')
+            text = log.read_text()
+            if debug:
+                self.assertIn('launch pid=', text)
+                self.assertIn('host-start', text)
+                self.assertIn('code=0', text)
+            else:
+                self.assertEqual(text, '')
 
     def portable_tree(self):
         root = self.base / 'synthetic portable tree'
@@ -1060,6 +1321,57 @@ class BrowserEventsTests(unittest.TestCase):
         queued = events.internal_action({'action': 'command', 'taskId': 'task', 'operation': 'snapshot'}, **self.paths)
         self.sync(commandResult={'requestId': queued['commandId'], 'status': 'ok', 'result': self.SNAPSHOT})
 
+    def test_render_probe_capability_gate_and_pending_verification(self):
+        self.prepare_command()
+        args = {'action': 'command', 'taskId': 'task', 'operation': 'render_probe', 'stage': 'inspect'}
+        with self.assertRaisesRegex(ValueError, 'EXTENSION_UPGRADE_REQUIRED'):
+            events.internal_action(args, **self.paths)
+        self.sync(capabilities=['cdp_input', 'document_binding', 'background_popups', 'render_probe'])
+        with events.event_store(self.store) as data:
+            data['peer']['pendingVerify'] = {'taskId': 'task', 'operation': 'navigate'}
+        with self.assertRaisesRegex(ValueError, 'RENDER_PROBE_NOT_READY'):
+            events.internal_action(args, **self.paths)
+        self.assertEqual(events.read_file(self.store)['peer']['pendingVerify']['operation'], 'navigate')
+        self.assertFalse(events.read_file(self.store)['peer'].get('command'))
+
+    def test_render_probe_result_is_document_scoped_and_has_no_input_verification_effect(self):
+        self.prepare_command()
+        caps = ['cdp_input', 'document_binding', 'background_popups', 'render_probe']
+        self.sync(capabilities=caps)
+        args = {'action': 'command', 'taskId': 'task', 'operation': 'render_probe', 'stage': 'inspect'}
+        queued = events.internal_action(args, **self.paths)
+        self.sync(capabilities=caps)
+        result = dict(stage='inspect', startedAt=events.time.time(), completedAt=events.time.time(),
+            performed=False, attachedBefore=False, attachedAfter=False, pageEnabledBefore=False, pageEnabledAfter=False)
+        self.sync(capabilities=caps, commandResult={'requestId': queued['commandId'], 'status': 'ok', 'result': result})
+        reply = self.poll_command(queued['commandId'])
+        self.assertEqual(reply['result'], result)
+        self.assertEqual(reply['nextAction'], 'observe')
+        self.assertIsNone(events.read_file(self.store)['peer'].get('pendingVerify'))
+        queued = events.internal_action(args, **self.paths)
+        self.sync(capabilities=caps)
+        with events.event_store(self.store) as data:
+            data['tasks']['task']['event']['documentId'] = 'new-doc'
+        self.sync(capabilities=caps, commandResult={'requestId': queued['commandId'], 'status': 'ok', 'result': result})
+        self.assertIn('STALE_DOCUMENT', self.poll_command(queued['commandId'])['error'])
+
+    def test_render_probe_strict_reply_and_schema(self):
+        r = dict(stage='capture', startedAt=100, completedAt=101, performed=True,
+                 attachedBefore=True, attachedAfter=True, pageEnabledBefore=True, pageEnabledAfter=True,
+                 captureDataLength=8)
+        self.assertEqual(events.validate_render_probe(r, {'stage': 'capture'}), r)
+        for bad in [dict(r, data='private'), dict(r, stage='inspect'), dict(r, performed=False),
+                    dict(r, startedAt=float('nan')), dict(r, completedAt=float('inf')),
+                    dict(r, completedAt=120), dict(r, captureDataLength=True),
+                    dict(r, captureDataLength=8.5), dict(r, pageEnabledBefore=False),
+                    dict(r, attachedAfter=False)]:
+            with self.assertRaises(ValueError):
+                events.validate_render_probe(bad, {'stage': 'capture'})
+        tool = events.make_tool(lambda: self.tasks)
+        self.assertEqual(tool['inputSchema']['properties']['stage']['enum'], list(events.RENDER_PROBE_STAGES))
+        with self.assertRaises(ValueError):
+            events.command_params({'operation': 'render_probe', 'stage': 'Runtime.evaluate'}, 'render_probe')
+
     def test_command_ack_loss_accepts_the_same_reply_without_overwriting_or_replaying(self):
         self.prepare_command()
         queued = events.internal_action({'action': 'command', 'taskId': 'task', 'operation': 'snapshot'}, **self.paths)
@@ -1068,6 +1380,194 @@ class BrowserEventsTests(unittest.TestCase):
         self.assertIsNone(self.sync(commandResult=reply)['command'])
         results = events.read_file(self.store)['peer']['commandResults']
         self.assertEqual(sum(r['requestId'] == queued['commandId'] for r in results), 1)
+
+    def poll_command(self, command_id):
+        return events.internal_action({'action': 'result', 'taskId': 'task', 'commandId': command_id}, **self.paths)
+
+    def test_expiry_is_terminal_even_without_heartbeats_and_after_new_commands(self):
+        self.prepare_command()
+        queued = events.internal_action({'action': 'command', 'taskId': 'task', 'operation': 'snapshot'}, **self.paths)
+        self.sync()
+        with events.event_store(self.store) as data:
+            data['peer']['command']['expiresAt'] = events.time.time() - 1
+            data['peer']['lastSeen'] = events.time.time() - 30
+        expired = self.poll_command(queued['commandId'])
+        self.assertEqual(expired['status'], 'expired')
+        self.assertTrue(expired['mayHaveExecuted'])
+        self.sync()
+        next_command = events.internal_action({'action': 'command', 'taskId': 'task', 'operation': 'diagnostics'}, **self.paths)
+        ack = self.sync(commandResult={'requestId': queued['commandId'], 'status': 'ok', 'result': self.SNAPSHOT})
+        self.assertEqual(ack['commandAck']['status'], 'discarded')
+        self.assertEqual(ack['command']['requestId'], next_command['commandId'])
+        self.assertEqual(self.poll_command(queued['commandId'])['status'], 'expired')
+
+    def test_expired_input_requires_snapshot_and_is_never_replayed(self):
+        self.prepare_command()
+        queued = events.internal_action({'action': 'command', 'taskId': 'task', 'operation': 'navigate',
+                                        'url': 'https://example.org/next'}, **self.paths)
+        self.sync()
+        with events.event_store(self.store) as data:
+            data['peer']['command']['expiresAt'] = events.time.time() - 1
+        self.assertEqual(self.poll_command(queued['commandId'])['nextAction'], 'snapshot')
+        self.assertIsNone(self.sync()['command'])
+        shot = events.internal_action({'action': 'command', 'taskId': 'task', 'operation': 'screenshot'}, **self.paths)
+        self.sync(commandResult={'requestId': shot['commandId'], 'status': 'ok', 'result': {
+            'mimeType': 'image/jpeg', 'data': 'ZmFrZQ==', 'tabId': 7, 'documentId': 'doc'}})
+        with self.assertRaisesRegex(ValueError, '尚未用 snapshot'):
+            events.internal_action({'action': 'command', 'taskId': 'task', 'operation': 'navigate',
+                                    'url': 'https://example.org/next'}, **self.paths)
+
+    def navigation_fixture(self, ready=True, url='https://example.org/next', epoch=2):
+        self.prepare_command()
+        queued = events.internal_action({'action': 'command', 'taskId': 'task', 'operation': 'navigate',
+                                        'url': 'https://example.org/next'}, **self.paths)
+        self.sync(commandResult={'requestId': queued['commandId'], 'status': 'ok', 'result': {
+            'performed': True, 'verified': False, 'observed': {'route': 'extension', 'tabId': 7}}})
+        self.assertEqual(self.poll_command(queued['commandId'])['nextAction'], 'navigation_observation')
+        with events.event_store(self.store) as data:
+            data['tasks']['task']['event'].update(documentId='next-doc', navigationEpoch=epoch,
+                url=url, phase='content', domReady=ready, loaded=ready, readyState='complete' if ready else 'loading')
+
+    def test_navigation_accepts_current_screenshot_diagnostics_or_read_without_full_snapshot(self):
+        for operation in ('screenshot', 'diagnostics', 'read'):
+            with self.subTest(operation=operation):
+                self.navigation_fixture()
+                self.sync(capabilities=['cdp_input', 'document_binding', 'background_popups', 'paged_read'])
+                observation = events.internal_action({'action': 'command', 'taskId': 'task', 'operation': operation}, **self.paths)
+                outcomes = {
+                    'screenshot': {'mimeType': 'image/jpeg', 'data': 'ZmFrZQ==', 'tabId': 7, 'documentId': 'next-doc'},
+                    'diagnostics': self.DIAGNOSTICS | {'url': 'https://example.org/next'},
+                    'read': {'readId': 'read-next', 'mode': 'content', 'url': 'https://example.org/next', 'title': 'Fixture',
+                             'offset': 0, 'nextOffset': None, 'totalItems': 0, 'sourceTruncated': False,
+                             'domOnly': True, 'observedAt': 1794210000000, 'items': []}}
+                self.sync(commandResult={'requestId': observation['commandId'], 'status': 'ok', 'result': outcomes[operation]})
+                self.assertFalse(events.status('task', **self.paths)['commandState']['verificationRequired'])
+                # This observation grants no fresh input references.
+                with self.assertRaisesRegex(ValueError, 'STALE_SNAPSHOT'):
+                    events.internal_action({'action': 'command', 'taskId': 'task', 'operation': 'click',
+                                            'snapshotId': 'snap-1', 'ref': 1}, **self.paths)
+                next_nav = events.internal_action({'action': 'command', 'taskId': 'task', 'operation': 'navigate',
+                                                   'url': 'https://example.org/third'}, **self.paths)
+                events.internal_action({'action': 'cancel', 'taskId': 'task', 'commandId': next_nav['commandId']}, **self.paths)
+
+    def test_navigation_lightweight_verification_requires_new_ready_matching_document(self):
+        for change in ({'ready': False}, {'url': 'https://example.org/unexpected'}, {'epoch': 1}):
+            with self.subTest(change=change):
+                self.navigation_fixture(**change)
+                if change.get('ready') is False:
+                    with mock.patch.object(events, 'NAVIGATION_OBSERVATION_TIMEOUT', 0), self.assertRaises(events.NavigationDocumentPending):
+                        events.internal_action({'action': 'command', 'taskId': 'task', 'operation': 'screenshot'}, **self.paths)
+                    self.assertIsNone(events.read_file(self.store)['peer']['command'])
+                    continue
+                queued = events.internal_action({'action': 'command', 'taskId': 'task', 'operation': 'screenshot'}, **self.paths)
+                self.sync(commandResult={'requestId': queued['commandId'], 'status': 'ok', 'result': {
+                    'mimeType': 'image/jpeg', 'data': 'ZmFrZQ==', 'tabId': 7, 'documentId': 'next-doc'}})
+                self.assertTrue(events.status('task', **self.paths)['commandState']['verificationRequired'])
+
+    def test_redirected_navigation_explicitly_requests_snapshot_without_reassigning_target(self):
+        for url in ('https://example.org/next/', 'https://example.org/landing', 'https://other.example/landing'):
+            with self.subTest(url=url):
+                self.navigation_fixture(url=url)
+                binding = events.read_file(self.store)['tasks']['task']['bindingId']
+                queued = events.internal_action({'action': 'command', 'taskId': 'task', 'operation': 'diagnostics'}, **self.paths)
+                self.sync(commandResult={'requestId': queued['commandId'], 'status': 'ok', 'result': self.DIAGNOSTICS | {'url': url}})
+                result = self.poll_command(queued['commandId'])
+                self.assertEqual(result['nextAction'], 'snapshot')
+                self.assertEqual(result['verification']['expectedUrl'], 'https://example.org/next')
+                self.assertEqual(result['verification']['observedUrl'], url)
+                self.assertTrue(result['verification']['bindingPreserved'])
+                status = events.status('task', **self.paths)
+                self.assertEqual(status['commandState']['verificationNextAction'], 'snapshot')
+                with self.assertRaisesRegex(ValueError, '请获取当前 snapshot'):
+                    events.internal_action({'action': 'command', 'taskId': 'task', 'operation': 'navigate', 'url': 'https://example.org/third'}, **self.paths)
+                reviewed = events.internal_action({'action': 'command', 'taskId': 'task', 'operation': 'snapshot'}, **self.paths)
+                self.sync(commandResult={'requestId': reviewed['commandId'], 'status': 'ok', 'result': self.SNAPSHOT | {'url': url}})
+                self.assertFalse(events.status('task', **self.paths)['commandState']['verificationRequired'])
+                self.assertEqual(events.read_file(self.store)['tasks']['task']['bindingId'], binding)
+
+    def test_observation_waits_before_queuing_then_pins_new_document_without_reassignment(self):
+        self.navigation_fixture()
+        with events.event_store(self.store) as data:
+            binding = data['tasks']['task']['bindingId']
+            data['tasks']['task']['event'].update(documentId=None, phase='before')
+        def commit(_):
+            self.assertIsNone(events.read_file(self.store)['peer']['command'])
+            with events.event_store(self.store) as data:
+                data['tasks']['task']['event'].update(documentId='next-doc', phase='content')
+        with mock.patch.object(events.time, 'sleep', side_effect=commit):
+            queued = events.internal_action({'action': 'command', 'taskId': 'task', 'operation': 'screenshot'}, **self.paths)
+        self.assertEqual(queued['target']['documentId'], 'next-doc')
+        self.assertEqual(events.read_file(self.store)['tasks']['task']['bindingId'], binding)
+
+    def test_observation_wait_aborts_if_binding_changes(self):
+        self.navigation_fixture()
+        with events.event_store(self.store) as data:
+            data['tasks']['task']['event'].update(documentId=None, phase='before')
+        def replace(_):
+            with events.event_store(self.store) as data:
+                data['tasks']['task']['bindingId'] = 'f' * 32
+        with mock.patch.object(events.time, 'sleep', side_effect=replace), self.assertRaisesRegex(ValueError, 'STALE_TARGET'):
+            events.internal_action({'action': 'command', 'taskId': 'task', 'operation': 'screenshot'}, **self.paths)
+        self.assertIsNone(events.read_file(self.store)['peer']['command'])
+
+    def test_waited_observation_rechecks_binding_under_lock_after_native_revalidation(self):
+        self.navigation_fixture()
+        with events.event_store(self.store) as data:
+            data['tasks']['task']['event'].update(documentId=None, phase='before')
+        def commit(_):
+            with events.event_store(self.store) as data:
+                data['tasks']['task']['event'].update(documentId='next-doc', phase='content')
+        def change_binding(_):
+            with events.event_store(self.store) as data:
+                data['tasks']['task']['bindingId'] = 'e' * 32
+        with mock.patch.object(events.time, 'sleep', side_effect=commit), self.assertRaisesRegex(ValueError, 'STALE_TARGET'):
+            events.internal_action({'action': 'command', 'taskId': 'task', 'operation': 'screenshot'},
+                                   revalidate=change_binding, **self.paths)
+        self.assertIsNone(events.read_file(self.store)['peer']['command'])
+
+    def test_host_reports_rejected_request_separately_without_echoing_payload(self):
+        source, target, diagnostic = io.BytesIO(), io.BytesIO(), io.StringIO()
+        host.write_message(source, {'action': 'sync', 'secret': 'private-fixture-value'})
+        source.seek(0)
+        with mock.patch.object(sys, 'stderr', diagnostic):
+            host.serve(source, target, ORIGIN, {'allowed_origins': [ORIGIN]}, **self.paths)
+        result = host.read_message(io.BytesIO(target.getvalue()))
+        self.assertEqual(result['code'], 'BROWSER_REQUEST_REJECTED')
+        self.assertNotIn('private-fixture-value', target.getvalue().decode('utf-8', errors='ignore') + diagnostic.getvalue())
+
+    def test_sixty_navigation_screenshot_cycles_reuse_binding_and_keep_store_bounded(self):
+        self.prepare_command()
+        assignment = self.sync()['assignment']
+        event = self.event()
+        for index in range(60):
+            url = 'https://example.org/fixture-topic/%s' % index
+            nav = events.internal_action({'action': 'command', 'taskId': 'task', 'operation': 'navigate', 'url': url}, **self.paths)
+            self.sync()
+            before = event | {'documentId': None, 'navigationEpoch': event['navigationEpoch'] + 1,
+                'sequence': event['sequence'] + 1, 'url': url, 'phase': 'before', 'loaded': False,
+                'domReady': False, 'bodyPresent': False, 'bodyVisible': False,
+                'elementCount': 0, 'readyState': None, 'conditionMatched': None}
+            self.request({'action': 'event', 'taskId': 'task', 'token': assignment['token'], 'event': before})
+            committed = before | {'documentId': 'fixture-doc-%s' % index,
+                                  'phase': 'committed', 'sequence': before['sequence'] + 1}
+            self.request({'action': 'event', 'taskId': 'task', 'token': assignment['token'], 'event': committed})
+            event = committed | {'phase': 'content', 'sequence': committed['sequence'] + 1,
+                                 'loaded': True, 'domReady': True, 'bodyPresent': True, 'bodyVisible': True,
+                                 'elementCount': 10, 'readyState': 'complete'}
+            self.request({'action': 'event', 'taskId': 'task', 'token': assignment['token'], 'event': event})
+            self.sync(commandResult={'requestId': nav['commandId'], 'status': 'ok', 'result': {
+                'performed': True, 'verified': False, 'observed': {'route': 'extension', 'tabId': 7}}})
+            shot = events.internal_action({'action': 'command', 'taskId': 'task', 'operation': 'screenshot'}, **self.paths)
+            self.sync(commandResult={'requestId': shot['commandId'], 'status': 'ok', 'result': {
+                'mimeType': 'image/jpeg', 'data': 'ZmFrZQ==', 'tabId': 7, 'documentId': event['documentId']}})
+            self.assertEqual(self.poll_command(shot['commandId'])['status'], 'ok')
+            self.assertFalse(events.status('task', **self.paths)['commandState']['verificationRequired'])
+        stored = events.read_file(self.store)
+        self.assertEqual(stored['tasks']['task']['bindingId'], assignment['bindingId'])
+        self.assertEqual(stored['tasks']['task']['assignmentVersion'], assignment['assignmentVersion'])
+        self.assertLessEqual(len(stored['peer']['commandResults']), events.MAX_RESULTS)
+        self.assertLessEqual(len(stored['peer']['commandSeen']), events.MAX_SEEN)
+        self.assertLess(self.store.stat().st_size, events.MAX_BYTES)
 
     def test_old_extension_waits_instead_of_receiving_background_commands(self):
         self.prepare_command()
@@ -1171,7 +1671,7 @@ class BrowserEventsTests(unittest.TestCase):
                 mock.patch.object(server, 'call_helper', return_value={}) as helper, \
                 mock.patch.object(events, 'internal_action', wraps=events.internal_action) as dispatch:
             # 隔离 event store，但经过实际注册工具和 server 原生任务核验回调。
-            dispatch.side_effect = lambda a, task_file, **options: original(a, task_file, self.store, **options)
+            dispatch.side_effect = lambda a, task_file, event_file=None, **options: original(a, task_file, event_file or self.store, **options)
             response = server.call_tool('quietbridge_browser_events', args)
             self.assertFalse(response.get('isError'), response)
             self.assertTrue(json.loads(response['content'][0]['text'])['assigned'])

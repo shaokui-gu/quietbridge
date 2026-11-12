@@ -62,6 +62,7 @@ export function channelChrome(api, channel) {
   wrapped.tabs.onRemoved = event(api.tabs.onRemoved);
   wrapped.debugger = { ...api.debugger };
   wrapped.debugger.attach = async (target, version) => {
+    if (disposed) throw new Error('SESSION_ROUTING_INVALID: channel stopped');
     const owner = debuggerOwners.get(target.tabId);
     if (owner && owner !== channel) throw new Error('TARGET_IN_USE: target belongs to another session');
     debuggerOwners.set(target.tabId, channel);
@@ -98,14 +99,26 @@ export function channelChrome(api, channel) {
     for (const remove of removers) remove();
     for (const id of timers) { clearTimeout(id); clearInterval(id); }
     api.alarms.clear(prefix + 'observer-sync');
-    // Detach only debuggers proven to belong to this channel's saved targets.
-    api.storage.session.get([prefix + 'observer', prefix + 'managedTabs']).then(async raw => {
-      const ids = new Set([raw[prefix + 'observer']?.tabId, ...(raw[prefix + 'managedTabs'] || [])]);
+    // Detach removes CDP preloads, but MAIN-world hooks survive it. Clean only
+    // this channel's recorded lease; late cleanup must not remove a new lease.
+    api.storage.session.get([prefix + 'observer', prefix + 'managedTabs', prefix + 'managedTaskId']).then(async raw => {
+      const observer = raw[prefix + 'observer'];
+      const ids = new Set([observer?.tabId, ...(raw[prefix + 'managedTabs'] || [])]);
       for (const tabId of ids) if (Number.isInteger(tabId)) {
         if (debuggerOwners.get(tabId) !== channel) continue;
         debuggerOwners.delete(tabId);
+        const owner = raw[prefix + 'managedTaskId'] || observer?.taskId;
+        const leaseId = observer?.tabId === tabId ? observer.bindingId || owner : owner;
+        if (owner && api.scripting) {
+          // Do not await a renderer acknowledgement before detaching.
+          Promise.resolve().then(() => api.scripting.executeScript({ target: { tabId, allFrames: true },
+            world: 'MAIN', injectImmediately: true,
+            func: (taskId, leaseId, deadline) => Date.now() < deadline &&
+              globalThis.__quietbridgePopupGuard?.(taskId, 'release', leaseId),
+            args: [owner, leaseId, Date.now() + 1200] })).catch(() => {});
+        }
         try { await api.debugger.detach({ tabId }); } catch {}
       }
-    });
+    }).catch(() => {});
   } };
 }

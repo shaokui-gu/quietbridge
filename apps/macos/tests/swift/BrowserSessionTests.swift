@@ -27,6 +27,9 @@ import Testing
         #expect(plan.json["windows"] == .array([]))
         #expect(plan.json["dispatched"] == .bool(false))
         #expect(plan.json["launchSupported"] == .bool(true))
+        #expect(plan.json["setup"]["inheritsLogin"] == .bool(false))
+        #expect(plan.json["setup"]["extensionAutoLoaded"] == .bool(false))
+        #expect(plan.json["setup"]["browserChannelReady"] == .bool(false))
         #expect(plan.json["authorization"] == .null)
         #expect(plan.json["pendingConfirmation"] != .null)
         #expect(!FileManager.default.fileExists(atPath: plan.profile))
@@ -239,6 +242,8 @@ import Testing
         var closed = false
         var verifyCalls = 0
         var describeCalls = 0
+        var cloneSignatureCalls = 0
+        var cloneSignatureValid = true
         let authorization = JSONValue.object(["id": .string("确认记录"), "persistable": .bool(true)])
 
         func manager() -> BrowserSessionManager {
@@ -252,6 +257,10 @@ import Testing
             }
             dependencies.runningBundle = { _ in (self.bundleID, URL(fileURLWithPath: self.bundlePath)) }
             dependencies.executablePath = { _ in self.path }
+            dependencies.verifyCloneSignature = { _ in
+                self.cloneSignatureCalls += 1
+                if !self.cloneSignatureValid { throw ApplicationExecutableIdentity.mismatch }
+            }
             dependencies.describe = { _, _ in self.describeCalls += 1; return self.authorization }
             dependencies.windows = {
                 let other = WindowInfo(windowID: 11, pid: 88, appName: "Chrome", title: "其他窗口",
@@ -323,6 +332,27 @@ import Testing
                 #expect(fixture.verifyCalls > before)
             }
         }
+    }
+
+    @Test @MainActor func attachAndStatusRevalidateCodeSigningCloneAndRejectRevokedIdentity() throws {
+        let fixture = AttachFixture()
+        let root = try #require(ApplicationExecutableIdentity.systemChromeCloneRoot())
+        fixture.path = root.appendingPathComponent("code_sign_clone.Test123/Google Chrome.app.bundle/Contents/MacOS/Google Chrome").path
+        let manager = fixture.manager(), latch = CancellationLatch()
+        let attached = try manager.handle(action: "attach", confirm: true, pid: 88, windowID: 9, cancellation: latch)
+        #expect(attached["state"] == .string("attached"))
+        let before = fixture.cloneSignatureCalls
+        #expect(before >= 2)
+        _ = try manager.handle(action: "list", cancellation: latch)
+        #expect(fixture.cloneSignatureCalls > before)
+        fixture.cloneSignatureValid = false
+        let failed = try manager.handle(action: "list", cancellation: latch)
+        guard case .array(let sessions) = failed["sessions"] else { Issue.record("missing sessions"); return }
+        #expect(sessions[0]["state"] == .string("invalidated"))
+        #expect(sessions[0]["windows"] == .array([]))
+        fixture.cloneSignatureValid = true
+        guard case .array(let restored) = try manager.handle(action: "list", cancellation: latch)["sessions"] else { return }
+        #expect(restored[0]["state"] == .string("invalidated"))
     }
 
     @Test @MainActor func attachRejectsNonChromeWrongPathMissingWindowAndMissingConfirmation() throws {

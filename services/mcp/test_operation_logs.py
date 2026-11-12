@@ -41,6 +41,22 @@ class OperationLogTests(unittest.TestCase):
         self.assertEqual(record["result"]["pointer"]["screenPoint"], {"x": -880, "y": 130})
         self.assertEqual((self.root / "bridge-operations.jsonl").stat().st_mode & 0o777, 0o600)
 
+    def test_render_probe_logging_keeps_fixed_stage_metadata_only(self):
+        safe = dict(stage='capture', startedAt=100, completedAt=101, performed=True,
+                    attachedBefore=True, attachedAfter=True, pageEnabledBefore=True,
+                    pageEnabledAfter=True, captureDataLength=8)
+        args = {'action': 'result', 'taskId': 'task', 'commandId': 'a' * 32}
+        for result in (safe, dict(safe, data='private-content')):
+            payload = {'operation': 'render_probe', 'status': 'ok', 'result': result}
+            with mock.patch.object(server, '_events_handler', return_value=json.dumps(payload)):
+                server._events_dispatch(args)
+        records = self.records()
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0]['result'], safe)
+        self.assertNotIn('private-content', json.dumps(records))
+        self.assertEqual(server.diagnostic_fields({'stage': 'attach', 'data': 'private-content'}), {'stage': 'attach'})
+        self.assertEqual(server.diagnostic_fields({'stage': 'private-content'}), {})
+
     def test_invalid_fields_do_not_break_diagnostics(self):
         for value in (None, [], "invalid", 1):
             self.assertEqual(server.diagnostic_fields(value), {})
@@ -65,6 +81,41 @@ class OperationLogTests(unittest.TestCase):
         self.assertFalse(result['preview']['panelSpaceVerified'])
         self.assertNotIn('synthetic-content', json.dumps(result))
         self.assertNotIn('hostSpaceIds', server.diagnostic_result({'preview': {'hostSpaceIds': ['private-content']}})['preview'])
+
+    def test_preview_frame_progress_retains_only_finite_counters_without_content(self):
+        preview = {'frameAgeMs': 12.5, 'videoFrames': 20, 'targetOnCurrentSpace': False,
+                   'videoLayerReady': False, 'frameProgress': {'completeFrames': 20, 'submittedFrames': 2,
+                   'backpressureDroppedFrames': 18, 'lastSubmissionAgeMs': 1500.5,
+                   'lastSampledContentChangeAgeMs': None, 'contentSamples': float('nan'),
+                   'sampleFailures': -1, 'callbackFrames': True, 'fingerprint': 'private-content',
+                   'image': 'private-content'}}
+        result = server.diagnostic_result({'preview': preview})['preview']
+        self.assertEqual(result['frameProgress'], {'completeFrames': 20, 'submittedFrames': 2,
+                         'backpressureDroppedFrames': 18, 'lastSubmissionAgeMs': 1500.5,
+                         'lastSampledContentChangeAgeMs': None})
+        self.assertEqual(result['frameAgeMs'], 12.5)
+        self.assertFalse(result['targetOnCurrentSpace'])
+        self.assertFalse(result['videoLayerReady'])
+        self.assertNotIn('private-content', json.dumps(result, allow_nan=False))
+
+    def test_source_probe_and_capture_stop_are_content_free_and_independent(self):
+        preview = {'frameProgress': {'bodySamples': 5, 'bodyContentChanges': 1,
+                   'bodyNearUniformSamples': 4, 'lastBodyContentChangeAgeMs': None,
+                   'sourceFrame': {'pixelFormat': '420v', 'width': 800, 'bodyChannelSpread': 0,
+                   'bodyChromaSpread': 1, 'bodyNearUniform': True, 'colorPrimaries': 'ITU_R_709_2',
+                   'transferFunction': 'private-content', 'fingerprint': 'private-content'}},
+                   'captureLifecycle': {'streamGeneration': 'new', 'trackingWindowId': 8,
+                                        'startState': 'completed', 'stopState': 'not_requested'},
+                   'captureStop': {'streamGeneration': 'old', 'trackingWindowId': 7,
+                                   'stopState': 'requested', 'stopConfirmed': True,
+                                   'platformErrorDomain': 'private-content', 'message': 'private-content'}}
+        result = server.diagnostic_result({'preview': preview})['preview']
+        self.assertEqual(result['frameProgress']['bodyContentChanges'], 1)
+        self.assertTrue(result['frameProgress']['sourceFrame']['bodyNearUniform'])
+        self.assertEqual(result['captureLifecycle']['streamGeneration'], 'new')
+        self.assertEqual(result['captureStop']['streamGeneration'], 'old')
+        self.assertFalse(result['captureStop']['stopConfirmed'])
+        self.assertNotIn('private-content', json.dumps(result, allow_nan=False))
 
     def test_disabled_logging_does_not_create_files(self):
         with mock.patch.dict(os.environ, {"QUIETBRIDGE_OPERATION_LOG": "0"}):

@@ -1,7 +1,10 @@
 (() => {
   if (!['http:', 'https:'].includes(location.protocol)) return;
-  if (globalThis.__quietbridgeObserver) return;
+  const contentVersion = '0.4.6';
+  if (globalThis.__quietbridgeObserver && globalThis.__quietbridgeContentVersion === contentVersion) return;
+  globalThis.__quietbridgeObserverStop?.();
   globalThis.__cuaObserverStop?.(); // Cleanup previously injected legacy content.
+  globalThis.__quietbridgeContentVersion = contentVersion;
   const legacyNames = ['Observer', 'Snapshot', 'Prepare', 'Scroll', 'FocusInput', 'InputReady', 'PointMatches', 'VerifyFill', 'Select', 'Diagnostics', 'ObserverStop'];
   let timer;
   let previous = '';
@@ -30,12 +33,14 @@
     timer = setTimeout(() => { timer = null; report(); }, 250);
   }
   globalThis.__quietbridgeObserver = config => {
+    if (config?.deadline !== undefined && (!Number.isFinite(config.deadline) || Date.now() >= config.deadline)) return false;
     if (!config || !Number.isSafeInteger(config.navigationEpoch) ||
         typeof config.bindingId !== 'string' || config.authorizedOrigin !== location.origin ||
         typeof config.selector !== 'string' || config.selector.length > 128 ||
         (config.selector && !/^(?:[a-zA-Z][a-zA-Z0-9-]*)?(?:[.#][a-zA-Z_][a-zA-Z0-9_-]*)*$/.test(config.selector))) return;
     binding = config;
     report(true);
+    return true;
   };
   const onLifecycle = event => report(true, event.type === 'pageshow' ? 'pageshow' : 'content');
   const types = ['DOMContentLoaded', 'load', 'pageshow', 'popstate', 'resize'];
@@ -48,6 +53,7 @@
   let refSeq = 0;
   let snapshotSeq = 0;
   let snapshotId = null;
+  let readCache = null;
   const SELECTOR = 'a[href],button,input,select,textarea,[role],[contenteditable="true"]';
   function refFor(node) {
     let id = ids.get(node);
@@ -71,6 +77,15 @@
         button: 'button', search: 'searchbox', range: 'slider' })[type] || 'textbox';
     }
     return (node.getAttribute('role') || '').slice(0, 32);
+  }
+  function linkEvidence(node) {
+    if (node.tagName.toLowerCase() !== 'a') return {};
+    try {
+      const u = new URL(node.href, node.ownerDocument.baseURI || location.href);
+      if (!['http:', 'https:'].includes(u.protocol) || u.username || u.password ||
+          (u.origin + u.pathname).length > 2048) return {};
+      return { href: u.origin + u.pathname, urlHasQuery: !!u.search, urlHasFragment: !!u.hash };
+    } catch { return {}; }
   }
   // Resolve every frame again when using a reference: a child document can
   // navigate without changing the top document's navigation epoch.
@@ -133,45 +148,145 @@
   }
   function snapshot(limit) {
     const elements = [];
+    let truncated = false;
     function collect(doc) {
       for (const node of doc.querySelectorAll(SELECTOR)) {
-        if (elements.length >= limit) break;
+        if (truncated) return;
         if (!visible(node)) continue;
         const rect = node.getBoundingClientRect();
         if (rect.width <= 0 || rect.height <= 0) continue;
         const start = toTop(doc, rect.left, rect.top), end = toTop(doc, rect.right, rect.bottom);
         if (!start || !end) continue;
+        if (elements.length === limit) { truncated = true; return; }
         const name = (node.getAttribute('aria-label') || node.getAttribute('placeholder') ||
           node.getAttribute('alt') || node.textContent || '').replace(/\s+/g, ' ').trim();
         elements.push({ ref: refFor(node), tag: node.tagName.toLowerCase().slice(0, 32),
           role: defaultRole(node).slice(0, 32), name: name.slice(0, 80),
           disabled: node.disabled === true || node.getAttribute('aria-disabled') === 'true',
           x: Math.round(start.x), y: Math.round(start.y),
-          width: Math.round(end.x - start.x), height: Math.round(end.y - start.y) });
+          width: Math.round(end.x - start.x), height: Math.round(end.y - start.y), ...linkEvidence(node) });
       }
       for (const frame of doc.querySelectorAll('iframe,frame')) {
-        if (elements.length >= limit) break;
+        if (truncated) return;
         try { if (frame.contentDocument && frameChain(frame.contentDocument)) collect(frame.contentDocument); } catch {}
       }
     }
     collect(document);
-    return elements;
+    return { elements, truncated };
   }
   globalThis.__quietbridgeSnapshot = config => {
     if (!binding || !config || config.bindingId !== binding.bindingId ||
         config.navigationEpoch !== binding.navigationEpoch ||
         location.origin !== binding.authorizedOrigin) return null;
     refs.clear();
+    readCache = null;
     snapshotId = `${binding.bindingId}:${binding.navigationEpoch}:${++snapshotSeq}`;
+    const captured = snapshot(300);
     return { snapshotId, url: `${location.origin}${location.pathname}`, readyState: document.readyState,
       elementCount: Math.min(document.getElementsByTagName('*').length, 10000),
-      elements: snapshot(300) };
+      elements: captured.elements, coverage: { returnedElements: captured.elements.length, limit: 300,
+        truncated: captured.truncated, scope: 'visible_interactive_top_and_accessible_frames',
+        elementCountScope: 'top_document_dom_nodes_capped_10000' } };
   };
   function bound(config) {
     return !!(binding && config && config.bindingId === binding.bindingId &&
       config.navigationEpoch === binding.navigationEpoch &&
       location.origin === binding.authorizedOrigin);
   }
+  function renderedText(node) {
+    // An empty innerText is still an observation. Falling back on truthiness
+    // would expose textContent from hidden descendants of a rendered block.
+    return typeof node.innerText === 'string' ? node.innerText : (node.textContent || '');
+  }
+  // Reading uses the bound, rendered DOM and its login state. It never fetches
+  // site APIs, evaluates caller code or claims unloaded posts were observed.
+  globalThis.__quietbridgeRead = (config, options = {}) => {
+    if (!bound(config)) return null;
+    const mode = options.mode || 'content';
+    const offset = options.offset ?? 0, limit = options.limit ?? 30, maxChars = options.maxChars ?? 10000;
+    if (!['links', 'content'].includes(mode) || !Number.isInteger(offset) || offset < 0 ||
+        !Number.isInteger(limit) || limit < 1 || limit > 100 || !Number.isInteger(maxChars) ||
+        maxChars < 4000 || maxChars > 16000) return null;
+    if (options.readId) {
+      if (!readCache || readCache.id !== options.readId || readCache.mode !== mode ||
+          readCache.bindingId !== binding.bindingId || readCache.navigationEpoch !== binding.navigationEpoch ||
+          readCache.documentUrl !== location.href) return null;
+    } else {
+      if (offset !== 0) return null;
+      const items = [];
+      let sourceChars = 0, sourceTruncated = false;
+      const root = document.querySelector('main,[role="main"]') || document.body;
+      if (!root) return null;
+      let nodes = mode === 'links' ? root.querySelectorAll('a[href]') :
+        root.querySelectorAll('article,[role="article"]');
+      const contentKind = nodes.length ? 'article' : 'text';
+      if (mode === 'content' && !nodes.length) nodes = root.querySelectorAll('p,h1,h2,h3,li,pre,blockquote');
+      const nodeSet = new Set();
+      for (let i = 0; i < Math.min(nodes.length, 10000); i++) nodeSet.add(nodes[i]);
+      let scanned = 0;
+      for (const node of nodes) {
+        if (++scanned > 10000 || items.length >= 2000 || sourceChars >= 262144) { sourceTruncated = true; break; }
+        if (!visible(node) || !node.isConnected) continue;
+        if (mode === 'links') {
+          const evidence = linkEvidence(node);
+          if (!evidence.href) continue;
+          const name = (node.getAttribute('aria-label') || renderedText(node)).slice(0, 4096)
+            .replace(/\s+/g, ' ').trim().slice(0, 160);
+          const item = { name, ...evidence };
+          const cost = name.length + evidence.href.length;
+          if (sourceChars + cost > 262144) { sourceTruncated = true; break; }
+          items.push(item); sourceChars += cost;
+        } else {
+          // Skip nested blocks to avoid counting the same rendered post twice.
+          let nested = false;
+          for (let parent = node.parentElement; parent && parent !== root; parent = parent.parentElement) {
+            if (nodeSet.has(parent)) { nested = true; break; }
+          }
+          if (nested) continue;
+          const body = node.querySelector?.('.cooked') || node;
+          if (!visible(body)) continue;
+          const rawText = renderedText(body);
+          let take = Math.min(rawText.length, 262144 - sourceChars);
+          // Do not cut a surrogate pair at the bounded source capture edge.
+          if (take < rawText.length && /[\uD800-\uDBFF]/u.test(rawText[take - 1] || '') &&
+              /[\uDC00-\uDFFF]/u.test(rawText[take])) take--;
+          const textTruncated = take < rawText.length;
+          sourceTruncated ||= textTruncated;
+          sourceChars += take;
+          const text = rawText.slice(0, take).replace(/\r/g, '').trim();
+          if (!text) continue;
+          const rawId = node.getAttribute('data-post-id') || node.getAttribute('data-post-number') || node.id;
+          const id = String(rawId || '').replace(/[\u0000-\u001f\u007f]/g, '').slice(0, 120) || ('block-' + items.length);
+          const characters = Array.from(text).filter(c => c.charCodeAt(0) >= 32 || c === '\n' || c === '\t')
+            .map(c => c.length === 1 && /[\uD800-\uDFFF]/u.test(c) ? '\uFFFD' : c);
+          for (let start = 0; start < characters.length; start += 1000) {
+            if (items.length >= 2000) { sourceTruncated = true; break; }
+            const segment = characters.slice(start, start + 1000);
+            const part = segment.join('');
+            items.push({ id, kind: contentKind, text: part, textOffset: start,
+              textComplete: !textTruncated && start + segment.length === characters.length });
+          }
+        }
+      }
+      readCache = { id: binding.bindingId + ':' + binding.navigationEpoch + ':read:' + (++snapshotSeq),
+        bindingId: binding.bindingId, navigationEpoch: binding.navigationEpoch,
+        documentUrl: location.href, title: String(document.title || '').slice(0, 200),
+        mode, items, sourceTruncated, observedAt: Date.now() };
+    }
+    if (offset > readCache.items.length) return null;
+    const items = [];
+    let size = 0, next = offset;
+    while (next < readCache.items.length && items.length < limit) {
+      const item = readCache.items[next];
+      const cost = JSON.stringify(item).length;
+      if (items.length && size + cost > maxChars) break;
+      items.push(item); next++; size += cost;
+    }
+    return { readId: readCache.id, mode, url: location.origin + location.pathname,
+      title: readCache.title, offset,
+      nextOffset: next < readCache.items.length ? next : null, totalItems: readCache.items.length,
+      sourceTruncated: readCache.sourceTruncated, domOnly: true, observedAt: readCache.observedAt, items };
+  };
   const fail = reason => ({ performed: false, verified: false,
     observed: { reason: String(reason).slice(0, 100) } });
   function writable(node) {
@@ -288,7 +403,8 @@
       viewport: { width: Math.round(innerWidth), height: Math.round(innerHeight) },
       scroll: { x: Math.round(scrollX), y: Math.round(scrollY) } };
   };
-  globalThis.__quietbridgeObserverStop = () => {
+  globalThis.__quietbridgeObserverStop = expectedBindingId => {
+    if (expectedBindingId !== undefined && binding?.bindingId !== expectedBindingId) return false;
     for (const name of legacyNames) delete globalThis['__cua' + name];
     binding = null;
     observer.disconnect();
@@ -297,10 +413,13 @@
     removeEventListener('error', onError);
     removeEventListener('unhandledrejection', onRejection);
     delete globalThis.__quietbridgeObserver;
+    delete globalThis.__quietbridgeContentVersion;
     delete globalThis.__quietbridgeSnapshot;
-    for (const key of ['__quietbridgePrepare', '__quietbridgeScroll', '__quietbridgeFocusInput', '__quietbridgeInputReady', '__quietbridgePointMatches', '__quietbridgeVerifyFill', '__quietbridgeSelect']) delete globalThis[key];
+    readCache = null;
+    for (const key of ['__quietbridgeRead', '__quietbridgePrepare', '__quietbridgeScroll', '__quietbridgeFocusInput', '__quietbridgeInputReady', '__quietbridgePointMatches', '__quietbridgeVerifyFill', '__quietbridgeSelect']) delete globalThis[key];
     delete globalThis.__quietbridgeDiagnostics;
     delete globalThis.__quietbridgeObserverStop;
+    return true;
   };
   // An already-running pre-upgrade worker can finish cleanup before Chrome reloads it.
   for (const name of legacyNames) globalThis['__cua' + name] = globalThis['__quietbridge' + name];

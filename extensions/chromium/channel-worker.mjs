@@ -51,9 +51,16 @@ let assignmentStatus = 'no_assignment';
 let createdReport = null;
 let lastCreateRequestId = null;
 let assignmentTitle = null;
+let observerStatus = null;
+let lifecycleError = null;
+function noteLifecycleError(error) {
+  if (!error?.stage || !['BROWSER_LIFECYCLE_TIMEOUT', 'BROWSER_LIFECYCLE_FAILED'].includes(error.code)) return;
+  lifecycleError = { stage: error.stage, code: error.code, at: Date.now() / 1000 };
+}
 let commandReport = null;
 let panelReport = null;
 let panelBridge = false;
+const navigationPulseDocuments = new Set();
 let applicationSession = null;
 let lastCommandId = null;
 let keepAlivePort = null;
@@ -104,7 +111,19 @@ async function runCommand(command, state) {
   lastCommandId = command.requestId;
   await chrome.storage.session.set({ lastCommand: { requestId: command.requestId, at: Date.now() } });
   try {
+    if (observerStatus?.state === 'failed' && observerStatus.bindingId === state?.bindingId &&
+        observerStatus.documentId === state?.documentId) {
+      throw new Error('BROWSER_OBSERVER_NOT_READY：原标签观察初始化失败，请先只读查询状态并通知用户；未执行命令');
+    }
     const result = await background.run(command, state);
+    if (command.operation === 'navigate' && result?.performed) {
+      // Publish a navigation barrier before acknowledging dispatch. The next
+      // command must never be queued against the outgoing document simply
+      // because webNavigation callbacks are still behind this sync in queue.
+      await navigation('before', { tabId: state.tabId, frameId: 0,
+        url: command.params.url, timeStamp: state.lastTime });
+      await reconcileObservation();
+    }
     if (result?.children?.length) {
       const { managedTabs = [] } = await chrome.storage.session.get('managedTabs');
       await chrome.storage.session.set({ managedTabs: [...new Set([...managedTabs, ...result.children.map(t => t.tabId)])],
@@ -123,7 +142,7 @@ async function runCommand(command, state) {
 }
 const serial = fn => {
   const job = queue.then(fn);
-  queue = job.catch(() => {});
+  queue = job.catch(noteLifecycleError);
   return job;
 };
 const read = async () => (await chrome.storage.session.get('observer')).observer || null;
@@ -164,7 +183,7 @@ const background = new BackgroundBrowser(chrome, async s => {
   const current = await read();
   return await enabled() && await permitted() && !current?.paused && current?.bindingId === s?.bindingId &&
     current?.documentId === s?.documentId && await runtimeAvailable();
-}, recordDownload);
+}, recordDownload, noteLifecycleError);
 function applicationStopped() {
   if (applicationSession) enableRevision++;
   applicationSession = null;
@@ -194,6 +213,7 @@ async function native(message) {
     if (!result?.ok) {
       const error = new Error(result?.error || '本地请求被拒绝');
       error.code = result?.code;
+      error.nativeRejected = true;
       if (error.code === 'APP_NOT_RUNNING') applicationStopped();
       throw error;
     }
@@ -220,39 +240,70 @@ async function publish(s) {
   else await clearObservation();
 }
 async function stop(s) {
-  try {
-    if (s?.documentId) await chrome.scripting.executeScript({ target: {
-      tabId: s.tabId, documentIds: [s.documentId] }, func: () => globalThis.__quietbridgeObserverStop?.() });
-  } catch {}
+  if (s?.documentId) await background.lifecycle('observer_stop', deadline => chrome.scripting.executeScript({ target: {
+    tabId: s.tabId, documentIds: [s.documentId] }, injectImmediately: true,
+    func: (bindingId, deadline) => Date.now() < deadline && globalThis.__quietbridgeObserverStop?.(bindingId),
+    args: [s.bindingId, deadline] }));
 }
 async function clearObservation(keepTask = false) {
   const s = await read();
+  navigationPulseDocuments.clear();
   assignmentTitle = null;
+  observerStatus = null;
   await save(null);
-  await stop(s);
+  const cleanup = [stop(s)];
   if (!keepTask) {
     const { managedTabs = [], managedTaskId } = await chrome.storage.session.get(['managedTabs', 'managedTaskId']);
-    for (const tabId of new Set([...managedTabs, ...background.attached.keys(), ...background.guards.keys()])) {
-      await background.release(tabId, managedTaskId || s?.taskId);
-    }
     await chrome.storage.session.set({ managedTabs: [], managedTaskId: null });
+    for (const tabId of new Set([...managedTabs, ...background.attached.keys(), ...background.guards.keys()])) {
+      cleanup.push(background.release(tabId, managedTaskId || s?.taskId));
+    }
   }
+  for (const result of await Promise.allSettled(cleanup)) if (result.status === 'rejected') noteLifecycleError(result.reason);
 }
 async function suspend(s) {
-  await stop(s);
+  await stop(s).catch(noteLifecycleError);
   await publish(pause(s, Date.now()));
 }
 async function inject(s) {
   if (!s?.url || !s.documentId || s.pending || s.paused || !await enabled() || !await permitted() || !await runtimeAvailable()) return;
+  const same = observerStatus?.bindingId === s.bindingId && observerStatus?.documentId === s.documentId &&
+    observerStatus?.navigationEpoch === s.navigationEpoch;
+  if (same && (observerStatus.state === 'ready' || observerStatus.attempt >= 2 ||
+      Date.now() / 1000 - observerStatus.at < 1)) return;
+  const attempt = { state: 'initializing', bindingId: s.bindingId, documentId: s.documentId,
+    navigationEpoch: s.navigationEpoch, attempt: same ? observerStatus.attempt + 1 : 1,
+    stage: 'observer_load', code: null, at: Date.now() / 1000 };
+  observerStatus = attempt;
+  const current = async () => {
+    const now = await read();
+    return observerStatus === attempt && now?.bindingId === s.bindingId && now?.documentId === s.documentId &&
+      now?.navigationEpoch === s.navigationEpoch && !now?.paused && await enabled() && await permitted();
+  };
   try {
-    await chrome.scripting.executeScript({ target: { tabId: s.tabId,
-      documentIds: [s.documentId] }, files: ['content.js'], injectImmediately: true });
-    if (!await runtimeAvailable()) return;
-    await chrome.scripting.executeScript({ target: { tabId: s.tabId,
-      documentIds: [s.documentId] }, func: config => globalThis.__quietbridgeObserver?.(config),
-      args: [{ navigationEpoch: s.navigationEpoch, bindingId: s.bindingId,
-        authorizedOrigin: originOf(s.url), selector: s.selector }] });
-  } catch { /* 文档切换不回退到其他文档。 */ }
+    await background.lifecycle('observer_load', () => chrome.scripting.executeScript({ target: { tabId: s.tabId,
+      documentIds: [s.documentId] }, files: ['content.js'], injectImmediately: true }), 3000);
+    if (!await current() || !await runtimeAvailable()) return;
+    attempt.stage = 'observer_configure';
+    const replies = await background.lifecycle('observer_configure', deadline => chrome.scripting.executeScript({ target: { tabId: s.tabId,
+      documentIds: [s.documentId] }, injectImmediately: true, func: config => globalThis.__quietbridgeObserver?.(config),
+      args: [{ navigationEpoch: s.navigationEpoch, bindingId: s.bindingId, deadline,
+        authorizedOrigin: originOf(s.url), selector: s.selector }] }), 3000);
+    if (!await current()) return;
+    if (!replies?.some(reply => reply.result === true && (!reply.documentId || reply.documentId === s.documentId))) {
+      const error = new Error('观察脚本未确认初始化');
+      error.code = 'BROWSER_LIFECYCLE_FAILED'; error.stage = 'observer_configure';
+      throw error;
+    }
+    attempt.state = 'ready';
+    attempt.at = Date.now() / 1000;
+  } catch (error) {
+    if (await current()) {
+      noteLifecycleError(error);
+      attempt.state = 'failed'; attempt.code = error.code; attempt.stage = error.stage;
+      attempt.at = Date.now() / 1000;
+    }
+  }
 }
 async function navigation(type, d) {
   if (d.frameId !== 0) return;
@@ -260,15 +311,60 @@ async function navigation(type, d) {
   if (!old || old.tabId !== d.tabId || old.paused) return;
   if (!await permitted() || !await enabled()) { await clearObservation(); return; }
   if (type === 'committed') {
-    const frame = await chrome.webNavigation.getFrame({ tabId: d.tabId, frameId: 0 });
+    const frame = await background.lifecycle('document_lookup', () => chrome.webNavigation.getFrame({ tabId: d.tabId, frameId: 0 }));
     if (!frame || frame.documentId !== d.documentId || safeUrl(frame.url) !== safeUrl(d.url)) return;
   }
   const next = reduce(old, { ...d, type });
+  if (next !== old && type === 'before') {
+    next.previousDocumentId = old.documentId || old.previousDocumentId;
+    next.previousDocumentUrl = old.pending ? old.previousDocumentUrl : old.documentUrl;
+  }
+  if (next !== old && type === 'committed') {
+    delete next.previousDocumentId;
+    delete next.previousDocumentUrl;
+  }
   if (next !== old) next.documentUrl = d.url;
   if (next === old) return;
-  if (next.paused) await stop(old);
+  if (next.paused) await stop(old).catch(noteLifecycleError);
   await publish(next);
   if (['committed', 'dom', 'completed', 'history'].includes(type)) await inject(next);
+  if (['dom', 'completed'].includes(type)) await pulseNavigationDocument();
+}
+async function pulseNavigationDocument() {
+  const s = await read();
+  if (!s?.documentId || s.pending) return false;
+  const key = `${s.taskId}:${s.documentId}:${s.navigationEpoch}`;
+  if (navigationPulseDocuments.has(key)) return true;
+  if (!await background.pulse(s)) return false;
+  navigationPulseDocuments.add(key);
+  return true;
+}
+async function reconcileObservation() {
+  const s = await read();
+  if (!s || s.paused || !await enabled() || !await permitted() || !await runtimeAvailable()) return;
+  const [tab, frame] = await background.lifecycle('document_lookup', () => Promise.all([chrome.tabs.get(s.tabId),
+    chrome.webNavigation.getFrame({ tabId: s.tabId, frameId: 0 })]));
+  const current = await read();
+  if (current?.bindingId !== s.bindingId || current?.paused) return;
+  if (tab.windowId !== s.browserWindowId || !safeUrl(tab.url) || !safeUrl(frame?.url)) {
+    await suspend(s);
+    return;
+  }
+  // Reconcile only Chrome's current, fixed top-level document. Never migrate
+  // an already queued command, follow a moved tab or adopt a pending URL.
+  if (!frame?.documentId || tab.url !== frame.url || (tab.pendingUrl && tab.pendingUrl !== frame.url)) return;
+  const timeStamp = Date.now();
+  if (s.pending && frame.documentId === s.previousDocumentId && frame.url === s.previousDocumentUrl) return;
+  if (s.documentId !== frame.documentId) {
+    if (!s.pending) await navigation('before', { tabId: s.tabId, frameId: 0, url: frame.url, timeStamp });
+    await navigation('committed', { ...frame, tabId: s.tabId, frameId: 0, timeStamp });
+  } else if (s.documentUrl !== frame.url) {
+    await navigation('history', { ...frame, tabId: s.tabId, frameId: 0, timeStamp });
+  } else if (s.nativeError) {
+    await publish({ ...s, sequence: s.sequence + 1 });
+  }
+  await inject(await read());
+  await pulseNavigationDocument();
 }
 async function acceptAssignment(a) {
   if (!a || typeof a.taskId !== 'string' || !/^[0-9a-f]{64}$/.test(a.token) ||
@@ -283,10 +379,11 @@ async function acceptAssignment(a) {
       old.assignmentVersion === a.assignmentVersion && old.token === a.token) {
     old.ownedTabCount = (a.ownedTabs || []).length || old.ownedTabCount || 1;
     await save(old);
+    await reconcileObservation();
     return;
   }
   await clearObservation(old?.taskId === a.taskId);
-  const tab = await chrome.tabs.get(a.tabId);
+  const tab = await background.lifecycle('assignment_lookup', () => chrome.tabs.get(a.tabId));
   if (tab.windowId !== a.browserWindowId || !safeUrl(tab.url)) {
     assignmentStatus = 'needs_target_selection';
     return;
@@ -296,7 +393,7 @@ async function acceptAssignment(a) {
     assignmentVersion: a.assignmentVersion, globalOrigins: true,
     authorizedOrigin: originOf(tab.url), selector: '', tabId: a.tabId, browserWindowId: a.browserWindowId,
     ownedTabCount: (a.ownedTabs || []).length || 1 });
-  assignmentTitle = typeof tab.title === 'string' ? tab.title.slice(0, 200) : null;
+  assignmentTitle = typeof tab.title === 'string' ? tab.title.replace(/[\u0000-\u001f]/gu, ' ').trim().slice(0, 200) : null;
   // 重启保留 host 已接受的序号与 epoch，但重新核验当前文档。
   if (a.event) {
     s.sequence = a.event.sequence;
@@ -307,7 +404,7 @@ async function acceptAssignment(a) {
   await chrome.storage.session.set({ managedTabs: (a.ownedTabs || [{ tabId: a.tabId }]).map(t => t.tabId),
     managedTaskId: a.taskId });
   await chrome.storage.local.set({ boundTarget: { taskId: a.taskId, token: a.token, tabId: a.tabId } });
-  const frame = await chrome.webNavigation.getFrame({ tabId: a.tabId, frameId: 0 });
+  const frame = await background.lifecycle('document_lookup', () => chrome.webNavigation.getFrame({ tabId: a.tabId, frameId: 0 }));
   if (frame?.documentId) await navigation('committed', { ...frame, frameId: 0,
     tabId: a.tabId, timeStamp: Date.now() });
   else await publish(s);
@@ -346,7 +443,7 @@ async function finishCreatedTarget(request, result) {
     await chrome.tabs.update(result.tabId, { url: request.url });
     return await complete('issued');
   } catch (error) {
-    await background.release(result.tabId, request.taskId);
+    await background.release(result.tabId, request.taskId).catch(noteLifecycleError);
     return complete(issued ? 'unknown' : 'failed', error);
   }
 }
@@ -382,6 +479,27 @@ async function createWindow(request) {
   createdReport = await finishCreatedTarget(request, result);
   return true;
 }
+async function windowEvidence() {
+  const s = await read();
+  if (!s || s.paused) return null;
+  // Chrome's native window title follows its active tab, even when our task
+  // deliberately owns a different, inactive tab. Reading metadata never
+  // selects a tab or changes the user's focused window.
+  try {
+    const [assigned, tabs] = await background.lifecycle('window_evidence', () => Promise.all([
+      chrome.tabs.get(s.tabId), chrome.tabs.query({ windowId: s.browserWindowId, active: true })]));
+    if (assigned.windowId !== s.browserWindowId || !safeUrl(assigned.url)) return null;
+    const tab = tabs.length === 1 ? tabs[0] : null;
+    if (!tab || tab.windowId !== s.browserWindowId || !Number.isInteger(tab.id) ||
+        !safeUrl(tab.url) || typeof tab.title !== 'string' || !tab.title.trim() ||
+        /[\u0000-\u001f]/u.test(tab.title)) return null;
+    const current = await read();
+    if (current?.bindingId !== s.bindingId || current?.paused) return null;
+    return { bindingId: s.bindingId, browserWindowId: s.browserWindowId,
+      tabId: tab.id, title: tab.title.slice(0, 200) };
+  } catch (error) { noteLifecycleError(error); return null; }
+}
+
 async function sync() {
   try {
     const { permission, on, revision } = await control(async () => {
@@ -395,7 +513,9 @@ async function sync() {
       return { permission, on, revision: enableRevision };
     });
     keepAlive(on && permission);
-    const payload = { action: 'sync', enabled: on, permission, applicationSession, clientVersion: '0.4.1', capabilities: ['cdp_input', 'document_binding', 'background_popups'] };
+    const payload = { action: 'sync', enabled: on, permission, applicationSession, clientVersion: '0.4.10', capabilities: ['cdp_input', 'document_binding', 'background_popups', 'paged_read', 'render_probe'],
+      windowEvidence: on && permission ? await windowEvidence() : null,
+      observerStatus, lifecycleError };
     if (panelBridge) {
       // A command screenshot and a review image can each be large; send them on separate turns.
       if (!commandReport?.result?.data) payload.panelState = await panelSnapshot();
@@ -409,6 +529,9 @@ async function sync() {
     // host 接受后才清除待回传证据；抛错时保留到下一轮。
     if (payload.created) createdReport = null;
     if (payload.commandResult) commandReport = null;
+    if (r.commandAck?.status === 'rejected') {
+      connection = { ...connection, backgroundStatus: 'waiting', lastActionError: r.commandAck.code };
+    }
     if (payload.panelResult) panelReport = null;
     if (revision !== enableRevision) return;
     if (r.protocolVersion !== 2 || !Number.isFinite(r.heartbeatAt)) throw new Error('host 协议不兼容');
@@ -420,9 +543,10 @@ async function sync() {
     applicationSession = r.applicationSession;
     connection = { ...connection, status: 'connected', lastHeartbeatAt: r.heartbeatAt * 1000 };
     delete connection.lastError;
+    delete connection.errorCode;
     if (r.requestCandidates && on && permission) {
       // 仅原生可信端请求时返回候选元数据，不观察候选页面内容，不按焦点筛选。
-      const tabs = await chrome.tabs.query({});
+      const tabs = await background.lifecycle('candidate_lookup', () => chrome.tabs.query({}));
       const candidates = tabs.map(t => ({ tabId: t.id, browserWindowId: t.windowId, url: safeUrl(t.url) }))
         .filter(t => t.url && Number.isInteger(t.tabId) && Number.isInteger(t.browserWindowId)).slice(0, 1000);
       if (!await permitted() || !await enabled()) { await clearObservation(); return; }
@@ -452,9 +576,18 @@ async function sync() {
       serial(sync);
     }
   } catch (error) {
+    if (error?.stage) {
+      noteLifecycleError(error);
+      // This is a local lifecycle failure after/before an actual host exchange.
+      // Preserve the last transport result and assignment; do not report it as
+      // a host disconnect or silently restart/rebind the task.
+      return;
+    }
     applicationSession = null;
     keepAlive(false);
-    connection = { ...connection, status: error?.code === 'APP_NOT_RUNNING' ? 'application_stopped' : 'host_unavailable',
+    connection = { ...connection, status: error?.code === 'APP_NOT_RUNNING' ? 'application_stopped' :
+      error?.nativeRejected ? 'request_rejected' : 'host_unavailable',
+      errorCode: error?.code || null,
       lastError: String(error?.message || '本地连接失败').slice(0, 500) };
     assignmentStatus = 'no_assignment';
     await clearObservation();
@@ -628,10 +761,10 @@ chrome.runtime.onMessage.addListener((message, sender, respond) => {
       await clearObservation();
     }
     const s = await read();
-    const visible = s ? Object.fromEntries(Object.entries(s).filter(([k]) => !['token', 'bindingId', 'documentUrl'].includes(k))) : null;
+    const visible = s ? Object.fromEntries(Object.entries(s).filter(([k]) => !['token', 'bindingId', 'documentUrl', 'previousDocumentUrl'].includes(k))) : null;
     return { globalPermission: await permitted() ? 'granted' : 'permission_missing',
       enabled: await enabled(), nativeConnection: { ...connection },
-      taskAssignment: assignmentStatus, state: visible };
+      taskAssignment: assignmentStatus, observerStatus, lifecycleError, state: visible };
   }).then(result => respond({ ok: true, ...result }), error => respond({ ok: false, error: error.message }));
   return true;
 });

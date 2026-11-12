@@ -22,13 +22,42 @@ struct RequestParameters: Sendable {
             switch values["action"]?.string {
             case "hold":
                 guard ["action", "appHandle", "windowId"].allSatisfy({ values[$0] != nil }),
-                      Set(values.keys).isSubset(of: ["action", "appHandle", "windowId", "durationSeconds", "source", "waitForFrame"]) else {
+                      Set(values.keys).isSubset(of: ["action", "appHandle", "windowId", "durationSeconds", "source", "waitForFrame", "leaseId"]) else {
                     throw Self.invalid("hold 需要 appHandle、windowId，可选 durationSeconds 与 source")
+                }
+                if values["source"] == .string("browser_content") {
+                    guard let lease = values["leaseId"]?.string, !lease.isEmpty, lease.utf8.count <= 128 else {
+                        throw Self.invalid("网页预览 hold 需要 leaseId")
+                    }
+                } else if values["leaseId"] != nil {
+                    throw Self.invalid("系统预览不接受 leaseId")
+                }
+            case "browserRenew", "browserFrame":
+                let frame = values["action"] == .string("browserFrame")
+                let required: Set<String> = frame ? ["action", "leaseId", "documentKey", "sequence"] : ["action", "leaseId", "durationSeconds"]
+                let allowed = frame ? required.union(["data", "capturedAt"]) : required
+                guard required.isSubset(of: Set(values.keys)), Set(values.keys).isSubset(of: allowed),
+                      let lease = values["leaseId"]?.string, !lease.isEmpty, lease.utf8.count <= 128 else {
+                    throw Self.invalid("网页预览参数不完整或包含额外字段")
+                }
+                if frame {
+                    guard let key = values["documentKey"]?.string, key.utf8.count <= 2048,
+                          let sequence = values["sequence"]?.number, sequence.isFinite,
+                          sequence > 0, Int(exactly: sequence) != nil,
+                          (values["data"] != nil) == (values["capturedAt"] != nil) else {
+                        throw Self.invalid("网页预览帧身份或时间字段无效")
+                    }
+                    if let raw = values["data"] {
+                        guard let data = raw.string, data.utf8.count <= 180000,
+                              let captured = values["capturedAt"]?.number, captured.isFinite else {
+                            throw Self.invalid("网页预览帧超出限制")
+                        }
+                    }
                 }
             case "release", "status", "renew":
                 guard Set(values.keys) == ["action"] else { throw Self.invalid("release/status 仅接受 action") }
             default:
-                throw Self.invalid("preview action 必须为 hold、release、status 或 renew")
+                throw Self.invalid("preview action 无效")
             }
         }
         if request.method == "powerGuard" {

@@ -34,10 +34,11 @@ for _dependency in ('compatibility', 'lifecycle_store'):
     if _loaded is not None and Path(getattr(_loaded, '__file__', '')).parent != Path(__file__).parent:
         sys.modules.pop(_dependency, None)
 
-from browser_events import application_session, config_dir, read_file, make_tool as make_browser_events_tool, TASK_FILE as SESSION_TASK_FILE
+from browser_events import application_session, config_dir, read_file, make_tool as make_browser_events_tool, TASK_FILE as SESSION_TASK_FILE, validate_render_probe, RENDER_PROBE_STAGES
 from lifecycle_store import stop_reason as host_stop_reason, host_binding
 from compatibility import canonical_tool, environment, runtime_root
 from recovery import GUIDANCE as RECOVERY_GUIDANCE, policy as recovery_policy
+from preview_metadata import frame_progress, capture_lifecycle
 from task_lifecycle import TaskOwner, ProtectionSession, SESSION_IDLE_SECONDS, lease_live
 _adapter_root = Path(__file__).resolve().parents[2]
 if (_adapter_root / 'adapters').is_dir():
@@ -81,16 +82,61 @@ TOOL_ICONS = ([{'src': 'data:image/png;base64,' + base64.b64encode(LOGO_PATH.rea
                 'mimeType': 'image/png', 'sizes': ['64x64']}]
               if LOGO_PATH.is_file() else [])
 
+BROWSER_ROUTING_GUIDANCE = (
+    "浏览器按操作对象选路：网页正文、链接、表单、页面滚动、导航和页面按键用 Chrome 扩展，"
+    "task begin 指定 targetSurface=web_content（自动选 background_browser）。"
+    "地址栏、浏览器工具栏等非网页控件用 targetSurface=browser_ui；真实打开/保存等原生对话框用 native_dialog，"
+    "这两者自动选 desktop，仅在已核实窗口、共享及后台投递可用时操作。导航网址仍优先扩展 navigate，不为导航切到地址栏。"
+    "网页中的弹窗、登录框、跨域 frame、空 AX 树以及 chrome:// 等受限页面不因此变成原生对话框。"
+    "原生路由不保证浏览器菜单或系统弹窗都可后台操作；需要前台、应用级快捷键或无法核实目标时通知用户处理。"
+    "按真实操作阶段选路，不能因扩展断开、权限拒绝、超时或快照缺元素而降级为原生网页输入。"
+    "合法跨界面阶段先核实上一动作结果，保存原标签身份并 end 自己的阶段，再 begin/bind 真实新目标；"
+    "返回网页时重新核实原标签、assign 和 mapping，不复用原生快照或重放未知输入，不结束宿主会话保护。"
+)
+TARGET_SURFACE_MODES = {
+    "web_content": "background_browser", "browser_ui": "desktop",
+    "native_dialog": "desktop", "desktop_app": "desktop",
+}
+
+
+def task_interaction_mode(args):
+    surface = args.get('targetSurface')
+    if 'targetSurface' in args and (not isinstance(surface, str) or surface not in TARGET_SURFACE_MODES):
+        raise HelperError('INVALID_ARGUMENT', 'targetSurface 必须为 web_content、browser_ui、native_dialog 或 desktop_app')
+    mode = args.get('interactionMode', TARGET_SURFACE_MODES.get(surface, 'background_browser'))
+    if mode not in ('background_browser', 'desktop'):
+        raise HelperError('INVALID_ARGUMENT', 'interactionMode 仅允许 background_browser 或 desktop')
+    if surface is not None and mode != TARGET_SURFACE_MODES[surface]:
+        raise HelperError('INVALID_ARGUMENT', 'targetSurface 与 interactionMode 冲突；网页不能声明为 desktop，原生控件不能声明为 background_browser')
+    return mode
+
+
+def task_reply(record, **details):
+    """Expose the chosen channel without adding runtime handles to task storage."""
+    extension = record.get('interactionMode', 'background_browser') == 'background_browser'
+    routing = {
+        'targetSurface': record.get('targetSurface', 'web_content' if extension else 'desktop_app'),
+        'scopeSource': 'explicit_surface' if 'targetSurface' in record else 'interaction_mode',
+        'channel': 'chrome_extension' if extension else 'native_window',
+        'focusPolicy': 'preserve', 'automaticFallbackAllowed': False,
+        'requiresWindowShare': True, 'requiresTargetEvidence': True,
+        'extensionTabRequired': extension,
+    }
+    return json.dumps(dict(record, routing=routing, **details), ensure_ascii=False)
+
+
 AGENT_INSTRUCTIONS = """QuietBridge 用于保持用户正常使用电脑的后台界面操作。所有界面操作必须遵守：
 1. 不抢焦点：保持用户的前台应用、键盘窗口、物理鼠标和当前 Space。禁止调用 activate、AXRaise、置前窗口、切换 Space 或全局 HID 输入来促成操作；也禁止先抢焦点再自动恢复。无法在后台完成时报告阻塞并等待，不更换自动化通道绕过。
-2. 先核实权限和真实目标，再创建并绑定 quietbridge_task；普通桌面应用用 interactionMode=desktop，网页用默认 background_browser。始终复用已确认的 appHandle/windowId 或 browserWindowId/tabId，不按前台焦点换目标，不把后台网页任务改为桌面任务。
+2. 先按操作对象选择 targetSurface，再核实权限和真实目标、创建并绑定 quietbridge_task；普通桌面应用用 desktop_app，网页内容用 web_content，浏览器自身控件用 browser_ui，真实原生对话框用 native_dialog。自动选择对应的 desktop 或 background_browser；始终复用已确认的 appHandle/windowId 或 browserWindowId/tabId，不按前台焦点换目标，不把失败的网页任务改为桌面任务。
 3. 使用共享窗口能力：原生界面操作前调用 quietbridge_windows(action=share, appHandle=..., windowId=..., source=window)，确认目标窗口及 streamReady=true。后续观察和输入会自动核验并续租，复用同一捕获流，不要为每次点击重复 unshare/share。共享预览只负责展示，不提供独立桌面或焦点隔离；仍须使用窗口定向输入。
 4. 网页只走 quietbridge_browser_events：先 bind、用真实候选 assign，再 verify_mapping 核验系统窗口与标签的对应关系，随后为该窗口建立共享预览。映射或共享未就绪时报告并等待，不展示未经核验的窗口，不激活浏览器或回落原生键鼠；标签 screenshot 是观察证据，不能代替实时共享窗口。
 5. 原生输入前必须有同一目标的最新快照或图像证据；坐标使用窗口内 point。后台点击走窗口定向事件，AX 点击仅用于已经处于前台键盘焦点的同一窗口。桌面任务拒绝没有窗口级确认的 type_text/paste/key，使用已确认且可写的 AX 元素；网页填写用扩展 fill。
 6. 串行派发并读回核实。dispatched/performed 不代表成功；点击回执中的 focusPreserved=false 或 null 时暂停后续输入并核实原因，不能直接重复点击或自动恢复焦点。FOCUS_STATE_UNKNOWN、FOREGROUND_REQUIRED、共享或窗口投递错误均不得通过激活窗口绕过。超时或执行状态未知时先观察或查询既有命令，不重放副作用。结束时 quietbridge_task(action=end, confirm=true) 释放共享租约。"""
+AGENT_INSTRUCTIONS += "\n准备检查无需先 begin：permissions 的 browserChannel 表示扩展全局心跳与授权；无活动任务的 candidates 返回 connectionScope=extension_preflight、clientVersion 和候选元数据，taskChannelReady=false 不表示扩展离线，也不授权输入或共享。begin 后必须使用自己的会话通道；channel_pending/BROWSER_CHANNEL_STARTING 时保留原任务，只读复查 candidates 最多两次，不要求用户重载扩展、不重建目标。全局候选不能替代会话内 assign 的候选证据。"
 AGENT_INSTRUCTIONS += "\n7. " + RECOVERY_GUIDANCE
-AGENT_INSTRUCTIONS += "\n8. quietbridge_task end 仅结束当前界面操作阶段并释放绑定和共享预览；阶段切换和短暂停顿不结束会话锁屏保护。同一宿主本轮可 begin/bind 多个界面阶段。120 秒无实际界面操作会中断该阶段，ping、权限/任务状态查询和扩展心跳不续期。宿主 FinalStop/SessionEnd、取消、断连或退出结束会话保护；已核实宿主归属的会话保护允许最长 30 分钟无实际工具活动，未核实归属时保留 120 秒兜底，不能声称连接器在线就证明会话仍在运行。TASK_INTERRUPTED/TASK_CANCELLED 后不得复活旧任务或重放输入，先核实既有结果，再 begin 并显式绑定新阶段。TARGET_MISMATCH 只说明目标不一致，不证明旧任务已失效；先查看状态，不自动结束或接管其他任务。"
+AGENT_INSTRUCTIONS += "\n8. quietbridge_task end 仅结束当前界面操作阶段并释放绑定和共享预览；阶段切换和短暂停顿不结束会话锁屏保护。end 返回 previewCleanup；released 仅确认面板/租约释放，捕获停止需看 captureStop.stopState=completed、stopConfirmed=true 或对应 captureStopCompleted 日志；requested/failed/缺失不能称捕获已确认退出。failed/unconfirmed 时通知用户清理未确认，不把 state=ended 当作共享已关闭。同一宿主本轮可 begin/bind 多个界面阶段。120 秒无实际界面操作会中断该阶段，ping、权限/任务状态查询和扩展心跳不续期。宿主 FinalStop/SessionEnd、取消、断连或退出结束会话保护；已核实宿主归属的会话保护允许最长 30 分钟无实际工具活动，未核实归属时保留 120 秒兜底，不能声称连接器在线就证明会话仍在运行。TASK_INTERRUPTED/TASK_CANCELLED 后不得复活旧任务或重放输入，先核实既有结果，再 begin 并显式绑定新阶段。TARGET_MISMATCH 只说明目标不一致，不证明旧任务已失效；先查看状态，不自动结束或接管其他任务。"
 AGENT_INSTRUCTIONS += "\n9. QuietBridge 最多同时运行三个独立会话。宿主 hook 自动提供可信逐调用身份，Agent 不填写会话 ID 或 _quietbridgeRoute。每项复用自己的 taskId、appHandle、窗口/标签、快照和命令结果；卡片切换只是用户查看画面，不能据此变更操作目标。SESSION_CAPACITY_FULL/TARGET_IN_USE 时通知用户并等待，不能结束或接管其他会话。同一个原生应用进程的不同窗口暂按进程互斥；浏览器使用不同专用窗口。某项停止、超时或执行进程退出后只处理本项，禁止重启整个连接器影响其他项。"
+AGENT_INSTRUCTIONS += "\n10. " + BROWSER_ROUTING_GUIDANCE
 
 def shots_directory():
     """Screenshots must land somewhere the signed app bundle never owns."""
@@ -180,13 +226,15 @@ def diagnostic_fields(params):
     if not isinstance(params, dict):
         return {}
     numbers = {"windowId", "elementIndex", "x", "y", "fromX", "fromY", "toX", "toY", "clickCount", "holdMs", "deltaLinesX", "deltaLinesY", "durationMs", "steps"}
-    identifiers = {"appHandle", "snapshotId", "mouseButton", "action", "source", "taskId", "operation", "commandId", "documentId", "interactionMode"}
+    identifiers = {"appHandle", "snapshotId", "mouseButton", "action", "source", "taskId", "operation", "commandId", "documentId", "interactionMode", "targetSurface"}
     numbers.update({"browserWindowId", "tabId", "navigationEpoch", "deltaY", "lines"})
     fields = {key: value[:256] if isinstance(value, str) else value for key, value in (params or {}).items()
             if (key in numbers and diagnostic_number(value)) or
                (key in identifiers and isinstance(value, str))}
     if params.get('direction') in ('up', 'down'):
         fields['direction'] = params['direction']
+    if params.get('stage') in RENDER_PROBE_STAGES:
+        fields['stage'] = params['stage']
     return fields
 
 
@@ -228,7 +276,8 @@ def diagnostic_result(result):
     preview = result.get("preview")
     if isinstance(preview, dict):
         safe = diagnostic_geometry(preview, ("trackingWindowId", "hostWindowId", "hostPid", "displayId"))
-        for key in ("panelSpaceVerified", "hostOnCurrentSpace", "panelOnCurrentSpace", "visible", "streamReady", "waitingForTargetDesktop"):
+        for key in ("panelSpaceVerified", "hostOnCurrentSpace", "panelOnCurrentSpace", "targetOnCurrentSpace",
+                    "visible", "streamReady", "waitingForTargetDesktop", "videoLayerReady", "videoLayerFailed"):
             if type(preview.get(key)) is bool:
                 safe[key] = preview[key]
         for key in ("hostSpaceIds", "panelSpaceIds"):
@@ -236,8 +285,17 @@ def diagnostic_result(result):
             if isinstance(values, list) and len(values) <= 64 and all(type(v) is int and v > 0 for v in values):
                 safe[key] = values
         for key in ("mode", "captureMode"):
-            if preview.get(key) in ("window", "application", "desktop"):
+            if preview.get(key) in ("window", "application", "desktop", "browser_content"):
                 safe[key] = preview[key]
+        for key in ("frameAgeMs", "videoFrames"):
+            if diagnostic_number(preview.get(key)) and preview[key] >= 0:
+                safe[key] = preview[key]
+        progress = preview.get('frameProgress')
+        if isinstance(progress, dict):
+            safe['frameProgress'] = frame_progress(progress)
+        for key in ('captureLifecycle', 'captureStop'):
+            if isinstance(preview.get(key), dict):
+                safe[key] = capture_lifecycle(preview[key])
         fields["preview"] = safe
     return fields
 
@@ -555,15 +613,9 @@ def browser_channel_state():
     """Extension presence, not a task binding: fresh heartbeat plus consent."""
     import browser_events
     try:
-        data = browser_events.read_file(browser_events.EVENT_FILE, {"version": 1, "tasks": {}})
-    except (ValueError, OSError):
+        return browser_events.extension_presence(Path(task_root()) / 'browser-events.json')
+    except (ValueError, OSError, TypeError):
         return False
-    peer = data.get("peer") if isinstance(data, dict) else None
-    if not isinstance(peer, dict):
-        return False
-    if time.time() - (peer.get("lastSeen") or 0) >= 20:
-        return False
-    return bool(peer.get("enabled") and peer.get("permission") and peer.get("clientVersion"))
 
 
 def native_preview_matches(task_id):
@@ -576,17 +628,31 @@ def native_preview_matches(task_id):
     return state.get('mappingVerified') is True and state.get('crossCheck', {}).get('consistent') is True
 
 
+def stop_browser_preview():
+    """Compatibility no-op; there is no screenshot-mailbox producer."""
+
+
+def selected_share_source(app, window):
+    selection = SHARE_SELECTION or {}
+    if (selection.get('appHandle') == app and selection.get('windowId') == window and
+            selection.get('connection') == current_connection() and HELPER._alive()):
+        return selection.get('source')
+    return None
+
+
 def ensure_background_preview(app, window):
-    """Keep the task window preview leased; CDP never waits for a video frame."""
-    connection, preview = request_share(app, window, "window", require_frame=False)
-    if preview.get('streamReady') is not True:
-        operation_log("browser.preview_waiting", windowId=window, reason="frame_pending")
-    return connection
+    """Reuse the continuous native window stream for Chrome page commands."""
+    return ensure_share(app, window, require_frame=False)
 
 
-def ensure_share(app, window, source=None, duration=600):
+def ensure_share(app, window, source=None, duration=600, require_frame=True):
     """应用内默认只共享该应用；显式桌面范围在同一目标的后续动作中保留。"""
     global SHARE_RECORD, SHARE_SELECTION
+    if source is None:
+        source = selected_share_source(app, window)
+    # Screenshot-mailbox previews are retained only for protocol compatibility.
+    # Product sharing always uses ScreenCaptureKit window/application streams.
+    stop_browser_preview()
     if source is not None:
         SHARE_SELECTION = None
     if source is None:
@@ -595,7 +661,7 @@ def ensure_share(app, window, source=None, duration=600):
                        and selection.get("connection") == current_connection() and HELPER._alive())
         source = selection["source"] if same_target else "application"
     try:
-        connection, preview = request_share(app, window, source, duration)
+        connection, preview = request_share(app, window, source, duration, require_frame=require_frame)
     except HelperError:
         SHARE_SELECTION = {"appHandle": app, "windowId": window, "connection": current_connection(), "source": source}
         raise
@@ -1045,25 +1111,32 @@ def release_task_preview():
     """Release a phase's preview without starting a helper or ending protection."""
     global SHARE_SELECTION
     SHARE_SELECTION = None
-    if HELPER._alive():
-        try:
-            call_helper('preview', {'action': 'release'})
-        except HelperError:
-            pass
+    stop_browser_preview()
+    if not HELPER._alive():
+        return {'status': 'connection_closed', 'nativeConnection': 'closed'}
+    try:
+        payload = call_helper('preview', {'action': 'release'}) or {}
+    except HelperError as error:
+        return {'status': 'failed', 'errorCode': error.code}
+    preview = payload.get('preview') or {}
+    result = {key: preview[key] for key in ('holding', 'visible', 'streamReady') if key in preview}
+    result['status'] = 'released' if preview.get('holding') is False and preview.get('visible') is False else 'unconfirmed'
+    if isinstance(preview.get('captureStop'), dict):
+        result['captureStop'] = capture_lifecycle(preview['captureStop'])
+    return result
 
 
 def tool_task(args):
     global SHARE_SELECTION
-    if not isinstance(args, dict) or set(args) - {"action", "taskId", "appHandle", "windowId", "confirm", "interactionMode"}:
-        raise HelperError("INVALID_ARGUMENT", "仅接受 action、taskId、appHandle、windowId、confirm、interactionMode")
+    if not isinstance(args, dict) or set(args) - {"action", "taskId", "appHandle", "windowId", "confirm", "interactionMode", "targetSurface"}:
+        raise HelperError("INVALID_ARGUMENT", "仅接受 action、taskId、appHandle、windowId、confirm、interactionMode、targetSurface")
     action = args.get("action")
     if action not in ("begin", "bind", "status", "end"):
         raise HelperError("INVALID_ARGUMENT", "action 必须为 begin、bind、status、end")
-    if action == "begin" and (set(args) - {"action", "interactionMode"} or
-            args.get("interactionMode", "background_browser") not in ("background_browser", "desktop")):
-        raise HelperError("INVALID_ARGUMENT", "begin 的 interactionMode 仅允许 background_browser（默认）或 desktop")
-    if action != "begin" and "interactionMode" in args:
-        raise HelperError("INVALID_ARGUMENT", "任务执行模式不能中途降级；只能在 begin 时指定")
+    if action == "begin" and set(args) - {"action", "interactionMode", "targetSurface"}:
+        raise HelperError("INVALID_ARGUMENT", "begin 仅接受 interactionMode 与 targetSurface")
+    if action != "begin" and any(key in args for key in ('interactionMode', 'targetSurface')):
+        raise HelperError("INVALID_ARGUMENT", "任务执行模式及操作对象不能中途更改；只能在 begin 时指定")
     if action == "status" and set(args) - {"action", "taskId"}:
         raise HelperError("INVALID_ARGUMENT", "status 仅接受 action 和 taskId")
     if action == "end" and (set(args) - {"action", "taskId", "confirm"} or args.get("confirm") is not True):
@@ -1071,6 +1144,7 @@ def tool_task(args):
     if "taskId" in args and (not isinstance(args["taskId"], str) or not args["taskId"]):
         raise HelperError("INVALID_ARGUMENT", "taskId 必须是非空字符串")
     if action == 'begin':
+        interaction_mode = task_interaction_mode(args)
         reap_protection_session()
     with task_store() as data:
         if action == "begin":
@@ -1088,7 +1162,9 @@ def tool_task(args):
             task_id = str(uuid.uuid4())
             record = {"taskId": task_id, "state": "awaiting_window", "mode": None,
                       "newWindowCreated": False,
-                      "interactionMode": args.get("interactionMode", "background_browser")}
+                      "interactionMode": interaction_mode}
+            if 'targetSurface' in args:
+                record['targetSurface'] = args['targetSurface']
             TASK_OWNER.attach(record, Path(TASK_FILE).parent)
             from session_registry import reserve
             try:
@@ -1097,7 +1173,7 @@ def tool_task(args):
                 raise HelperError(str(error).split(':', 1)[0], str(error))
             data["tasks"][task_id] = record
             data["activeTaskId"] = task_id
-            return json.dumps(record, ensure_ascii=False)
+            return task_reply(record)
         task_id = args.get("taskId", data["activeTaskId"])
         record = data["tasks"].get(task_id)
         if record is None:
@@ -1105,7 +1181,7 @@ def tool_task(args):
                 return json.dumps({'state': 'idle', 'activeTaskId': None, 'sessionProtection': protection_status()})
             raise HelperError("UNKNOWN_TASK", "任务不存在；先 begin")
         if action == "status":
-            return json.dumps(dict(task_status(record), sessionProtection=protection_status()), ensure_ascii=False)
+            return task_reply(task_status(record), sessionProtection=protection_status())
         if action == "end":
             # 显式结束是唯一回到「无任务」原生模式的入口：只收尾记录，
             # 不清空历史，也不把已绑定目标转交其它窗口。
@@ -1121,13 +1197,14 @@ def tool_task(args):
             from session_registry import release
             release(task_root(), SESSION_KEY or TASK_OWNER.id, task_id)
             if not active:
-                return json.dumps(dict(record, cleanup='historical_record_only'), ensure_ascii=False)
+                return task_reply(record, cleanup='historical_record_only')
             # 共享面板跟随界面操作任务：任务结束就释放租约，不让浮层继续留在屏幕上。
-            release_task_preview()
+            preview_cleanup = release_task_preview()
             if SESSION_PROTECTION.record is not None:
                 SESSION_PROTECTION.touch()
-            operation_log('task.phase_ended', taskId=task_id, protectionRetained=POWER_GUARD['active'])
-            return json.dumps(dict(record, sessionProtection=protection_status()), ensure_ascii=False)
+            operation_log('task.phase_ended', taskId=task_id, protectionRetained=POWER_GUARD['active'],
+                          previewCleanup=preview_cleanup)
+            return task_reply(record, previewCleanup=preview_cleanup, sessionProtection=protection_status())
         if args.get("confirm") is not True or type(args.get("windowId")) is not int or not 1 <= args["windowId"] <= 4294967295 or not args.get("appHandle"):
             raise HelperError("INVALID_ARGUMENT", "bind 需要显式 appHandle、有效 windowId、confirm=true")
         if READ_ONLY:
@@ -1167,7 +1244,7 @@ def tool_task(args):
             raise HelperError("ATTACH_UNVERIFIED", "原生服务未返回完整窗口和进程代际身份；任务未绑定")
         if record.get("processIdentity") is not None and record["processIdentity"] != identity:
             record["state"] = "invalidated"
-            return json.dumps(record, ensure_ascii=False)
+            return task_reply(record)
         record.update(state="bound", mode="attached_existing", pid=pid, processIdentity=identity,
                       windowId=args["windowId"], newWindowCreated=False)
         if not desktop:
@@ -1185,9 +1262,9 @@ def tool_task(args):
         data["activeTaskId"] = task_id
         STATE.update(app=app, snapshot=None, snapshot_app=None, snapshot_window=None)
         # 绑定成功即进入任务运行期：按住防睡眠断言，锁屏后任务仍能继续。
-        return json.dumps(dict(record, limitation="仅绑定指定应用的已有窗口，未提供数据隔离" if desktop else
+        return task_reply(record, limitation="仅绑定指定应用的已有窗口，未提供数据隔离" if desktop else
                                "仅绑定已有窗口，共享 Chrome 数据；未实现新建专用窗口或数据隔离",
-                               powerGuard=hold_power_guard(record) if record.get("interactionMode") == "desktop" else {"active": False}), ensure_ascii=False)
+                          powerGuard=hold_power_guard(record) if desktop else {"active": False})
 
 
 TASK_TARGET_TOOLS = {"quietbridge_situation", "quietbridge_state", "quietbridge_visual_state", "quietbridge_screenshot", "quietbridge_wait_ready",
@@ -1205,6 +1282,13 @@ def task_guard(name, args):
         return args, None
     with task_store() as data:
         record = data["tasks"].get(data["activeTaskId"])
+        if name == 'quietbridge_windows' and args.get('action') == 'unshare':
+            # Cleanup is scoped to this connector's native socket, even after
+            # its interface phase ends. Never release another active owner's
+            # resources or require a new task just to close an old preview.
+            if record and record.get('lease') and not TASK_OWNER.owns(record):
+                raise HelperError('TASK_IN_USE', '共享资源属于另一个活动连接，未释放其资源')
+            return args, None
         if record is None:
             if SESSION_PROTECTION.record is not None and (name in TASK_TARGET_TOOLS or
                     name == 'quietbridge_windows' and args.get('action', 'list') != 'list' or
@@ -1212,20 +1296,31 @@ def task_guard(name, args):
                 raise HelperError('TASK_NOT_BOUND', '会话保护仍在，当前界面阶段已结束；先 begin 并绑定新阶段，不能复用已结束目标或无任务输入')
             return args, None
         if record.get('lease') and (record['state'] == 'interrupted' or not lease_live(record, Path(TASK_FILE).parent)):
-            if name in TASK_TARGET_TOOLS or name in ('quietbridge_windows', 'quietbridge_browser_events'):
+            if name in TASK_TARGET_TOOLS or name in ('quietbridge_windows', 'quietbridge_browser_events', 'quietbridge_browser_session'):
                 raise HelperError('TASK_INTERRUPTED', '原任务已中断或租约已过期；查看任务状态后显式创建新任务')
         if record.get('lease') and not TASK_OWNER.owns(record) and (
-                name in TASK_TARGET_TOOLS or name == 'quietbridge_windows' or
+                name in TASK_TARGET_TOOLS or name in ('quietbridge_windows', 'quietbridge_browser_session') or
                 (name == 'quietbridge_browser_events' and args.get('action') not in ('status', 'candidates', 'annotations'))):
             raise HelperError('TASK_IN_USE', '任务属于另一个活动连接，未接管其输入或共享资源')
         # 等待绑定时允许只读枚举窗口：否则「先建窗再绑定」会被守卫锁死。
         discovery = (name == "quietbridge_windows" and args.get("action", "list") == "list" and
                      record.get("state") == "awaiting_window")
         protected = name in TASK_TARGET_TOOLS or (name == "quietbridge_windows" and not discovery)
-        if name == "quietbridge_browser_session" and args.get("action") != "list":
-            raise HelperError("TASK_SCOPE_REQUIRED", "任务期间仅允许通过 quietbridge_task bind 登记已有窗口，不允许启动或另行绑定")
+        if name == "quietbridge_browser_session" and args.get("action") not in ("prepare", "list"):
+            preparing = (args.get("action") == "start" and record.get("state") == "awaiting_window" and
+                         record.get("windowId") is None and record.get("interactionMode") == "background_browser")
+            if not preparing:
+                raise HelperError("TASK_SCOPE_REQUIRED", "已绑定任务不能迁移到其他浏览器。保留原任务与结果，通知用户确认恢复方式；"
+                                  "独立浏览器可在未绑定的 background_browser 阶段 prepare/start，再依据 list 的真实 PID 和窗口 bind。"
+                                  "新 profile 需用户加载扩展并登录，不自动继承原登录态。")
         if name == "quietbridge_apps" and args.get("action") == "launch":
             raise HelperError("TASK_SCOPE_REQUIRED", "任务期间不允许启动应用")
+        if (record.get('targetSurface') in ('browser_ui', 'native_dialog', 'desktop_app') and
+                name == 'quietbridge_browser_events' and
+                args.get('action') not in ('status', 'candidates', 'result', 'cancel', 'annotations')):
+            raise HelperError('TASK_ROUTE_MISMATCH', '本阶段声明为原生界面；未派发扩展操作。'
+                              '先检查任务与原目标，只有真实进入网页阶段时才 end 自己的阶段并以 targetSurface=web_content begin；'
+                              '不能更改活动阶段的通道或重放未知输入。')
         if record.get("interactionMode", "background_browser") == "background_browser":
             native_input = name in {"quietbridge_click", "quietbridge_hover", "quietbridge_scroll", "quietbridge_drag", "quietbridge_type_text",
                                     "quietbridge_paste", "quietbridge_key", "quietbridge_set_value"}
@@ -1258,8 +1353,9 @@ def task_guard(name, args):
         element = args.get("elementIndex") is not None
         if "snapshotId" in args or element:
             snapshot = args.get("snapshotId") or STATE["snapshot"]
-            if (not snapshot or snapshot != STATE["snapshot"] or
-                    STATE["snapshot_app"] != binding["appHandle"] or STATE["snapshot_window"] != record["windowId"]):
+            if not snapshot or snapshot != STATE["snapshot"]:
+                raise HelperError("STALE_SNAPSHOT", "快照已被新的观察替换；保留当前绑定，重新观察原窗口后使用新 snapshotId")
+            if STATE["snapshot_app"] != binding["appHandle"] or STATE["snapshot_window"] != record["windowId"]:
                 raise HelperError("TARGET_MISMATCH", "snapshot 无法通过 STATE snapshot_window 证明属于绑定窗口")
             args["snapshotId"] = snapshot
         if not element and "windowId" not in args:
@@ -1664,12 +1760,18 @@ def tool_apps(args):
 
 
 def tool_windows(args):
+    global SHARE_SELECTION
     action = (args.get("action") or "list").lower()
     if action == "unshare":
         # 释放共享不需要应用句柄：目标应用可能已经退出，但浮层必须能收掉。
         if READ_ONLY:
             raise HelperError("READ_ONLY", "QUIETBRIDGE_READ_ONLY=1，unshare 已禁用")
+        stop_browser_preview()
+        if not HELPER._alive():
+            release_task_preview()
+            return "本地共享选择已清理（nativeConnection=closed）；未启动新的原生连接。"
         result = call_helper("preview", {"action": "release"}) or {}
+        SHARE_SELECTION = None
         preview = result.get("preview") or {}
         return "已结束窗口共享（holding=%s，visible=%s）。" % (preview.get("holding"), preview.get("visible"))
     app_handle = resolve_app(args.get("appHandle"))
@@ -1697,11 +1799,11 @@ def tool_windows(args):
         duration = args.get("durationSeconds", 1800)
         if type(duration) not in (int, float) or not 60 <= duration <= 3600:
             raise HelperError("INVALID_ARGUMENT", "durationSeconds 必须在 60 到 3600 之间")
-        source = args.get("source", "application")
-        if source not in ("application", "window", "desktop"):
+        source = args.get("source")
+        if source is not None and source not in ("application", "window", "desktop"):
             raise HelperError("INVALID_ARGUMENT", "source 必须是 application、window 或 desktop")
         ensure_share(app_handle, window_id, source=source, duration=duration)
-        scope = {"desktop": "目标应用所在的整个桌面", "application": "目标应用", "window": "单个窗口"}[SHARE_RECORD["source"]]
+        scope = {"browser_content": "网页内容（定时帧，非整窗视频）", "desktop": "目标应用所在的整个桌面", "application": "目标应用", "window": "单个窗口"}[SHARE_RECORD["source"]]
         return ("已开始共享%s（windowId=%d，租约=%s 秒，holding=True）。"
                 "共享面板在任务结束前保持：动作会续租，quietbridge_windows action=unshare 或 quietbridge_task end 会立即关闭。"
                 % (scope, window_id, duration))
@@ -1726,10 +1828,13 @@ def tool_situation(args):
         raise HelperError("TARGET_MISMATCH", "现场观察返回不同目标")
     STATE.update(snapshot=state.get("snapshotId"), snapshot_app=app, snapshot_window=window)
     tree = state.get("tree")
+    truncated = state.get("truncated", "unknown")
+    if isinstance(tree, str) and len(tree) > MAX_TREE_CHARS:
+        tree = tree[:MAX_TREE_CHARS]
+        truncated = True
     preview_result = call_helper("preview", {"action": "status"}) or {}
     preview = preview_result.get("preview")
-    return {"content": [{"type": "text", "text": "只读现场观察；未启动共享或截图。"}],
-            "situation": {"target": dict({"appHandle": app, "windowId": window},
+    situation = {"target": dict({"appHandle": app, "windowId": window},
                                                      **{k: target[k] for k in ("bounds", "isOnScreen", "onCurrentSpace") if k in target}),
                           "permissions": caps.get("permissions", "unknown"),
                           "sessionLocked": caps.get("sessionLocked", "unknown"),
@@ -1737,13 +1842,18 @@ def tool_situation(args):
                                     "frontPid": state.get("frontPid", "unknown"),
                                     "targetOnCurrentSpace": target.get("onCurrentSpace", "unknown")},
                           "ax": {"available": bool(tree.strip()) if isinstance(tree, str) else "unknown",
-                                 "truncated": state.get("truncated", "unknown"), "tree": tree,
+                                 "truncated": truncated, "tree": tree,
                                  "snapshotId": state.get("snapshotId"), "maxElements": 50, "maxDepth": 6},
                           "preview": preview if isinstance(preview, dict) else {"status": "unknown"},
                           "scopeWarning": "desktop 可能包含其他应用及敏感信息；现场观察不证明共享正在运行。",
                           "suggestedActions": ["按明确目标观察 AX；空树不证明自绘或权限失败。",
                                                "操作前使用 quietbridge_windows action=share source=window，核实共享目标和视频首帧；后续自动续租。",
-                                               "必须不抢焦点；需要前台或共享未就绪时报告阻塞，不激活、不置前、不切换 Space。"]}}
+                                               "必须不抢焦点；需要前台或共享未就绪时报告阻塞，不激活、不置前、不切换 Space。"]}
+    # Some MCP clients expose only content to their agent. Keep the bounded
+    # observation visible there as well as in structuredContent.
+    return {"content": [{"type": "text", "text": "只读现场观察；未启动共享或截图。\n" +
+                         json.dumps(situation, ensure_ascii=False, indent=2)}],
+            "situation": situation}
 
 
 def tool_state(args):
@@ -1795,8 +1905,9 @@ def tool_state(args):
     if result.get("truncated"):
         tail.append("界面树被截断：可加大 maxElements/maxDepth，或先用 quietbridge_windows 选中具体窗口缩小范围。")
     if not tree.strip():
-        target = by_id.get(result.get("windowId") or window_id) or {}
-        if target and not target.get("isOnScreen"):
+        observed_window = result.get("windowId") or window_id
+        target = next((w for w in list_windows(app_handle) if w.get("windowId") == observed_window), {})
+        if target.get("isOnScreen") is False:
             tail.append(
                 "AX 树为空且该窗口 isOnScreen=false，不能据此断定 Space 或自绘状态；先核对目标与可见性，"
                 "可用 quietbridge_visual_state 获取视频帧进行视觉分析；不得自动点击或猜测盲点。"
@@ -2296,7 +2407,9 @@ APP_HANDLE_PROP = {"type": "string", "description": "quietbridge_apps 返回的 
 WINDOW_PROP = {"type": "integer", "description": "窗口 id；输入必须显式指定或使用同应用当前连接可信快照的窗口"}
 SNAPSHOT_PROP = {"type": "string", "description": "quietbridge_state 返回的 snapshotId；省略时使用该应用最近快照"}
 NATIVE_INPUT_GUIDANCE = (
-    "必须不抢焦点并使用共享窗口：先绑定 desktop 任务，调用 quietbridge_windows action=share source=window 核实目标与视频首帧；后续自动续租。"
+    "必须不抢焦点并使用共享窗口：普通原生应用用 targetSurface=desktop_app，浏览器工具栏等原生控件用 browser_ui，真实原生对话框用 native_dialog，"
+    "在 task begin 自动选择 desktop 后绑定真实窗口，调用 quietbridge_windows action=share source=window 核实目标与视频首帧；后续自动续租。"
+    "不用于网页正文、表单或页面滚动；扩展异常不得作为改用原生操作网页的理由。"
     "仅操作已确认目标，禁止 activate/AXRaise、切换 Space、移动物理鼠标或全局 HID 兜底；遇到前台要求、共享或投递错误时停止并报告。"
 )
 NATIVE_OBSERVATION_GUIDANCE = (
@@ -2310,7 +2423,7 @@ MODIFIERS_PROP = {
 }
 
 TOOLS = [
-    {"name": "quietbridge_situation", "description": "只读现场：必须显式 appHandle/windowId，经任务守卫核验，仅读取能力、窗口与有界AX（50元素/6层），不截图、不启动共享、不重绑。保持用户焦点；返回的 preview 只是状态，不能证明已建立共享，后续界面操作必须使用共享窗口能力。焦点、AX、共享未知值诚实返回，不推断空树为自绘。选路：原生 App 走本工具及其后的 AX 系列；网页内容优先 quietbridge_browser_events（结构化、不靠猜元素）；纯命令行或文件操作不需要 QuietBridge。",
+    {"name": "quietbridge_situation", "description": "只读现场：必须显式 appHandle/windowId，经任务守卫核验，仅读取能力、窗口与有界AX（50元素/6层），不截图、不启动共享、不重绑。保持用户焦点；返回的 preview 只是状态，不能证明已建立共享，后续界面操作必须使用共享窗口能力。焦点、AX、共享未知值诚实返回，不推断空树为自绘。选路：普通原生 App、浏览器自身控件和真实原生对话框可走本工具及 AX 系列；网页正文和表单用 quietbridge_browser_events，不因空树或扩展失败转为原生输入。纯命令行或文件操作不需要 QuietBridge。",
      "inputSchema": {"type": "object", "additionalProperties": False,
                      "properties": {"appHandle": {"type": "string", "minLength": 1},
                                     "windowId": {"type": "integer", "minimum": 1, "maximum": 4294967295}},
@@ -2319,7 +2432,7 @@ TOOLS = [
      "annotations": {"readOnlyHint": True, "destructiveHint": False}},
     {
         "name": "quietbridge_task",
-        "description": "界面任务必须不抢焦点，绑定后使用 quietbridge_windows action=share source=window 建立目标共享；绑定不等于共享就绪。持久任务绑定：begin 默认 interactionMode=background_browser，执行层禁止所有原生输入和窗口激活；扩展未就绪必须等待。只有明确的普通桌面应用任务才在 begin 指定 desktop，模式不能中途更改。begin 生成 UUID，保持 awaiting_window，不创建或启动浏览器。bind 必须显式 appHandle、windowId、confirm=true，仅绑定已有窗口，mode=attached_existing，不等于新建或数据隔离。status 只读核验进程代际和窗口；跨连接 requires_revalidation，需重新显式确认，绝不按 PID 自动接管。任务期间观察和输入严格限制目标，应用级键盘接口拒绝。浏览器共享前先 assign 并 verify_mapping。"
+        "description": BROWSER_ROUTING_GUIDANCE + "界面任务必须不抢焦点，绑定后使用 quietbridge_windows action=share source=window 建立系统窗口连续视频预览；网页动作完成后扩展执行一次有界绘制脉冲，空闲时不轮询截图。绑定不等于首帧就绪。begin 推荐指定 targetSurface，自动选择对应执行模式；显式 interactionMode 与之冲突会拒绝。省略 targetSurface 时兼容原调用：默认 background_browser，或显式 desktop。网页阶段禁止所有原生输入和窗口激活；扩展未就绪必须等待。操作对象和模式只能在 begin 指定，不能中途更改。begin/status/bind/end 回执含 routing，表明选路及前提，不证明已绑定、已授权或已共享。begin 生成 UUID，保持 awaiting_window，不创建或启动浏览器。bind 必须显式 appHandle、windowId、confirm=true，仅绑定已有窗口，mode=attached_existing，不等于新建或数据隔离。status 只读核验进程代际和窗口；跨连接 requires_revalidation，需重新显式确认，绝不按 PID 自动接管。任务期间观察和输入严格限制目标，应用级键盘接口拒绝。网页共享前先 assign 并 verify_mapping。"
                        "后台模式不启动桌面接管；共享预览独立维持原目标和宿主位置。end 只释放本阶段绑定和共享预览，返回 sessionProtection；同一宿主本轮下一阶段可 begin 新任务，不主动交还系统锁屏。会话停止、取消或断连才释放会话保护；已核实宿主归属时保护最多允许30分钟无实际工具活动，无归属证据时120秒兜底。界面阶段120秒无操作仍会中断，状态查询与心跳不续期。旧任务不能复活，新阶段须重新核实目标，禁止重放旧输入。其他连接的活动任务不能接管；TARGET_MISMATCH 不等于旧绑定已失效。",
         "inputSchema": {
             "type": "object", "additionalProperties": False,
@@ -2328,24 +2441,28 @@ TOOLS = [
                 "taskId": {"type": "string", "minLength": 1},
                 "appHandle": APP_HANDLE_PROP, "windowId": WINDOW_PROP,
                 "confirm": {"type": "boolean", "const": True},
-                "interactionMode": {"type": "string", "enum": ["background_browser", "desktop"], "default": "background_browser"},
+                "interactionMode": {"type": "string", "enum": ["background_browser", "desktop"],
+                                    "description": "省略时按 targetSurface 自动选择；两者都省略时兼容默认为 background_browser。"},
+                "targetSurface": {"type": "string", "enum": list(TARGET_SURFACE_MODES),
+                                  "description": "仅 begin：web_content 自动选 background_browser；browser_ui/native_dialog/desktop_app 自动选 desktop。按真实控件类型声明，不能用于扩展故障兜底。可省略 interactionMode，显式指定时必须一致。"},
             },
             "required": ["action"],
             "oneOf": [
                 {"properties": {"action": {"const": "begin"}},
                  "not": {"anyOf": [{"required": [k]} for k in ("taskId", "appHandle", "windowId", "confirm")]}},
-                {"properties": {"action": {"const": "bind"}}, "required": ["appHandle", "windowId", "confirm"], "not": {"required": ["interactionMode"]}},
+                {"properties": {"action": {"const": "bind"}}, "required": ["appHandle", "windowId", "confirm"],
+                 "not": {"anyOf": [{"required": [k]} for k in ("interactionMode", "targetSurface")]}},
                 {"properties": {"action": {"const": "status"}},
-                 "not": {"anyOf": [{"required": [k]} for k in ("appHandle", "windowId", "confirm", "interactionMode")]}},
+                 "not": {"anyOf": [{"required": [k]} for k in ("appHandle", "windowId", "confirm", "interactionMode", "targetSurface")]}},
                 {"properties": {"action": {"const": "end"}}, "required": ["confirm"],
-                 "not": {"anyOf": [{"required": [k]} for k in ("appHandle", "windowId", "interactionMode")]}},
+                 "not": {"anyOf": [{"required": [k]} for k in ("appHandle", "windowId", "interactionMode", "targetSurface")]}},
             ],
         },
         "handler": tool_task, "readOnly": True,
     },
     {
         "name": "quietbridge_browser_session",
-        "description": "受管 Chrome 会话；始终不抢焦点，启动或绑定后仍需核验目标并建立共享窗口，不把会话存在当作共享成功。prepare 登记固定配置；start 必须 sessionId+confirm=true 并核验安装身份，返回 pending/started；list 核验进程身份与窗口。start 不重试，超时可能已启动；禁止重复启动，不关闭浏览器、不切换 Space。attach(pid,windowId,confirm=true) 共享既有 Chrome 数据，仅绑定指定进程代际和窗口，不启动、不写 profile、不激活、不 raise；关闭或身份改变后 invalidated，不选择其他窗口。READ_ONLY 拦截 start/attach。",
+        "description": "受管 Chrome 会话；请求不激活窗口，启动后仍需核验真实目标与共享。prepare/list 可在任务内查询；start 仅在无活动任务或尚未绑定窗口的 background_browser 阶段允许，必须 sessionId+confirm=true，返回 pending/started，不自动绑定。list 返回独立进程 PID/窗口，须按这些真实结果重新获取 appHandle 后 task bind，不能选用户的其他 Chrome 窗口。已绑定任务不能自动迁移，先通知用户确认新阶段。新 profile 没有原登录态，也不会自动加载 QuietBridge 扩展；需用户加载扩展、授权站点并登录，不复制旧 profile/cookie，不把受管启动作为即用恢复路径。start 不重试，超时可能已启动；禁止重复启动，不关闭浏览器、不切换 Space。attach(pid,windowId,confirm=true) 共享既有 Chrome 数据，不启动、不写 profile、不激活、不 raise；任务内仅通过 task bind 使用。READ_ONLY 拦截 start/attach。",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -2399,8 +2516,8 @@ TOOLS = [
     {
         "name": "quietbridge_windows",
         "description": "不抢焦点地列出窗口或使用共享窗口能力。界面任务绑定后，先 action=share 并显式 appHandle/windowId/source=window，仅共享已确认目标，核对 streamReady 与 trackingWindowId；浏览器窗口须先 verify_mapping。后续观察和输入自动核验、续租并复用捕获流，不要逐次 unshare/share。share 持续到 unshare 或 quietbridge_task end；不激活目标或切换 Space，也不提供焦点隔离。"
-                       "未指定范围时默认 application；只有任务确实需要跨应用、Dock 或系统界面时才显式 source=desktop，不能为解决点击失败扩大范围。"
-                       "activate 会改变前台焦点，不抢焦点任务禁止调用，更不能作为失败兜底。锁屏时共享立即关闭并清除画面。",
+                       "后台浏览器任务同样使用系统窗口连续视频；网页动作完成后扩展会丢弃地触发一次有界绘制脉冲，以帮助离屏 Chrome 把新画面送入窗口流。该脉冲不是预览帧，空闲时不运行，也不能证明页面动作已成功。原生任务省略范围时默认 application。显式 application/desktop 保留系统捕获范围；只有任务确实需要跨应用、Dock 或系统界面时才显式 source=desktop，不能为解决点击失败扩大范围。"
+                       "unshare 是幂等清理，阶段 end 后仍可调用，只释放本连接共享，不结束宿主会话保护，也不为清理启动新连接。activate 会改变前台焦点，不抢焦点任务禁止调用，更不能作为失败兜底。锁屏时共享立即关闭并清除画面。",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -2408,8 +2525,8 @@ TOOLS = [
                 "appHandle": APP_HANDLE_PROP,
                 "windowId": {"type": "integer", "minimum": 1, "maximum": 4294967295},
                 "durationSeconds": {"type": "number", "minimum": 60, "maximum": 3600, "default": 1800},
-                "source": {"type": "string", "enum": ["application", "window", "desktop"], "default": "application",
-                           "description": "不抢焦点的固定窗口任务显式用 window，仅包含指定窗口；application 包含目标应用，后台 Space 时原生端收窄为目标窗口；desktop 包含目标显示器当前桌面，仅用于确有跨应用需要的任务。共享不授权激活、置前或切换 Space；所选范围随动作续租。"},
+                "source": {"type": "string", "enum": ["application", "window", "desktop"],
+                           "description": "window 在后台浏览器和原生任务中均表示系统目标窗口连续视频；网页动作后的绘制脉冲不会替代这个视频流，也不作为成功证据。application 使用系统应用捕获，后台 Space 时原生端收窄为目标窗口；desktop 包含目标显示器当前桌面，仅用于确有跨应用需要的任务。共享不授权激活、置前或切换 Space；显式应用/桌面范围随动作续租。"},
             },
         },
         "handler": tool_windows,
@@ -2630,7 +2747,8 @@ def _bound_windows(task_id):
             for row in rows if isinstance(row, dict) and isinstance(row.get('windowId'), int)]
 
 
-_events_tool = make_browser_events_tool(lambda: TASK_FILE, validate_browser_assignment, check_request_cancelled)
+_events_tool = make_browser_events_tool(lambda: TASK_FILE, validate_browser_assignment, check_request_cancelled,
+                                      preflight_root=task_root)
 _events_handler = _events_tool['handler']
 
 
@@ -2700,6 +2818,8 @@ def _events_dispatch(args):
                 output = str(output) + '\n共享待补: %s: %s' % (exc.code, exc.message)
         return output
     output = _events_handler(args)
+    if isinstance(args, dict) and args.get('action') in ('assign', 'select_tab'):
+        stop_browser_preview()
     if isinstance(args, dict) and args.get('action') == 'assign':
         payload = json.loads(output) if isinstance(output, str) else output
         operation_log('browser.assigned', taskId=args.get('taskId'),
@@ -2716,11 +2836,20 @@ def _events_dispatch(args):
         payload = json.loads(output) if isinstance(output, str) else output
         operation_log("browser.command_queued" if args['action'] == 'command' else "browser.logical_tab_selected",
                       taskId=args.get('taskId'), operation=args.get('operation'),
+                      **({'stage': args['stage']} if args.get('operation') == 'render_probe' and args.get('stage') in RENDER_PROBE_STAGES else {}),
                       commandId=payload.get('commandId'), tabId=payload.get('tabId'),
                       target=diagnostic_fields(payload.get("target", {})), route="background_browser")
     if isinstance(args, dict) and args.get('action') == 'result':
         payload = json.loads(output) if isinstance(output, str) else output
         result = payload.get('result', {}) if isinstance(payload, dict) else {}
+        if payload.get('operation') == 'render_probe' and payload.get('status') == 'ok' and isinstance(result, dict):
+            try:
+                safe = validate_render_probe(result, {'stage': result.get('stage')})
+            except (ValueError, TypeError, KeyError, OverflowError):
+                safe = None
+            if safe is not None:
+                operation_log('browser.render_probe_result', taskId=args.get('taskId'),
+                              commandId=args.get('commandId'), result=safe)
         if payload.get('operation') == 'scroll' and isinstance(result, dict):
             observed = result.get('observed') or {}
             scroll = diagnostic_geometry(observed, ('beforeY', 'afterY', 'maxY', 'expectedY'))
@@ -2745,6 +2874,7 @@ for _tool in TOOLS:
     _tool['description'] += "\n" + RECOVERY_GUIDANCE
 TOOL_MAP = dict((t["name"], t) for t in TOOLS)
 HINTS = {
+    "TASK_ROUTE_MISMATCH": "先 quietbridge_task status 核实本阶段 routing；网页和原生界面是不同阶段，不为故障重试更换通道。",
     "BACKGROUND_ONLY": "继续使用 quietbridge_browser_events 的原任务、原标签；先检查 status，不能改用前台输入或新建窗口。",
     "TARGET_LOST": "原窗口不可用时保留任务状态，显式重新选择；不自动新建 Chrome 窗口。",
     "PERMISSION_DENIED": "请用户通过 QuietBridge 的权限向导授予辅助功能/屏幕录制；暂停操作，不自行打开系统设置抢焦点。",
@@ -2755,7 +2885,7 @@ HINTS = {
     "SHARE_REQUIRED": "界面操作需要共享窗口能力；只读模式可用 quietbridge_situation 检查状态，不能绕过共享派发输入。",
     "UNSAFE_WINDOW_DELIVERY": "缺少绑定窗口的投递确认；使用同窗口已确认的可写 AX 元素或网页扩展通道，不能结束任务、激活窗口或改用应用级键盘绕过。",
     "STALE_SNAPSHOT": "快照已失效：重新 quietbridge_state 后再操作。",
-    "STALE_APP": "应用进程已变化：重新 quietbridge_apps(action=\"get\")。",
+    "STALE_APP": "应用句柄或路径身份未通过核验：最多两次只读 quietbridge_apps(action=\"get\")；仍失败则通知用户，不自动重启或绕过校验。",
     "WINDOW_UNAVAILABLE": "窗口不存在或已关闭：重新 quietbridge_windows。",
     "CAPTURE_BUSY": "上一次屏幕捕获未结束：保留任务等待，重新观察共享就绪状态；不能跳过共享或改为前台输入。",
     "APP_NOT_ALLOWED": "QUIETBRIDGE_ALLOWLIST 拦截：通知用户确认目标访问范围，暂停并等待；不能更换目标绕过。",
@@ -2804,6 +2934,9 @@ def call_tool(name, args):
                                            'not_verified' if last and last.get('verified') is False else 'unknown'},
                           "retry": {"replaySideEffects": False, "guidance": "排队不等于执行；状态未知时先观察或查询既有命令，勿重放副作用。"}}
             error_code = result.pop('errorCode', None)
+            if (not error_code and name == _events_tool['name'] and isinstance(payload, dict) and
+                    payload.get('status') == 'error'):
+                error_code = payload.get('errorCode') or 'BROWSER_COMMAND_FAILED'
             if result.get('isError') and error_code is None:
                 error_code = 'READ_ONLY' if READ_ONLY else 'UNKNOWN_TOOL' if name not in TOOL_MAP else 'BRIDGE_ERROR'
             structured['errorCode'] = error_code
@@ -2911,7 +3044,8 @@ def _call_tool(name, args):
             return {"content": [{"type": "text", "text": "INVALID_ARGUMENT: %s" % exc}], "isError": True, "errorCode": "INVALID_ARGUMENT"}
         message = str(exc)
         code = next((c for c in ("BROWSER_HOST_UNAVAILABLE", "BROWSER_PERMISSION_MISSING", "BROWSER_DISABLED", "BACKGROUND_WAITING", "STALE_SNAPSHOT", "CANDIDATE_REFRESH_TIMEOUT",
-                                "BROWSER_TARGET_CHANGED") if message.startswith(c)), "BROWSER_TARGET_WAITING")
+                                "BROWSER_OBSERVER_NOT_READY", "BROWSER_LIFECYCLE_TIMEOUT", "BROWSER_LIFECYCLE_FAILED",
+                                "BROWSER_TARGET_CHANGED", "STALE_TARGET", "STALE_DOCUMENT") if message.startswith(c)), "BROWSER_TARGET_WAITING")
         return {"content": [{"type": "text", "text": message + "\n保持原任务与标签；等待扩展恢复或重新观察，禁止回落桌面输入。"}],
                 "isError": True, "errorCode": code}
     except Exception as exc:  # noqa: BLE001 - surface anything as a tool error

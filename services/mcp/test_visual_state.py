@@ -112,7 +112,7 @@ class WaitReadyTests(unittest.TestCase):
                         mock.patch.object(server, "READ_ONLY", False),
                         mock.patch.object(server, "ensure_share", return_value=None),
                         mock.patch.object(server.time, "monotonic", side_effect=lambda: self.now),
-                        mock.patch.object(server.threading.Event, "wait", side_effect=self.wait),
+                        mock.patch.object(server.REQUEST_CANCELLED, "wait", side_effect=self.wait),
                         mock.patch.object(server.time, "sleep", side_effect=AssertionError("不得sleep")),
                         mock.patch.object(server.subprocess, "Popen", side_effect=AssertionError("不得启动进程"))):
             patcher.start()

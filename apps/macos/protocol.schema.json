@@ -267,7 +267,14 @@
           "properties": {
             "action": {
               "type": "string",
-              "enum": ["hold", "release", "status", "renew"]
+              "enum": [
+                "hold",
+                "release",
+                "status",
+                "renew",
+                "browserRenew",
+                "browserFrame"
+              ]
             },
             "appHandle": {
               "type": "string",
@@ -278,7 +285,9 @@
               "exclusiveMinimum": 0,
               "maximum": 4294967295
             },
-            "waitForFrame": {"type": "boolean"},
+            "waitForFrame": {
+              "type": "boolean"
+            },
             "durationSeconds": {
               "type": "number",
               "minimum": 60,
@@ -286,11 +295,266 @@
             },
             "source": {
               "type": "string",
-              "enum": ["application", "desktop", "window"]
+              "enum": [
+                "application",
+                "desktop",
+                "window",
+                "browser_content"
+              ]
+            },
+            "leaseId": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128
+            },
+            "documentKey": {
+              "type": "string",
+              "maxLength": 2048
+            },
+            "sequence": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "data": {
+              "type": "string",
+              "maxLength": 180000
+            },
+            "capturedAt": {
+              "type": "number"
             }
           },
-          "required": ["action"],
-          "additionalProperties": false
+          "required": [
+            "action"
+          ],
+          "additionalProperties": false,
+          "oneOf": [
+            {
+              "properties": {
+                "action": {
+                  "const": "hold"
+                }
+              },
+              "required": [
+                "appHandle",
+                "windowId"
+              ],
+              "not": {
+                "anyOf": [
+                  {
+                    "required": [
+                      "documentKey"
+                    ]
+                  },
+                  {
+                    "required": [
+                      "sequence"
+                    ]
+                  },
+                  {
+                    "required": [
+                      "data"
+                    ]
+                  },
+                  {
+                    "required": [
+                      "capturedAt"
+                    ]
+                  }
+                ]
+              },
+              "if": {
+                "properties": {
+                  "source": {
+                    "const": "browser_content"
+                  }
+                },
+                "required": [
+                  "source"
+                ]
+              },
+              "then": {
+                "required": [
+                  "leaseId"
+                ]
+              },
+              "else": {
+                "not": {
+                  "required": [
+                    "leaseId"
+                  ]
+                }
+              }
+            },
+            {
+              "properties": {
+                "action": {
+                  "enum": [
+                    "release",
+                    "status",
+                    "renew"
+                  ]
+                }
+              },
+              "not": {
+                "anyOf": [
+                  {
+                    "required": [
+                      "appHandle"
+                    ]
+                  },
+                  {
+                    "required": [
+                      "windowId"
+                    ]
+                  },
+                  {
+                    "required": [
+                      "waitForFrame"
+                    ]
+                  },
+                  {
+                    "required": [
+                      "durationSeconds"
+                    ]
+                  },
+                  {
+                    "required": [
+                      "source"
+                    ]
+                  },
+                  {
+                    "required": [
+                      "leaseId"
+                    ]
+                  },
+                  {
+                    "required": [
+                      "documentKey"
+                    ]
+                  },
+                  {
+                    "required": [
+                      "sequence"
+                    ]
+                  },
+                  {
+                    "required": [
+                      "data"
+                    ]
+                  },
+                  {
+                    "required": [
+                      "capturedAt"
+                    ]
+                  }
+                ]
+              }
+            },
+            {
+              "properties": {
+                "action": {
+                  "const": "browserRenew"
+                }
+              },
+              "required": [
+                "leaseId",
+                "durationSeconds"
+              ],
+              "not": {
+                "anyOf": [
+                  {
+                    "required": [
+                      "appHandle"
+                    ]
+                  },
+                  {
+                    "required": [
+                      "windowId"
+                    ]
+                  },
+                  {
+                    "required": [
+                      "waitForFrame"
+                    ]
+                  },
+                  {
+                    "required": [
+                      "source"
+                    ]
+                  },
+                  {
+                    "required": [
+                      "documentKey"
+                    ]
+                  },
+                  {
+                    "required": [
+                      "sequence"
+                    ]
+                  },
+                  {
+                    "required": [
+                      "data"
+                    ]
+                  },
+                  {
+                    "required": [
+                      "capturedAt"
+                    ]
+                  }
+                ]
+              }
+            },
+            {
+              "properties": {
+                "action": {
+                  "const": "browserFrame"
+                }
+              },
+              "required": [
+                "leaseId",
+                "documentKey",
+                "sequence"
+              ],
+              "not": {
+                "anyOf": [
+                  {
+                    "required": [
+                      "appHandle"
+                    ]
+                  },
+                  {
+                    "required": [
+                      "windowId"
+                    ]
+                  },
+                  {
+                    "required": [
+                      "waitForFrame"
+                    ]
+                  },
+                  {
+                    "required": [
+                      "durationSeconds"
+                    ]
+                  },
+                  {
+                    "required": [
+                      "source"
+                    ]
+                  }
+                ]
+              },
+              "dependentRequired": {
+                "data": [
+                  "capturedAt"
+                ],
+                "capturedAt": [
+                  "data"
+                ]
+              }
+            }
+          ]
         }
       },
       "required": [

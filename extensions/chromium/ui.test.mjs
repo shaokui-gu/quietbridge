@@ -112,6 +112,39 @@ test('content uses viewport geometry, rechecks moved targets and drops reference
   assert.equal(context.__quietbridgePrepare(bound, action).ok, false);
 });
 
+test('snapshot coverage distinguishes DOM counts and exact interaction truncation', async () => {
+  const nodes = [];
+  const context = {
+    location: { protocol: 'https:', origin: 'https://example.org', pathname: '/' },
+    document: { readyState: 'complete', getElementsByTagName: () => ({ length: 12000 }),
+      querySelectorAll: selector => selector === 'iframe,frame' ? [] : nodes },
+    innerWidth: 1280, innerHeight: 800,
+    getComputedStyle: () => ({ display: 'block', visibility: 'visible', opacity: '1' }),
+    chrome: { runtime: { sendMessage: async () => {} } },
+    addEventListener() {}, removeEventListener() {}, setTimeout() { return 1; }, clearTimeout() {},
+    MutationObserver: class { observe() {} disconnect() {} }
+  };
+  context.document.defaultView = context;
+  context.document.body = { getClientRects: () => [{}] };
+  vm.createContext(context);
+  vm.runInContext(await readFile(new URL('./content.js', import.meta.url), 'utf8'), context);
+  const config = { navigationEpoch: 1, bindingId: 'a'.repeat(32), authorizedOrigin: 'https://example.org', selector: '' };
+  context.__quietbridgeObserver(config);
+  for (const count of [2, 300, 301]) {
+    while (nodes.length < count) nodes.push({ tagName: 'BUTTON', textContent: 'Button',
+      isConnected: true, ownerDocument: context.document, getAttribute: () => null,
+      getClientRects: () => [{}],
+      getBoundingClientRect: () => ({ left: 10, top: 10, right: 30, bottom: 30, width: 20, height: 20 }) });
+    const result = JSON.parse(JSON.stringify(context.__quietbridgeSnapshot(config)));
+    assert.equal(result.elementCount, 10000, 'DOM count is capped independently of interactive elements');
+    assert.equal(result.elements.length, Math.min(count, 300));
+    assert.deepEqual(result.coverage, { returnedElements: Math.min(count, 300), limit: 300,
+      truncated: count > 300, scope: 'visible_interactive_top_and_accessible_frames',
+      elementCountScope: 'top_document_dom_nodes_capped_10000' });
+  }
+  context.__quietbridgeObserverStop();
+});
+
 test('content 采集页面错误与视口，且在未绑定时拒绝诊断', async () => {
   const handlers = {};
   const context = {

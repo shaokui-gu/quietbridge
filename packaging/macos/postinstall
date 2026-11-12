@@ -23,6 +23,6 @@ support='/Library/Application Support/QuietBridge'
 # The PKG owns this immutable helper release. Never run a user-controlled
 # interpreter as root, or point MCP at the menu application's signing identity.
 helper="$(/usr/libexec/PlistBuddy -c 'Print :helper' "$support/installation.plist")"
-/usr/bin/sudo -H -u "$user" "$python" -B "$support/deploy.py" --helper "$helper"
+/usr/bin/sudo -H -u "$user" "$python" -B "$support/deploy.py" --finish-install --helper "$helper"
 # Application launch is a separate, optional component in the native Installer
 # choices. Browser extension setup stays inside the app's control panel.

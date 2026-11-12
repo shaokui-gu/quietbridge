@@ -66,7 +66,7 @@ test('真实 worker 入口：握手、默认无任务、内部派发、隔离、
         async get(id) { return { id, windowId: 2, url: frame.url }; },
         async query(q) { assert.equal(Object.keys(q).length, 0); return [
           { id: 7, windowId: 2, url: frame.url }, { id: 8, windowId: 3, url: 'chrome://settings' }]; } },
-      scripting: { async executeScript(o) { scripts.push(o); } }
+      scripting: { async executeScript(o) { scripts.push(o); return [{ result: true }]; } }
     };
     context = vm.createContext({ chrome, BackgroundBrowser, initialState, reduce, safeUrl, originOf, pause, URL, Date,
       setTimeout(fn, ms) { const id = ++timerId; timers.set(id, { fn, ms }); return id; },
@@ -249,7 +249,7 @@ async function lifecycleHarness() {
     debugger: { onDetach: listener(), async attach() {}, async detach() {}, async sendCommand(target, method) {
       return method === 'Page.getFrameTree' ? { frameTree: { frame: { id: 'initial-frame', url: 'about:blank' } } } : { identifier: 'script-1' };
     } },
-    scripting: { async executeScript() {} },
+    scripting: { async executeScript() { return [{ result: true }]; } },
     alarms: { create() {}, onAlarm: listener() }
   };
   let context;
@@ -285,6 +285,39 @@ async function lifecycleHarness() {
       { id: 'extension', url: 'chrome-extension://extension/popup.html' }, resolve)); }
   };
 }
+
+test('window mapping reads the active tab title without selecting it or changing the assigned background tab', async () => {
+  const h = await lifecycleHarness();
+  h.permission = true;
+  const assignment = { taskId: 'task', token: 'b'.repeat(64), bindingId: 'c'.repeat(32),
+    assignmentVersion: 1, globalOrigins: true, selector: '', tabId: 7, browserWindowId: 2,
+    mappingVerified: false };
+  let active = { id: 8, windowId: 2, url: 'https://example.org/other', title: 'Active document' };
+  const queries = [];
+  h.chrome.tabs.query = async query => { queries.push(query); return [active]; };
+  h.chrome.tabs.update = async () => { assert.fail('metadata must not select or navigate tabs'); };
+  h.chrome.debugger.attach = async () => { assert.fail('metadata must not attach a debugger'); };
+  h.native = async message => message.action === 'sync' ? {
+    ok: true, protocolVersion: 2, heartbeatAt: Date.now() / 1000, taskAssignment: 'assigned', assignment
+  } : { ok: true };
+  await h.send({ action: 'enable' });
+  await h.flush();
+  const poll = async () => { h.chrome.alarms.onAlarm.fn({ name: 'observer-sync' }); await h.flush(); };
+  await poll();
+  let evidence = h.calls.filter(c => c.action === 'sync').at(-1).windowEvidence;
+  assert.equal(evidence.title, 'Active document');
+  assert.equal(evidence.tabId, 8);
+  assert.equal(evidence.bindingId, assignment.bindingId);
+  assert.equal(h.state.tabId, 7);
+  assert.ok(queries.every(q => q.windowId === 2 && q.active === true));
+  for (const changed of [null, { windowId: 3 }, { url: 'chrome://settings/' }, { title: 'bad' + String.fromCharCode(10) + 'title' }]) {
+    active = { id: 8, windowId: 2, url: 'https://example.org/other', title: 'New document', ...changed };
+    await poll();
+    evidence = h.calls.filter(c => c.action === 'sync').at(-1).windowEvidence;
+    if (changed === null) assert.equal(evidence.title, 'New document');
+    else assert.equal(evidence, null);
+  }
+});
 
 test('popup 销毁后仅持久用户意图与完整授权共同触发启用并消费 nonce', async () => {
   const h = await lifecycleHarness();
@@ -576,7 +609,7 @@ test('快照命令绑定已核验文档执行，结果只回传一次', async ()
     if (typeof options.func === 'function' && options.func.toString().includes('__quietbridgeSnapshot')) {
       injections.push(options);
     }
-    return [{ result: snapshot }];
+    return [{ result: options.func?.toString().includes('__quietbridgeObserver') ? true : snapshot }];
   };
   const commandId = 'd'.repeat(32);
   const assignment = { taskId: 'task', token: 'b'.repeat(64), bindingId: 'c'.repeat(32),
@@ -638,7 +671,7 @@ test('动作命令通过 CDP 发给固定标签，DOM 不再直接 click', async
   };
   h.chrome.scripting.executeScript = async o => {
     if (o.func?.toString().includes('__quietbridgePrepare')) return [{ result: { ok: true, x: 10, y: 20 } }];
-    return [{ result: o.args?.[1] === 'drain' ? [] : true }];
+    return [{ result: o.func?.name === 'installPopupGuard' ? 'ready' : o.args?.[1] === 'drain' ? [] : true }];
   };
   const assignment = { taskId: 'task', token: 'b'.repeat(64), bindingId: 'c'.repeat(32),
     assignmentVersion: 1, globalOrigins: true, selector: '', tabId: 7, browserWindowId: 2, mappingVerified: false };
@@ -652,7 +685,7 @@ test('动作命令通过 CDP 发给固定标签，DOM 不再直接 click', async
   };
   await h.send({ action: 'enable' }); await h.flush();
   const pointer = inputs.filter(i => i.method === 'Input.dispatchMouseEvent');
-  assert.deepEqual(pointer.map(i => i.params.type), ['mouseMoved', 'mousePressed', 'mouseReleased']);
+  assert.deepEqual(pointer.map(i => i.params.type), ['mousePressed', 'mouseReleased']);
   assert.ok(pointer.every(i => i.target.tabId === 7 && i.params.x === 10 && i.params.y === 20));
   const report = syncs.find(m => m.commandResult).commandResult;
   assert.equal(report.status, 'ok'); assert.equal(report.result.verified, false);
@@ -663,7 +696,7 @@ test('导航命令走 tabs.update，且不声称已验证', async () => {
   h.permission = true;
   const updates = [];
   h.chrome.tabs.update = async (id, props) => { updates.push({ id, props }); return { id, url: props.url }; };
-  h.chrome.scripting.executeScript = async o => [{ result: o.args?.[1] === 'drain' ? [] : true }];
+  h.chrome.scripting.executeScript = async o => [{ result: o.func?.name === 'installPopupGuard' ? 'ready' : o.args?.[1] === 'drain' ? [] : true }];
   const commandId = 'f1'.repeat(16);
   const assignment = { taskId: 'task', token: 'b'.repeat(64), bindingId: 'c'.repeat(32),
     assignmentVersion: 1, globalOrigins: true, selector: '', tabId: 7, browserWindowId: 2,
@@ -732,7 +765,7 @@ test('诊断命令读取页面错误与视口，不声称已复核动作', async
       injections.push(options);
       return [{ result: diagnostics }];
     }
-    return [{ result: null }];
+    return [{ result: true }];
   };
   const commandId = 'c1'.repeat(16);
   const assignment = { taskId: 'task', token: 'b'.repeat(64), bindingId: 'c'.repeat(32),
@@ -863,4 +896,223 @@ test('native 旧响应跨停用再启用窗口不得接收旧分配或覆盖 syn
   assert.equal(status.state, null);
   assert.equal(status.taskAssignment, 'no_assignment');
   assert.equal(status.nativeConnection.lastError, undefined, '旧分配不得进入 tabs 或注入路径');
+});
+
+test('navigation reconciles missed callbacks before the next observation without changing binding or focus', async () => {
+  const h = await lifecycleHarness();
+  h.permission = true;
+  let frame = { documentId: 'doc-1', url: 'https://example.org/path' };
+  const assignment = { taskId: 'task', token: 'b'.repeat(64), bindingId: 'c'.repeat(32),
+    assignmentVersion: 1, globalOrigins: true, selector: '', tabId: 7, browserWindowId: 2, mappingVerified: false };
+  const updates = [], observed = [], reports = [];
+  let step = 0, navigationPulses = 0;
+  h.chrome.webNavigation.getFrame = async () => frame;
+  h.chrome.tabs.get = async id => ({ id, windowId: 2, url: frame.url });
+  h.chrome.tabs.update = async (id, props) => {
+    updates.push({ id, props });
+    frame = { documentId: 'doc-2', url: props.url }; // Deliberately no webNavigation callback.
+    return { id, windowId: 2, url: frame.url };
+  };
+  const debuggerSend = h.chrome.debugger.sendCommand;
+  h.chrome.debugger.sendCommand = async (...args) => {
+    if (args[1] === 'Page.captureScreenshot') {
+      navigationPulses++;
+      return { data: 'ZmFrZQ==' };
+    }
+    return debuggerSend(...args);
+  };
+  h.chrome.scripting.executeScript = async options => {
+    if (options.func?.toString().includes('__quietbridgeSnapshot')) {
+      observed.push(options.target);
+      return [{ documentId: 'doc-2', result: { snapshotId: 'snap-2' } }];
+    }
+    return [{ result: options.func?.name === 'installPopupGuard' ? 'ready' : options.args?.[1] === 'drain' ? [] : true }];
+  };
+  h.native = async message => {
+    if (message.action === 'event') { assignment.event = structuredClone(message.event); return { ok: true }; }
+    if (message.action !== 'sync') return { ok: true };
+    if (message.commandResult) { reports.push(message.commandResult); step++; }
+    const command = step === 0 ? { requestId: '91'.repeat(16), taskId: 'task', operation: 'navigate',
+      params: { url: 'https://example.org/next' } } : step === 1 ? {
+      requestId: '92'.repeat(16), taskId: 'task', operation: 'snapshot', params: {},
+      documentId: frame.documentId, navigationEpoch: assignment.event.navigationEpoch } : null;
+    return { ok: true, protocolVersion: 2, heartbeatAt: Date.now() / 1000,
+      taskAssignment: 'assigned', assignment, command };
+  };
+  await h.send({ action: 'enable' });
+  await h.flush();
+  assert.deepEqual(updates, [{ id: 7, props: { url: 'https://example.org/next' } }]);
+  assert.equal(h.state.documentId, 'doc-2');
+  assert.equal(h.state.bindingId, assignment.bindingId);
+  assert.equal(h.state.assignmentVersion, 1);
+  assert.equal(navigationPulses, 1, 'the reconciled document gets one discarded render refresh');
+  assert.deepEqual(Array.from(observed[0].documentIds), ['doc-2']);
+  assert.equal(reports.length, 2);
+  assert.ok(reports.every(r => r.status === 'ok'));
+  const events = h.calls.filter(c => c.action === 'event');
+  const boundary = events.findIndex(c => c.event.phase === 'before');
+  assert.ok(boundary >= 0);
+  assert.equal(events[boundary].event.documentId, null);
+  assert.equal(events[boundary + 1].event.documentId, 'doc-2');
+});
+
+test('an outgoing document cannot be recommitted while navigation is pending; original binding recovers later', async () => {
+  const h = await lifecycleHarness();
+  h.permission = true;
+  let frame = { documentId: 'doc-1', url: 'https://example.org/path' };
+  let pendingUrl;
+  const assignment = { taskId: 'task', token: 'b'.repeat(64), bindingId: 'c'.repeat(32),
+    assignmentVersion: 1, globalOrigins: true, selector: '', tabId: 7, browserWindowId: 2, mappingVerified: false };
+  let reported = false;
+  h.chrome.webNavigation.getFrame = async () => frame;
+  h.chrome.tabs.get = async id => ({ id, windowId: 2, url: frame.url, pendingUrl });
+  h.chrome.tabs.update = async (_id, props) => { pendingUrl = props.url; };
+  h.chrome.scripting.executeScript = async options => [{ result: options.func?.name === 'installPopupGuard' ? 'ready' : options.args?.[1] === 'drain' ? [] : true }];
+  h.native = async message => {
+    if (message.action === 'event') { assignment.event = structuredClone(message.event); return { ok: true }; }
+    if (message.action !== 'sync') return { ok: true };
+    if (message.commandResult) reported = true;
+    return { ok: true, protocolVersion: 2, heartbeatAt: Date.now() / 1000, taskAssignment: 'assigned', assignment,
+      command: reported ? null : { requestId: '93'.repeat(16), taskId: 'task', operation: 'navigate',
+        params: { url: 'https://example.org/next' } } };
+  };
+  await h.send({ action: 'enable' });
+  await h.flush();
+  assert.equal(h.state.phase, 'before');
+  assert.equal(h.state.documentId, null);
+  assert.equal(h.state.pending, true);
+  pendingUrl = undefined;
+  frame = { documentId: 'doc-2', url: 'https://example.org/next' };
+  h.chrome.alarms.onAlarm.fn({ name: 'observer-sync' });
+  await h.flush();
+  assert.equal(h.state.documentId, 'doc-2');
+  assert.equal(h.state.pending, false);
+  assert.equal(h.state.bindingId, assignment.bindingId);
+});
+
+test('reconciliation never retargets an already queued command from the old document', async () => {
+  const h = await lifecycleHarness();
+  h.permission = true;
+  const assignment = { taskId: 'task', token: 'b'.repeat(64), bindingId: 'c'.repeat(32),
+    assignmentVersion: 1, globalOrigins: true, selector: '', tabId: 7, browserWindowId: 2, mappingVerified: false };
+  let phase = 'initial', snapshots = 0, report;
+  h.chrome.scripting.executeScript = async options => {
+    if (options.func?.toString().includes('__quietbridgeSnapshot')) snapshots++;
+    return [{ result: true }];
+  };
+  h.native = async message => {
+    if (message.action === 'event') { assignment.event = structuredClone(message.event); return { ok: true }; }
+    if (message.action !== 'sync') return { ok: true };
+    if (message.commandResult) { report = message.commandResult; phase = 'done'; }
+    return { ok: true, protocolVersion: 2, heartbeatAt: Date.now() / 1000, taskAssignment: 'assigned', assignment,
+      command: phase === 'changed' ? { requestId: '94'.repeat(16), taskId: 'task', operation: 'snapshot',
+        documentId: 'doc-1', navigationEpoch: 1 } : null };
+  };
+  await h.send({ action: 'enable' }); await h.flush();
+  phase = 'changed';
+  h.chrome.webNavigation.getFrame = async () => ({ documentId: 'doc-2', url: 'https://example.org/next' });
+  h.chrome.tabs.get = async id => ({ id, windowId: 2, url: 'https://example.org/next' });
+  h.chrome.alarms.onAlarm.fn({ name: 'observer-sync' }); await h.flush();
+  assert.equal(h.state.documentId, 'doc-2');
+  assert.equal(snapshots, 0);
+  assert.equal(report.status, 'error');
+  assert.match(report.error, /STALE_TARGET/);
+});
+
+test('a rejected result is consumed without disconnecting the channel or replaying its command', async () => {
+  const h = await lifecycleHarness(); h.permission = true;
+  const assignment = { taskId: 'task', token: 'b'.repeat(64), bindingId: 'c'.repeat(32),
+    assignmentVersion: 1, globalOrigins: true, selector: '', tabId: 7, browserWindowId: 2, mappingVerified: false };
+  let reports = 0, executions = 0;
+  h.chrome.scripting.executeScript = async options => {
+    if (options.func?.toString().includes('__quietbridgeDiagnostics')) { executions++; return [{ result: { malformed: true } }]; }
+    return [{ result: true }];
+  };
+  h.native = async message => {
+    if (message.action !== 'sync') return { ok: true };
+    if (message.commandResult) reports++;
+    return { ok: true, protocolVersion: 2, heartbeatAt: Date.now() / 1000, taskAssignment: 'assigned', assignment,
+      commandAck: message.commandResult ? { requestId: message.commandResult.requestId, status: 'rejected', code: 'INVALID_BROWSER_RESULT' } : null,
+      command: reports ? null : { requestId: '95'.repeat(16), taskId: 'task', operation: 'diagnostics' } };
+  };
+  await h.send({ action: 'enable' }); await h.flush();
+  h.chrome.alarms.onAlarm.fn({ name: 'observer-sync' }); await h.flush();
+  const status = await h.send({ action: 'status' });
+  assert.equal(status.nativeConnection.status, 'connected');
+  assert.equal(status.nativeConnection.lastActionError, 'INVALID_BROWSER_RESULT');
+  assert.equal(h.state.bindingId, assignment.bindingId);
+  assert.equal(reports, 1);
+  assert.equal(executions, 1);
+});
+
+test('native protocol rejection is distinct from transport failure and still stops observation', async () => {
+  const h = await lifecycleHarness(); h.permission = true;
+  h.native = async () => ({ ok: false, code: 'BROWSER_REQUEST_REJECTED', error: '请求被拒绝' });
+  await h.send({ action: 'enable' }); await h.flush();
+  let status = await h.send({ action: 'status' });
+  assert.equal(status.nativeConnection.status, 'request_rejected');
+  assert.equal(status.nativeConnection.errorCode, 'BROWSER_REQUEST_REJECTED');
+  assert.equal(h.state, null);
+  h.native = async () => { throw new Error('Native host has exited'); };
+  h.chrome.alarms.onAlarm.fn({ name: 'observer-sync' }); await h.flush();
+  status = await h.send({ action: 'status' });
+  assert.equal(status.nativeConnection.status, 'host_unavailable');
+});
+
+test('same-document URL changes and restored documents reconcile epochs without navigation or reassignment', async () => {
+  const h = await lifecycleHarness(); h.permission = true;
+  let frame = { documentId: 'doc-1', url: 'https://example.org/path' };
+  const assignment = { taskId: 'task', token: 'b'.repeat(64), bindingId: 'c'.repeat(32),
+    assignmentVersion: 1, globalOrigins: true, selector: '', tabId: 7, browserWindowId: 2, mappingVerified: false };
+  h.chrome.webNavigation.getFrame = async () => frame;
+  h.chrome.tabs.get = async id => ({ id, windowId: 2, url: frame.url });
+  h.chrome.tabs.update = async () => assert.fail('reconciliation must not navigate or select a tab');
+  h.native = async message => {
+    if (message.action === 'event') { assignment.event = structuredClone(message.event); return { ok: true }; }
+    return message.action === 'sync' ? { ok: true, protocolVersion: 2, heartbeatAt: Date.now() / 1000,
+      taskAssignment: 'assigned', assignment } : { ok: true };
+  };
+  await h.send({ action: 'enable' }); await h.flush();
+  let epoch = h.state.navigationEpoch;
+  for (const next of [{ documentId: 'doc-1', url: 'https://example.org/path?private=fixture' },
+    { documentId: 'doc-2', url: 'https://example.org/other' },
+    { documentId: 'doc-1', url: 'https://example.org/path' }]) {
+    frame = next;
+    h.chrome.alarms.onAlarm.fn({ name: 'observer-sync' }); await h.flush();
+    assert.equal(h.state.documentId, next.documentId);
+    assert.ok(h.state.navigationEpoch > epoch);
+    assert.equal(h.state.bindingId, assignment.bindingId);
+    assert.equal(h.state.assignmentVersion, 1);
+    assert.equal(JSON.stringify((await h.send({ action: 'status' })).state).includes('private=fixture'), false);
+    epoch = h.state.navigationEpoch;
+  }
+});
+
+test('worker uses native window previews and no longer produces screenshot-mailbox frames', async () => {
+  const h = await lifecycleHarness();
+  h.permission = true;
+  const assignment = { taskId: 'task', token: 'b'.repeat(64), bindingId: 'c'.repeat(32),
+    assignmentVersion: 1, globalOrigins: true, selector: '', tabId: 7, browserWindowId: 2, mappingVerified: false };
+  let captures = 0;
+  h.chrome.debugger.sendCommand = async (_target, method) => {
+    if (method === 'Page.getLayoutMetrics') return { cssVisualViewport: { pageX: 0, pageY: 0, clientWidth: 800, clientHeight: 600 } };
+    if (method === 'Page.captureScreenshot') { captures++; return { data: 'ZmFrZQ==' }; }
+    return { identifier: 'script' };
+  };
+  h.native = async message => {
+    if (message.action !== 'sync') return { ok: true };
+    const state = h.state;
+    const previewLease = state ? { ...assignment, documentId: state.documentId,
+      navigationEpoch: state.navigationEpoch, leaseId: 'd'.repeat(32), expiresAt: Date.now() / 1000 + 3 } : null;
+    return { ok: true, protocolVersion: 2, heartbeatAt: Date.now() / 1000,
+      taskAssignment: 'assigned', assignment, previewLease };
+  };
+  await h.send({ action: 'enable' }); await h.flush();
+  const poll = async () => { h.chrome.alarms.onAlarm.fn({ name: 'observer-sync' }); await h.flush(); };
+  await poll();
+  await poll();
+  assert.equal(captures, 0, 'leases from an older native host cannot restart periodic preview captures');
+  assert.equal(h.calls.filter(c => c.previewFrame).length, 0);
+  const syncCalls = h.calls.filter(c => c.action === 'sync' && Array.isArray(c.capabilities));
+  assert.equal(syncCalls.at(-1).capabilities.includes('browser_preview'), false);
 });

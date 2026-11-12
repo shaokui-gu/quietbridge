@@ -22,7 +22,7 @@ enum NativeProtocol {
         "permissionStatus": [],
         "powerGuard": ["action", "durationSeconds", "lockedUse"],
         "pressKey": ["appHandle", "key", "modifiers"],
-        "preview": ["action", "appHandle", "durationSeconds", "source", "waitForFrame", "windowId"],
+        "preview": ["action", "appHandle", "durationSeconds", "source", "waitForFrame", "windowId", "leaseId", "documentKey", "sequence", "data", "capturedAt"],
         "requestPermission": ["permission"],
         "screenshot": ["appHandle", "windowId"],
         "visualState": ["appHandle", "windowId"],
@@ -40,7 +40,7 @@ enum NativeProtocol {
         "paste": ["format": ["html", "text"]],
         "pressKey": ["modifiers": ["command", "control", "fn", "option", "shift"]],
         "powerGuard": ["action": ["hold", "release", "status", "unlock", "unlockInspect", "lockSynthetic"]],
-        "preview": ["action": ["hold", "release", "status", "renew"], "source": ["application", "desktop", "window"]],
+        "preview": ["action": ["hold", "release", "status", "renew", "browserRenew", "browserFrame"], "source": ["application", "desktop", "window", "browser_content"]],
         "requestPermission": ["permission": ["accessibility", "screenRecording"]],
         "selectText": ["selectionType": ["cursor_after", "cursor_before", "text"]],
     ]

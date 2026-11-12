@@ -15,8 +15,16 @@ USER_ACTIONS = {
     'HELPER_BROKEN': ('restart_connector', '原生组件连接已断开。请先确认 QuietBridge 正在运行；若仍无法连接，请在宿主客户端中重启 QuietBridge 连接器，完成后告诉我继续。'),
     'HELPER_TIMEOUT': ('check_connection', '原生组件响应超时。请检查 QuietBridge 是否正常运行；若持续无响应，请重启该连接器，完成后告诉我继续。'),
     'BROWSER_HOST_UNAVAILABLE': ('connect_extension', '请确认浏览器中的 QuietBridge 扩展已启用，并在应用控制面板检查扩展连接，恢复后告诉我继续。'),
+    'BROWSER_REQUEST_REJECTED': ('check_browser_protocol', '原生端已响应但拒绝了请求，不代表进程退出。请检查 QuietBridge 应用和扩展版本、权限及原任务归属；不要反复重连或重放输入。'),
+    'BROWSER_STORAGE_UNAVAILABLE': ('check_browser_storage', '原生端暂时无法访问任务存储。请检查 QuietBridge 应用及本地文件访问状态，恢复后先只读核实原目标。'),
+    'INVALID_BROWSER_RESULT': ('check_browser_result', '扩展回执未通过校验，已作为失败记录，未采信其内容。请核对应用和扩展版本，保留原目标；若涉及输入，先观察已有结果，不能重放。'),
     'BROWSER_PERMISSION_MISSING': ('authorize_extension', '请在 QuietBridge 控制面板开启浏览器能力，并按扩展说明完成授权，完成后告诉我继续。'),
     'BROWSER_DISABLED': ('enable_browser', '请在 QuietBridge 控制面板开启浏览器能力，完成后告诉我继续。'),
+    'POPUP_GUARD_LEGACY': ('refresh_legacy_guard_document', '旧版弹窗守卫残留在原文档中。请通知用户刷新该专用标签一次，以替换旧页面钩子；未执行本次输入，不自动刷新或导航，不停用扩展、不换工具。刷新后核实新文档及原目标，再继续新操作。'),
+    'POPUP_GUARD_CONFLICT': ('inspect_popup_guard_lease', '页面弹窗守卫租约未确认，本次输入未执行。保留原任务和标签，只读核实任务与文档；通知用户确认归属，不强制接管、换工具或重放输入。'),
+    'BROWSER_DEBUGGER_RESTRICTED': ('resolve_extension_conflict', 'Chrome 拒绝该目标的调试访问。请用户检查原页面中的其他扩展注入；保留原任务和标签，不自动停用扩展、更换目标或重放输入。独立受管浏览器不是即用恢复路径：需用户确认新阶段、加载扩展并重新登录，不能复制原 profile 或声称继承原登录态。恢复后先只读观察已有结果。'),
+    'BACKGROUND_COMMAND_TIMEOUT': ('inspect_background_timeout', '页面输入未按时回执，结果未知，不能重放。先用原标签的 snapshot/diagnostics 核实已发生的变化并通知用户；不通过改绑、激活窗口、切换输入通道或反复重连继续点击。'),
+    'TASK_SCOPE_REQUIRED': ('confirm_task_scope', '当前操作超出已绑定阶段的范围。保留原任务和结果，先通知用户确认恢复方式；不能自动结束或改绑。新独立浏览器须在未绑定阶段 prepare/start，再核实返回的真实 PID/窗口并 bind；用户需单独加载扩展及登录。'),
     'EXTENSION_UPGRADE_REQUIRED': ('update_extension', '请在浏览器扩展管理页重新加载或更新 QuietBridge 扩展，完成后告诉我继续。'),
     'READ_ONLY': ('change_read_only', '当前连接仅允许观察。请确认是否要解除只读限制；完成配置并重新连接后告诉我继续。'),
     'APP_NOT_ALLOWED': ('approve_target', '当前目标不在允许列表中。请确认并配置该应用的访问范围，完成后告诉我继续。'),
@@ -29,13 +37,17 @@ USER_ACTIONS = {
     'TARGET_IN_USE': ('select_independent_target', '该窗口或原生应用已被另一会话使用。请用户提供独立目标或等待其完成；不能接管、更换通道或强行并行输入。'),
 }
 WAITING_CODES = {'host_unavailable': 'BROWSER_HOST_UNAVAILABLE',
+                 'browser_channel_starting': 'BROWSER_CHANNEL_STARTING',
+                 'observer_not_ready': 'BROWSER_OBSERVER_NOT_READY',
                  'permission_missing': 'BROWSER_PERMISSION_MISSING',
                  'disabled': 'BROWSER_DISABLED',
                  'extension_upgrade_required': 'EXTENSION_UPGRADE_REQUIRED'}
 REFRESH_CODES = {'STALE_SNAPSHOT', 'STALE_APP', 'REQUIRES_REVALIDATION', 'CONNECTOR_UPDATED',
-                 'BROWSER_TARGET_CHANGED', 'TASK_NOT_BOUND', 'SESSION_WORKER_EXITED', 'NATIVE_WORKER_EXITED'}
+                 'BROWSER_TARGET_CHANGED', 'STALE_TARGET', 'TASK_NOT_BOUND', 'SESSION_WORKER_EXITED', 'NATIVE_WORKER_EXITED'}
 WAIT_CODES = {'CAPTURE_BUSY', 'SHARE_NOT_READY', 'PREVIEW_NOT_READY', 'SHARE_REQUIRED',
-              'CANDIDATE_REFRESH_TIMEOUT', 'BACKGROUND_WAITING', 'SESSION_BUSY'}
+              'BROWSER_CHANNEL_STARTING',
+              'BROWSER_OBSERVER_NOT_READY', 'BROWSER_LIFECYCLE_TIMEOUT', 'BROWSER_LIFECYCLE_FAILED',
+              'CANDIDATE_REFRESH_TIMEOUT', 'BACKGROUND_WAITING', 'BROWSER_OBSERVATION_TIMEOUT', 'SESSION_BUSY'}
 
 
 def policy(code, execution, payload=None):
@@ -71,6 +83,18 @@ def policy(code, execution, payload=None):
     if code == 'TARGET_MISMATCH':
         return dict(common, status='revalidate_required', action='inspect_task_and_original_target', reason=code,
                     message='当前目标与任务绑定不一致，不代表旧任务已失效。只读检查任务状态和原目标；确认需要新任务后才显式 begin，不能自动结束或接管活动任务。')
+    if code == 'TASK_ROUTE_MISMATCH':
+        return dict(common, status='revalidate_required', action='inspect_task_route', reason=code,
+                    message='本阶段的操作对象与请求通道不一致，未派发。先 task status 核实 routing 和原目标；'
+                            '只有实际进入另一种界面时才结束自己的阶段并创建新阶段。扩展故障、权限拒绝或结果未知不能触发原生兜底，不能重放输入。')
+    if code in ('STALE_DOCUMENT', 'STALE_TARGET'):
+        return dict(common, status='revalidate_required', action='inspect_bound_document', reason=code,
+                    maxAutomaticChecks=2, onExhausted='notify_user_and_wait',
+                    message='命令属于旧文档或失效目标，未迁移到新文档。保留原任务和标签，先只读检查当前绑定与文档状态；新文档就绪后重新观察。不要每次导航都 candidates+assign，不猜测其他目标；结果未知的输入不得重放。')
+    if code == 'STALE_APP':
+        return dict(common, status='revalidate_required', action='reobserve_original_target', reason=code,
+                    maxAutomaticChecks=2, onExhausted='notify_user_and_wait',
+                    message='应用句柄或进程路径身份未通过核验，不等于已确认应用升级或退出。最多两次只读重取原应用；仍失败时通知用户并等待，不自动关闭或重启应用、不忽略校验、不切换工具或输入通道。恢复后重新确认原目标与共享，不能重放结果未知的输入。')
     if code in REFRESH_CODES:
         return dict(common, status='revalidate_required', action='reobserve_original_target', reason=code,
                     message='只读重新核实原目标、连接和共享窗口，再显式确认绑定；禁止猜测目标或重复先前输入。')

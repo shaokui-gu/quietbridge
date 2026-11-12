@@ -1,16 +1,19 @@
 // Streams the acted-on window through ScreenCaptureKit into a non-activating video panel.
-// No screenshot polling or synthetic desktop compositing. Anchored to the host application.
+// Browser content uses bounded extension frames; native surfaces use ScreenCaptureKit.
 import AppKit
 import ScreenCaptureKit
 import AVFoundation
 import CoreMedia
+import ImageIO
 
 enum PreviewSource: String {
     case window, application, desktop
+    case browserContent = "browser_content"
 
-    var usesDisplay: Bool { self != .window }
+    var usesDisplay: Bool { self == .application || self == .desktop }
     var scope: String {
         switch self {
+        case .browserContent: "web_content"
         case .window: "window"
         case .application: "application_current_space"
         case .desktop: "display_current_space"
@@ -18,6 +21,7 @@ enum PreviewSource: String {
     }
     var label: String {
         switch self {
+        case .browserContent: "网页内容 · 定时帧（非整窗视频）"
         case .window: "窗口共享"
         case .application: "应用共享"
         case .desktop: "桌面共享"
@@ -40,21 +44,26 @@ private final class VideoSample: @unchecked Sendable {
 }
 
 private final class PreviewStreamOutput: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Sendable {
+    let progress = PreviewFrameProgress()
     let receive: @Sendable (VideoSample) -> Void
-    let failed: @Sendable (String) -> Void
-    init(receive: @escaping @Sendable (VideoSample) -> Void, failed: @escaping @Sendable (String) -> Void) {
+    let failed: @Sendable (any Error) -> Void
+    init(receive: @escaping @Sendable (VideoSample) -> Void, failed: @escaping @Sendable (any Error) -> Void) {
         self.receive = receive; self.failed = failed
     }
     func stream(_ stream: SCStream, didOutputSampleBuffer buffer: CMSampleBuffer, of type: SCStreamOutputType) {
-        guard type == .screen, buffer.isValid, CMSampleBufferGetImageBuffer(buffer) != nil else { return }
+        guard type == .screen else { return }
+        let now = ProcessInfo.processInfo.systemUptime
         let info = CMSampleBufferGetSampleAttachmentsArray(buffer, createIfNecessary: false) as? [[SCStreamFrameInfo: Any]]
+        progress.recordCallback(status: (info?.first?[.status] as? NSNumber)?.intValue, now: now)
+        guard buffer.isValid, let pixels = CMSampleBufferGetImageBuffer(buffer) else { return }
         guard (info?.first?[.status] as? NSNumber)?.intValue == SCFrameStatus.complete.rawValue else { return }
+        progress.sample(pixels, now: now)
         if let attachments = CMSampleBufferGetSampleAttachmentsArray(buffer, createIfNecessary: true) as? [NSMutableDictionary] {
             attachments.first?[kCMSampleAttachmentKey_DisplayImmediately] = true
         }
         receive(VideoSample(buffer))
     }
-    func stream(_ stream: SCStream, didStopWithError error: any Error) { failed(error.localizedDescription) }
+    func stream(_ stream: SCStream, didStopWithError error: any Error) { failed(error) }
 }
 
 @MainActor
@@ -80,8 +89,13 @@ final class SpacePreview {
     fileprivate var target: (pid: Int32, windowID: UInt32)?
     private var canvas: CGRect = CGRect(x: 0, y: 0, width: 2560, height: 1440)
     fileprivate var width: CGFloat = 380
+    private var browserLeaseID: String?
+    private var browserDocumentKey: String?
+    private var browserSequence = 0
     private var stream: SCStream?
     private var streamOutput: PreviewStreamOutput?
+    private var streamLifecycle: PreviewCaptureLifecycle?
+    private var lastCaptureStop: PreviewCaptureLifecycle?
     private var streamConfiguration: SCStreamConfiguration?
     private var preferredFPS: Int32 = 15
     private var cursorState: CursorState?
@@ -94,6 +108,7 @@ final class SpacePreview {
     private var streamStarted = false
     private var streamError: String?
     private var lastFrameTime: TimeInterval?
+    private var nextProgressLog: TimeInterval = 0
     private var frameCount = 0
     private var visible = false
     private var lastActivity: TimeInterval = 0
@@ -163,7 +178,12 @@ final class SpacePreview {
     }
 
     var streamReady: Bool {
-        streamStarted && !streamStarting && streamError == nil && lastFrameTime != nil
+        if source == .browserContent {
+            return isHolding && browserLeaseID != nil && lastFrameTime.map {
+                ProcessInfo.processInfo.systemUptime - $0 < 3
+            } == true && NativePlatform.sessionLocked() == false && CGPreflightScreenCaptureAccess()
+        }
+        return streamStarted && !streamStarting && streamError == nil && lastFrameTime != nil
             && stream != nil && view?.video.status != .failed
             && NativePlatform.sessionLocked() == false && CGPreflightScreenCaptureAccess()
     }
@@ -244,6 +264,12 @@ final class SpacePreview {
         workspaceObserver = nil
         displayObserver = nil
         target = nil
+        browserLeaseID = nil
+        browserDocumentKey = nil
+        browserSequence = 0
+        view?.browserImage.contents = nil
+        view?.browserLabel.isHidden = true
+        view?.video.isHidden = false
         captureSource = nil
         displayID = nil
         waitingForTargetDesktop = false
@@ -251,26 +277,94 @@ final class SpacePreview {
         panelSpaceIDs = []
         panelSpaceVerified = false
         panelPlacementError = nil
-        resetCapture()
+        resetCapture(reason: "release_or_target_change")
         panel?.alphaValue = 0
         panel?.orderOut(nil)
         visible = false
     }
 
     /// Reconfigure capture without changing either the target identity or the preview host.
-    private func resetCapture() {
+    private func resetCapture(reason: String = "reconfigure") {
+        if let stream, let lifecycle = streamLifecycle {
+            requestCaptureStop(stream, output: streamOutput, lifecycle: lifecycle, reason: reason)
+        }
         generation = UUID()
+        nextProgressLog = 0
         streamStarting = false
         streamStarted = false
         streamError = nil
         lastFrameTime = nil
         frameCount = 0
-        if let stream { Task { try? await stream.stopCapture() } }
         stream = nil
         streamOutput = nil
+        streamLifecycle = nil
         streamConfiguration = nil
         view?.video.flushAndRemoveImage()
         view?.mirrorCursor(nil, canvas: canvas)
+    }
+
+    func configureBrowserLease(_ leaseID: String) {
+        guard source == .browserContent, isHolding else { return }
+        browserLeaseID = leaseID
+        browserDocumentKey = nil
+        browserSequence = 0
+        view?.video.isHidden = true
+        view?.browserImage.contents = nil
+        view?.browserLabel.isHidden = false
+        view?.browserLabel.stringValue = "网页内容 · 定时帧（非整窗视频）"
+    }
+
+    func renewBrowserLease(_ leaseID: String, seconds: TimeInterval) throws {
+        guard source == .browserContent, isHolding, browserLeaseID == leaseID else {
+            throw NativeFailure(code: "STALE_TARGET", message: "网页预览租约已失效")
+        }
+        hold(seconds: seconds)
+    }
+
+    func acceptBrowserFrame(leaseID: String, documentKey: String, sequence: Int, data: String?, capturedAt: Double?) throws {
+        guard source == .browserContent, isHolding, browserLeaseID == leaseID,
+              sequence > browserSequence, target != nil,
+              NativePlatform.sessionLocked() == false, CGPreflightScreenCaptureAccess() else {
+            throw NativeFailure(code: "STALE_TARGET", message: "网页预览租约已失效")
+        }
+        browserSequence = sequence
+        if browserDocumentKey != documentKey || data == nil {
+            browserDocumentKey = documentKey
+            lastFrameTime = nil
+            view?.browserImage.contents = nil
+        }
+        guard let data else { return }
+        guard let capturedAt, capturedAt.isFinite,
+              Date().timeIntervalSince1970 - capturedAt >= -0.25,
+              Date().timeIntervalSince1970 - capturedAt <= 3,
+              data.utf8.count <= 180000, let bytes = Data(base64Encoded: data),
+              let imageSource = CGImageSourceCreateWithData(bytes as CFData, nil),
+              CGImageSourceGetType(imageSource) as String? == "public.jpeg",
+              let properties = CGImageSourceCopyPropertiesAtIndex(imageSource, 0, nil) as? [CFString: Any],
+              let width = properties[kCGImagePropertyPixelWidth] as? Int,
+              let height = properties[kCGImagePropertyPixelHeight] as? Int,
+              width > 0, height > 0, width <= 2000, height <= 1500,
+              let image = CGImageSourceCreateImageAtIndex(imageSource, 0, nil) else {
+            throw RequestParameters.invalid("网页预览帧无效或超出限制")
+        }
+        canvas = CGRect(x: 0, y: 0, width: width, height: height)
+        view?.browserImage.contents = image
+        frameCount += 1
+        lastFrameTime = ProcessInfo.processInfo.systemUptime - max(0, Date().timeIntervalSince1970 - capturedAt)
+        view?.status = "网页内容 · 定时帧（非整窗视频）"
+    }
+
+    private func requestCaptureStop(_ stream: SCStream, output: PreviewStreamOutput?,
+                                    lifecycle: PreviewCaptureLifecycle, reason: String) {
+        guard lifecycle.stopRequested(reason: reason) else { return }
+        lastCaptureStop = lifecycle
+        // Keep the old stream/delegate alive until the API returns. Closing the panel stays immediate.
+        Task { @MainActor in
+            await lifecycle.waitForStartCompletion()
+            do { try await stream.stopCapture(); lifecycle.stopCompleted() }
+            catch { lifecycle.stopFailed(error) }
+            withExtendedLifetime(output) {}
+        }
     }
 
     private func clearHold() {
@@ -337,6 +431,11 @@ final class SpacePreview {
             if captureSource?.usesDisplay == true { resetCapture() }
         }
         let membership = spaces.memberships(windowIDs: [target.windowID])[target.windowID]
+        recordStreamProgress(now: now, targetOnCurrentSpace: membership?.onCurrentSpace)
+        if source == .browserContent {
+            captureSource = .browserContent
+            if !streamReady { view?.browserImage.contents = nil }
+        } else {
         switch PreviewCaptureRoute.decide(source: source, targetOnCurrentSpace: membership?.onCurrentSpace) {
         case .capture(let nextSource):
             if captureSource != nextSource || waitingForTargetDesktop { resetCapture() }
@@ -353,6 +452,7 @@ final class SpacePreview {
             let message = "目标桌面不在显示器当前 Space，保留绑定并等待返回"
             streamError = message
             view?.status = message
+        }
         }
         let host = resolveHostWindow()
         let hostMembership = host.flatMap { spaces.memberships(windowIDs: [$0.windowID])[$0.windowID] }
@@ -406,9 +506,13 @@ final class SpacePreview {
         frameCount = 0
         let token = generation
         guard let source = captureSource else { streamStarting = false; return }
+        let lifecycle = PreviewCaptureLifecycle(generation: token, windowID: windowID, source: source.rawValue)
+        streamLifecycle = lifecycle
         let wantedDisplay = displayID
         view?.status = "正在连接\(source.label)…"
         Task { @MainActor in
+            var createdStream: SCStream?
+            var createdOutput: PreviewStreamOutput?
             do {
                 let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: false)
                 guard generation == token else { return }
@@ -454,29 +558,38 @@ final class SpacePreview {
                         guard let owner = self else { return }
                         guard owner.generation == token, let view = owner.view else { return }
                         if view.video.status == .failed { view.video.flush() }
-                        if view.video.isReadyForMoreMediaData { view.video.enqueue(sample.buffer) }
+                        let accepted = view.video.isReadyForMoreMediaData
+                        if accepted { view.video.enqueue(sample.buffer) }
+                        owner.streamOutput?.progress.recordSubmission(accepted: accepted, now: ProcessInfo.processInfo.systemUptime)
                         owner.frameCount += 1
                         owner.lastFrameTime = ProcessInfo.processInfo.systemUptime
                         view.status = "quietbridge · \(source.label)"
                     }
-                }, failed: { [weak self] message in
+                }, failed: { [weak self] error in
                     Task { @MainActor [weak self] in
+                        lifecycle.delegateStopped(error)
                         guard let owner = self, owner.generation == token else { return }
                         owner.streamStarted = false
                         owner.streamStarting = false
-                        owner.streamError = message
+                        owner.streamError = error.localizedDescription
                         owner.lastFrameTime = nil
-                        owner.view?.status = "共享已中断：\(message)"
+                        owner.view?.status = "共享已中断：\(error.localizedDescription)"
                         owner.view?.video.flushAndRemoveImage()
                     }
                 })
                 let next = SCStream(filter: filter, configuration: config, delegate: output)
+                createdStream = next; createdOutput = output
                 try next.addStreamOutput(output, type: .screen, sampleHandlerQueue: DispatchQueue(label: "quietbridge.preview.video"))
                 stream = next
                 streamConfiguration = config
                 streamOutput = output
+                lifecycle.startRequested()
                 try await next.startCapture()
-                guard generation == token else { try? await next.stopCapture(); return }
+                lifecycle.startCompleted()
+                guard generation == token else {
+                    requestCaptureStop(next, output: output, lifecycle: lifecycle, reason: "superseded_start")
+                    return
+                }
                 streamStarting = false
                 streamStarted = streamError == nil
                 if let panel {
@@ -485,14 +598,18 @@ final class SpacePreview {
                     if let hostWindow { _ = syncAnchor(panel: panel, host: hostWindow) }
                 }
             } catch {
+                lifecycle.startFailed(error)
+                if let createdStream {
+                    requestCaptureStop(createdStream, output: createdOutput, lifecycle: lifecycle, reason: "start_failed")
+                }
                 guard generation == token else { return }
                 streamStarting = false
                 streamStarted = false
                 streamError = (error as? NativeFailure)?.message ?? error.localizedDescription
                 lastFrameTime = nil
-                if let stream { Task { try? await stream.stopCapture() } }
                 stream = nil
                 streamOutput = nil
+                streamLifecycle = nil
                 view?.status = "无法共享：\(streamError ?? "未知错误")"
                 Self.debug("stream failed: \(error)")
             }
@@ -646,7 +763,7 @@ final class SpacePreview {
         let hostMembership = hostWindow.flatMap { spaces.memberships(windowIDs: [$0.windowID])[$0.windowID] }
         let panelMembership = panel.flatMap { UInt32(exactly: $0.windowNumber) }
             .flatMap { spaces.memberships(windowIDs: [$0])[$0] }
-        return ["videoFrames": frameCount, "visible": visible && panelMembership?.onCurrentSpace == true, "status": view?.status ?? "",
+        var result: [String: Any] = ["videoFrames": frameCount, "visible": visible && panelMembership?.onCurrentSpace == true, "status": view?.status ?? "",
          "streamGeneration": generation.uuidString, "preferredFPS": Int(preferredFPS),
          "scope": captureSource?.scope ?? source.scope,
          "targetOnCurrentSpace": membership?.onCurrentSpace as Any? ?? NSNull(),
@@ -672,6 +789,28 @@ final class SpacePreview {
          "panelSpaceVerified": panelSpaceVerified,
          "panelPlacementError": panelPlacementError as Any? ?? NSNull(),
          "trackingWindowId": target.map { Int($0.windowID) } ?? 0]
+        result["frameProgress"] = streamOutput?.progress.snapshot(now: now) ?? PreviewFrameProgress().snapshot(now: now)
+        if let streamLifecycle { result["captureLifecycle"] = streamLifecycle.snapshot() }
+        if let lastCaptureStop { result["captureStop"] = lastCaptureStop.snapshot() }
+        return result
+    }
+
+    private func recordStreamProgress(now: TimeInterval, targetOnCurrentSpace: Bool?) {
+        guard stream != nil, let output = streamOutput, now >= nextProgressLog else { return }
+        nextProgressLog = now + 5
+        // Only counters, ages and fixed format/range metadata; no image, fingerprint,
+        // page title, URL, user input or raw platform error is logged.
+        guard let data = try? JSONSerialization.data(withJSONObject: output.progress.snapshot(now: now)),
+              let progress = try? JSONDecoder().decode(JSONValue.self, from: data) else { return }
+        panelTrace.mark("preview.streamProgress", fields: [
+            "trackingWindowId": target.map { .number(Double($0.windowID)) } ?? .null,
+            "streamGeneration": .string(generation.uuidString),
+            "targetOnCurrentSpace": targetOnCurrentSpace.map(JSONValue.bool) ?? .null,
+            "panelVisible": .bool(visible),
+            "videoLayerReady": .bool(view?.video.isReadyForMoreMediaData ?? false),
+            "videoLayerFailed": .bool(view?.video.status == .failed),
+            "frameProgress": progress,
+        ])
     }
 
     /// Person clicked the panel's close control: end sharing immediately.
@@ -972,6 +1111,8 @@ final class PreviewView: NSView {
     static let cornerRadius: CGFloat = 12
     weak var delegate: SpacePreview?
     let video = AVSampleBufferDisplayLayer()
+    let browserImage = CALayer()
+    let browserLabel = NSTextField(labelWithString: "网页内容 · 定时帧（非整窗视频）")
     private let pointerView = AgentCursorView(frame: CGRect(x: 0, y: 0, width: 80, height: 80))
     private var pointerPosition: CGPoint?
     private var cursorCanvas: CGRect = .zero
@@ -1066,6 +1207,17 @@ final class PreviewView: NSView {
         video.masksToBounds = true
         video.actions = ["position": NSNull(), "bounds": NSNull()]
         surface.layer?.addSublayer(video)
+        browserImage.contentsGravity = .resizeAspect
+        browserImage.masksToBounds = true
+        browserImage.cornerRadius = Self.cornerRadius
+        browserImage.actions = ["contents": NSNull(), "bounds": NSNull(), "position": NSNull()]
+        surface.layer?.addSublayer(browserImage)
+        browserLabel.font = .systemFont(ofSize: 10)
+        browserLabel.textColor = .white
+        browserLabel.backgroundColor = NSColor.black.withAlphaComponent(0.7)
+        browserLabel.drawsBackground = true
+        browserLabel.isHidden = true
+        surface.addSubview(browserLabel)
         grip.fillColor = nil
         grip.strokeColor = NSColor.white.withAlphaComponent(0.85).cgColor
         grip.lineWidth = 1.5
@@ -1109,6 +1261,9 @@ final class PreviewView: NSView {
         CATransaction.begin()
         CATransaction.setDisableActions(true)
         video.frame = surface.bounds
+        browserImage.frame = surface.bounds
+        browserLabel.frame = CGRect(x: 8, y: max(8, surface.bounds.height - 28),
+                                    width: min(260, max(0, surface.bounds.width - 54)), height: 18)
         grip.frame = surface.bounds
         let handle = CGMutablePath()
         handle.move(to: CGPoint(x: 8, y: 20)); handle.addLine(to: CGPoint(x: 8, y: 8)); handle.addLine(to: CGPoint(x: 20, y: 8))

@@ -8,7 +8,7 @@ env CLANG_MODULE_CACHE_PATH=/private/tmp/quietbridge-ui-module-cache \
     swift build --package-path apps/macos --configuration release --disable-sandbox
 make -C system/authorization-plugin all \
   PROVISIONING_PROFILE="$PWD/sign/QuietBridgeAuthp.provisionprofile"
-python3 packaging/macos/build.py --version 0.6.0 --build 83 \
+python3 packaging/macos/build.py --version 0.6.18 --build 101 \
   --identity 'Developer ID Application: shaokui gu (62RNP54C47)' --profiles-dir sign
 ```
 
@@ -32,6 +32,33 @@ the exact known old/new identifier and developer team before allowing replacemen
 at the fixed path. The launchd job key remains `com.workbuddy.cua.menubar` so an
 upgrade can stop and restore the existing job without creating a second one;
 it is a storage key, not the new app's signing identity.
+
+From 0.6.8, `preinstall` stops the signed menu application before PackageKit may
+rename or replace payload files. It runs all read-only environment, configuration
+and installed-signature checks first. Process discovery includes a Finder launch
+or first-run wizard that has not opened the status port yet. Shutdown waits for
+the verified menu processes to disappear; a timeout aborts payload replacement.
+Workbuddy, Chrome, other target applications and foreign port owners are not
+terminated. The installer never force-kills the menu process.
+
+An owner-only `upgrade-state.json` under the existing user runtime records the
+package version/build and original running state. When the menu was running,
+preinstall also saves a signed independent old app and a recovery LaunchAgent
+configuration. Postinstall requires this matching receipt and uses its original
+state when deciding whether to launch the verified new version. A deployment or
+new-version startup failure restores user files before resuming the saved old
+menu copy; external file edits are preserved and reported as recovery conflicts.
+
+PackageKit may fail or be cancelled before postinstall runs. There is no reliable
+failure callback for that gap, so the installer does not guess a recovery timeout.
+Preinstall publishes a self-contained recovery entry before stopping the app:
+`<user-runtime>/upgrade-recovery/<installation-id>/恢复安装.command`. The exact path
+is printed in the preparation log and on a subsequent preflight failure. It works
+even if the new system support scripts were never installed. An unfinished receipt
+blocks another installation until recovered. The packaged recovery command handles
+the same receipt once the new support scripts have been copied. A durable committed
+deployment is finalized rather than rolled back if only its last receipt write
+was interrupted. Recovery does not restore root-owned PackageKit payloads.
 
 The user-visible bundle is installed as `/Applications/QuietBridge.app`. During
 an upgrade, preinstall recognizes `Workbuddy CUA.app` and `workbuddy-cua.app`,

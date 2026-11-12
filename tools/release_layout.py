@@ -9,7 +9,7 @@ def bridge_sources(root):
     files = {Path(name): core / name for name in (
         'server.py', 'browser_events.py', 'recovery.py', 'connector.py',
         'task_lifecycle.py', 'stdio_transport.py', 'lifecycle_store.py', 'compatibility.py',
-        'session_routing.py', 'session_registry.py',
+        'session_routing.py', 'session_registry.py', 'preview_metadata.py', 'browser_preview.py',
         'assets/logo-64.png')}
     for path in sorted((root / 'adapters').rglob('*.py')):
         if '__pycache__' not in path.parts and not any(part.startswith('test') for part in path.relative_to(root / 'adapters').parts):

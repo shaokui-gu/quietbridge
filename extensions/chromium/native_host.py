@@ -2,6 +2,7 @@
 """原生端口多请求 framing；标准输出只承载协议，不操作浏览器。"""
 import json
 from pathlib import Path
+import re
 import struct
 import sys
 
@@ -65,8 +66,22 @@ def serve(source, target, origin, config, **paths):
             return
         try:
             result = dispatch(message, origin, origins, **paths)
-        except (ValueError, OSError, UnicodeError, TypeError, KeyError):
-            result = {'ok': False, 'error': '请求被拒绝：请检查任务分配、权限、数据格式及本地文件状态'}
+        except (ValueError, OSError, UnicodeError, TypeError, KeyError) as error:
+            code = 'BROWSER_STORAGE_UNAVAILABLE' if isinstance(error, OSError) else 'BROWSER_REQUEST_REJECTED'
+            # Never echo arbitrary exception text: it may contain page content,
+            # URLs or local paths. These fields are sufficient to correlate a
+            # transport-successful rejection without misreporting a host crash.
+            detail = {'event': 'browser_native_rejected', 'code': code, 'errorType': type(error).__name__}
+            if type(message) is dict:
+                if message.get('action') in ('sync', 'event', 'ping', 'pause', 'unbind', 'status', 'channels'):
+                    detail['action'] = message['action']
+                reply = message.get('commandResult')
+                if type(reply) is dict and type(reply.get('requestId')) is str and re.fullmatch('[a-f0-9]{32}', reply['requestId']):
+                    detail['commandId'] = reply['requestId']
+            print(json.dumps(detail), file=sys.stderr)
+            result = {'ok': False, 'code': code,
+                      'error': '本地存储暂不可用，请通知用户检查应用状态' if code == 'BROWSER_STORAGE_UNAVAILABLE' else
+                               '本地请求被拒绝，未接受该证据；请检查任务分配、权限及协议版本'}
         write_message(target, result)
 
 

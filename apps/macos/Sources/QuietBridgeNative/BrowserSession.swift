@@ -18,12 +18,17 @@ struct BrowserSessionPlan: Sendable {
             "profile": .string(profile), "pid": .null, "processIdentity": .null,
             "running": .bool(false), "windows": .array([]), "dispatched": .bool(false), "error": .null,
             "launchSupported": .bool(true), "scope": .string("connection"),
+            "setup": .object([
+                "profileIsolated": .bool(true), "inheritsLogin": .bool(false),
+                "extensionAutoLoaded": .bool(false), "browserChannelReady": .bool(false),
+                "nextAction": .string("用户在新 profile 加载 QuietBridge Browser、授权站点并登录；list 核实本会话 PID/窗口后显式绑定，不选择其他 Chrome 窗口。"),
+            ]),
             "configuration": .object([
                 "applicationPath": .string(Self.applicationPath), "activates": .bool(false),
                 "createsNewApplicationInstance": .bool(true), "arguments": .array(arguments.map(JSONValue.string)),
             ]),
             "pendingConfirmation": .array([.string("start 需要 sessionId 和显式 confirm=true；prepare 不授予授权。")]),
-            "limitations": .array([.string("不保证 Chrome 不抢焦点，不指定或切换 Space；prepare 不创建目录或启动进程。")]),
+            "limitations": .array([.string("请求不激活，但不保证 Chrome 启动不会改变焦点；不指定或切换 Space。prepare 不创建目录或启动进程。独立 profile 不继承扩展和登录态；会话启动不等于网页通道已就绪。")]),
         ])
     }
 }
@@ -49,6 +54,7 @@ struct BrowserSessionPlan: Sendable {
     var windows: () -> [WindowInfo] = { NativePlatform.windows() }
     var runningBundle: (Int32) -> (identifier: String?, url: URL?) = ApplicationAuthorization.runningBundle
     var executablePath: (Int32) throws -> String = { try NativePlatform.executablePathResult($0).get() }
+    var verifyCloneSignature: (ProcessIdentity) throws -> Void = ApplicationExecutableIdentity.verifyChromeSignature
     var existingPIDs: () throws -> Set<Int32> = {
         let count = proc_listallpids(nil, 0)
         guard count > 0 else { throw NativeFailure(code: "NATIVE_ERROR", message: "无法获取启动前进程列表") }
@@ -270,9 +276,15 @@ enum BrowserSessionPaths {
         guard app.bundleID == "com.google.Chrome", app.path == BrowserSessionPlan.applicationPath,
               app.executablePath == BrowserSessionPlan.executablePath,
               bundle.identifier == "com.google.Chrome",
-              bundle.url?.resolvingSymlinksInPath().path == app.path,
-              URL(fileURLWithPath: path).resolvingSymlinksInPath().path == app.executablePath else {
+              bundle.url?.resolvingSymlinksInPath().path == app.path else {
             throw NativeFailure(code: "BROWSER_PROCESS_MISMATCH", message: "绑定目标必须是固定真实路径的 Google Chrome 主进程")
+        }
+        do {
+            _ = try ApplicationExecutableIdentity.resolve(identity, observedPath: path, expectedPath: app.executablePath,
+                bundleIdentifier: bundle.identifier, bundleURL: bundle.url,
+                verifyProcess: dependencies.verify, verifySignature: dependencies.verifyCloneSignature)
+        } catch let error as NativeFailure where error.code == "STALE_APP" {
+            throw NativeFailure(code: "BROWSER_PROCESS_MISMATCH", message: "无法核验固定安装路径对应的 Chrome 进程；代码克隆需要有效的运行进程与安装签名，不会改绑其他浏览器")
         }
         try dependencies.verify(identity)
     }

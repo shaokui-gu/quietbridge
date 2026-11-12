@@ -172,7 +172,23 @@ class TaskWindowTests(unittest.TestCase):
             self.assertEqual(server.ensure_background_preview('a', 7), server.current_connection())
         params = self.fake.request.call_args.args[1]
         self.assertIs(params['waitForFrame'], False)
-        self.assertEqual(params['source'], 'window')
+        self.assertEqual(params['source'], 'application')
+
+    def test_browser_page_commands_preserve_explicit_system_share_scope(self):
+        for source in ('application', 'desktop'):
+            with self.subTest(source=source):
+                server.SHARE_SELECTION = dict(appHandle='a', windowId=7,
+                                              connection=server.current_connection(), source=source)
+                with mock.patch.object(server, 'request_share', return_value=(server.current_connection(),
+                            {'streamReady': True, 'targetOnCurrentSpace': True})) as share:
+                    server.ensure_background_preview('a', 7)
+                self.assertEqual(share.call_args.args[2], source)
+
+    def test_share_without_source_can_choose_browser_content(self):
+        self.bind()
+        reply = server.tool_windows(dict(action='share', appHandle='a', windowId=7))
+        self.assertIn(server.SHARE_RECORD['source'], ('application', 'window'))
+        self.assertNotIn('定时帧', reply)
 
     def error(self, code, name="quietbridge_task", **args):
         result = self.rpc(name, **args)
@@ -343,7 +359,7 @@ class TaskWindowTests(unittest.TestCase):
             for name in ("quietbridge_click", "quietbridge_hover", "quietbridge_set_value"):
                 self.error("TARGET_MISMATCH", name, elementIndex=1, value="x")
         self.state.update(snapshot="snap-1", snapshot_app="a", snapshot_window=7)
-        self.error("TARGET_MISMATCH", "quietbridge_scroll", windowId=7, snapshotId="unknown")
+        self.error("STALE_SNAPSHOT", "quietbridge_scroll", windowId=7, snapshotId="unknown")
         for name in ("quietbridge_click", "quietbridge_hover", "quietbridge_set_value"):
             result = self.rpc(name, elementIndex=1, value="x")
             self.assertFalse(result.get("isError"), result)
@@ -358,6 +374,20 @@ class TaskWindowTests(unittest.TestCase):
         self.error("TASK_SCOPE_REQUIRED", "quietbridge_apps", action="launch")
         self.assertFalse(any(c.args[0] in ("typeText", "paste", "pressKey", "activate", "launchApp")
                              for c in self.fake.request.call_args_list))
+
+    def test_browser_preparation_is_allowed_before_binding_but_never_migrates_a_bound_task(self):
+        task = self.payload(action="begin", interactionMode="background_browser")
+        valid = {"action": "start", "sessionId": "12345678-1234-1234-1234-123456789ABC", "confirm": True}
+        with mock.patch.object(server, "tool_browser_session", return_value={"content": [{"type": "text", "text": "{}"}]}):
+            args, context = server.task_guard("quietbridge_browser_session", valid)
+            self.assertEqual(args, valid)
+            self.assertIsNone(context)
+        self.payload(action="bind", taskId=task["taskId"], appHandle="a", windowId=7, confirm=True)
+        for action in ("prepare", "list"):
+            self.assertEqual(server.task_guard("quietbridge_browser_session", {"action": action})[0], {"action": action})
+        self.fake.request.reset_mock()
+        self.error("TASK_SCOPE_REQUIRED", "quietbridge_browser_session", **valid)
+        self.fake.request.assert_not_called()
 
     def test_wrong_observation_never_updates_snapshot(self):
         self.bind()
@@ -461,12 +491,50 @@ class TaskWindowTests(unittest.TestCase):
         situation = result["structuredContent"]["situation"]
         self.assertEqual(situation["target"], {"appHandle": "a", "windowId": 7, "isOnScreen": True})
         self.assertEqual(situation["ax"]["truncated"], "unknown")
+        readable = json.loads(self.text(result).split("\n", 1)[1])
+        self.assertEqual(readable, situation)
+        self.assertEqual(readable["ax"]["tree"], "- AXWindow")
+        self.assertFalse(readable["preview"]["holding"])
         self.assertFalse(any(c.args[0] in ("screenshot", "visualState") or
                              (c.args[0] == "preview" and c.args[1].get("action") != "status")
                              for c in self.fake.request.call_args_list))
         state = next(c.args[1] for c in self.fake.request.call_args_list if c.args[0] == "getState")
         self.assertEqual((state["maxElements"], state["maxDepth"]), (50, 6))
         self.error("TARGET_REQUIRED", "quietbridge_situation", appHandle="a")
+
+    def test_situation_text_and_structured_ax_are_bounded_identically(self):
+        original = self.request
+        def request(method, params=None, **kwargs):
+            result = original(method, params, **kwargs)
+            if method == "getState":
+                result["tree"] = "x" * (server.MAX_TREE_CHARS + 1)
+            return result
+        self.fake.request.side_effect = request
+        result = self.rpc("quietbridge_situation", appHandle="a", windowId=7)
+        situation = result["structuredContent"]["situation"]
+        self.assertEqual(json.loads(self.text(result).split("\n", 1)[1]), situation)
+        self.assertEqual(len(situation["ax"]["tree"]), server.MAX_TREE_CHARS)
+        self.assertTrue(situation["ax"]["truncated"])
+
+    def test_empty_ax_tree_uses_explicit_visibility_without_activating(self):
+        original = self.request
+        def request(method, params=None, **kwargs):
+            result = original(method, params, **kwargs)
+            if method == "getState":
+                result["tree"] = ""
+            return result
+        self.fake.request.side_effect = request
+        for visibility in (True, False, None):
+            with self.subTest(visibility=visibility):
+                self.windows = [{"windowId": 7, "pid": 88}]
+                if visibility is not None:
+                    self.windows[0]["isOnScreen"] = visibility
+                self.fake.request.reset_mock()
+                result = server.tool_state({"appHandle": "a", "windowId": 7})
+                self.assertIn("(空)", result)
+                self.assertEqual("isOnScreen=false" in result, visibility is False)
+                self.assertFalse(any(c.args[0] in ("activate", "screenshot", "visualState", "preview")
+                                     for c in self.fake.request.call_args_list))
 
     def test_page_input_requires_bound_share_but_observe_does_not(self):
         bound = self.bind()
@@ -585,6 +653,71 @@ class TaskWindowTests(unittest.TestCase):
         previews = [c.args for c in self.fake.request.call_args_list if c.args[0] == "preview"]
         self.assertEqual(previews[-1], ("preview", {"action": "release"}))
 
+    def test_unshare_after_phase_end_releases_only_preview_and_preserves_host_protection(self):
+        bound = self.bind()
+        ended = self.payload(action='end', taskId=bound['taskId'], confirm=True)
+        self.assertEqual(ended['previewCleanup'], {'status': 'released', 'holding': False,
+                                                  'visible': False, 'streamReady': False})
+        self.assertTrue(server.POWER_GUARD['active'])
+        self.fake.request.reset_mock()
+        result = self.rpc('quietbridge_windows', action='unshare')
+        self.assertFalse(result.get('isError'), self.text(result))
+        self.assertIn('holding=False', self.text(result))
+        self.fake.request.assert_called_once()
+        self.assertEqual(self.fake.request.call_args.args, ('preview', {'action': 'release'}))
+        self.assertTrue(server.POWER_GUARD['active'])
+
+    def test_phase_end_does_not_equate_panel_release_with_capture_stop_confirmation(self):
+        for state in ('requested', 'failed', 'completed'):
+            with self.subTest(stopState=state):
+                original = self.request
+                def request(method, params=None, **kwargs):
+                    if method == 'preview' and params == {'action': 'release'}:
+                        return {'preview': {'holding': False, 'visible': False, 'streamReady': False,
+                                'captureStop': {'streamGeneration': 'old-stream', 'trackingWindowId': 7,
+                                                'stopState': state, 'stopConfirmed': True,
+                                                'message': 'private-content'}}}
+                    return original(method, params, **kwargs)
+                self.fake.request.side_effect = request
+                task = self.payload(action="begin", interactionMode="desktop")
+                self.acknowledge(task)
+                bound = self.payload(action="bind", taskId=task["taskId"], appHandle="a", windowId=7, confirm=True)
+                ended = self.payload(action='end', taskId=bound['taskId'], confirm=True)
+                cleanup = ended['previewCleanup']
+                self.assertEqual(cleanup['status'], 'released')
+                self.assertEqual(cleanup['captureStop']['stopState'], state)
+                self.assertEqual(cleanup['captureStop']['stopConfirmed'], state == 'completed')
+                self.assertNotIn('private-content', json.dumps(cleanup))
+
+    def test_unshare_with_closed_native_connection_never_restarts_helper(self):
+        bound = self.bind()
+        self.payload(action='end', taskId=bound['taskId'], confirm=True)
+        self.fake.request.reset_mock()
+        self.fake._alive.return_value = False
+        result = self.rpc('quietbridge_windows', action='unshare')
+        self.assertFalse(result.get('isError'), self.text(result))
+        self.assertIn('nativeConnection=closed', self.text(result))
+        self.fake.request.assert_not_called()
+
+    def test_phase_end_reports_preview_release_failure_without_claiming_success(self):
+        bound = self.bind()
+        def fail_preview(method, params=None, **kwargs):
+            if method == 'preview':
+                raise server.HelperError('BRIDGE_TIMEOUT', 'synthetic release timeout')
+            return self.request(method, params, **kwargs)
+        self.fake.request.side_effect = fail_preview
+        ended = self.payload(action='end', taskId=bound['taskId'], confirm=True)
+        self.assertEqual(ended['state'], 'ended')
+        self.assertEqual(ended['previewCleanup'], {'status': 'failed', 'errorCode': 'BRIDGE_TIMEOUT'})
+        self.assertTrue(server.POWER_GUARD['active'])
+
+    def test_replaced_snapshot_is_stale_without_changing_task_binding(self):
+        bound = self.bind()
+        self.state.update(snapshot='snap-new', snapshot_app='a', snapshot_window=7)
+        result = self.rpc('quietbridge_click', appHandle='a', snapshotId='snap-old', elementIndex=1)
+        self.assertEqual(result['structuredContent']['errorCode'], 'STALE_SNAPSHOT')
+        self.assertEqual(self.payload(action='status')['taskId'], bound['taskId'])
+
     def test_share_can_cover_the_whole_desktop(self):
         self.bind()
         result = self.rpc("quietbridge_windows", action="share", appHandle="a", windowId=7, source="desktop")
@@ -658,10 +791,12 @@ class TaskWindowTests(unittest.TestCase):
                 server.ensure_share("a", 7, source="application")
         self.assertEqual(server.SHARE_SELECTION["source"], "application")
 
-    def test_share_schema_describes_application_default_and_desktop_for_cross_app(self):
+    def test_share_schema_describes_surface_default_and_desktop_for_cross_app(self):
         tool = server.TOOL_MAP["quietbridge_windows"]
         source = tool["inputSchema"]["properties"]["source"]
-        self.assertEqual(source["default"], "application")
+        self.assertNotIn('default', source)
+        self.assertIn('连续视频', tool['description'])
+        self.assertIn('绘制脉冲', tool['description'])
         self.assertEqual(set(source["enum"]), {"application", "desktop", "window"})
         self.assertIn("跨应用", tool["description"])
 
@@ -859,7 +994,7 @@ class TaskWindowTests(unittest.TestCase):
             now[0] += seconds
         self.fake.request.side_effect = read
         with mock.patch.object(server.time, "monotonic", side_effect=lambda: now[0]), \
-                mock.patch.object(server.threading.Event, "wait", side_effect=wait):
+                mock.patch.object(server.REQUEST_CANCELLED, "wait", side_effect=wait):
             result = self.rpc("quietbridge_wait_ready", windowId=7, timeoutSeconds=5, intervalSeconds=1)
         self.assertFalse(result.get("isError"), result)
         self.assertTrue(json.loads(self.text(result).split("\n")[0])["ready"])
@@ -886,7 +1021,7 @@ class TaskWindowTests(unittest.TestCase):
             now[0] += seconds
             self.fake.connection_id = "changed-during-wait"
         with mock.patch.object(server.time, "monotonic", side_effect=lambda: now[0]), \
-                mock.patch.object(server.threading.Event, "wait", side_effect=wait):
+                mock.patch.object(server.REQUEST_CANCELLED, "wait", side_effect=wait):
             self.error("REQUIRES_REVALIDATION", "quietbridge_wait_ready", windowId=7, timeoutSeconds=5, intervalSeconds=1)
         self.assertEqual(sum(c.args[0] == "getState" for c in self.fake.request.call_args_list), 1)
 

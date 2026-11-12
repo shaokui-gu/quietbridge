@@ -217,7 +217,7 @@ def main():
     shutil.copy2(ROOT / "services/mcp/browser_events.py", extension_stage / "browser_events.py")
     for destination in (extension, extension_stage):
         shutil.copy2(ROOT / 'services/mcp/compatibility.py', destination / 'compatibility.py')
-        for module in ('session_registry.py', 'lifecycle_store.py'):
+        for module in ('session_registry.py', 'lifecycle_store.py', 'browser_preview.py'):
             shutil.copy2(ROOT / 'services/mcp' / module, destination / module)
     extension_version = json.loads((extension_stage / "manifest.json").read_text())["version"]
     for name in ("popup.html", "popup.css", "popup.js", "service-worker.js", "content.js", "installer/index.html"):
@@ -231,6 +231,7 @@ def main():
     scripts.mkdir()
     for name in ("preinstall", "postinstall", "deploy.py"):
         shutil.copy2(Path(__file__).with_name(name), scripts / name)
+    (scripts / 'upgrade.plist').write_bytes(plistlib.dumps({'version': args.version, 'build': args.build}))
     shutil.copy2(ROOT / 'services/mcp/compatibility.py', scripts / 'compatibility.py')
     shutil.copytree(ROOT / 'adapters', scripts / 'adapters', ignore=shutil.ignore_patterns('__pycache__', 'tests', '*.pyc'))
     for name in ("preinstall", "postinstall", "launch-postinstall", "runtime.sh", "manage-plugin.command", "恢复安装.command"):

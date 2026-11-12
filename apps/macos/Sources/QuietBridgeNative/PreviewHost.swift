@@ -142,6 +142,7 @@ enum PreviewCaptureRoute: Equatable {
 
     static func decide(source: PreviewSource, targetOnCurrentSpace: Bool?) -> Self {
         switch source {
+        case .browserContent: .capture(.browserContent)
         case .window: .capture(.window)
         case .application: .capture(targetOnCurrentSpace == true ? .application : .window)
         case .desktop: targetOnCurrentSpace == true ? .capture(.desktop) : .waitingForTargetDesktop

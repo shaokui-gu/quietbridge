@@ -32,15 +32,33 @@ class FakeService:
 
     def stop(self):
         self.stops += 1
+        self.running = False
 
     def start(self):
         self.starts += 1
+        self.running = True
 
     def wait_ready(self, executable, info):
         if self.fail:
             raise RuntimeError('simulated startup failure')
         if info['CFBundleVersion'] != '55' or not executable.is_file():
             raise RuntimeError('wrong deployed version')
+
+
+class UpgradeService(FakeService):
+    def __init__(self, binary, running=True, fail_new=False):
+        super().__init__(running=running)
+        self.binary = binary
+        self.fail_new = fail_new
+        self.observed = []
+
+    def processes(self):
+        return [(12345, self.binary)] if self.running else []
+
+    def wait_ready(self, executable, info):
+        self.observed.append((info['CFBundleVersion'], executable.read_bytes()))
+        if self.fail_new and info['CFBundleVersion'] == '55':
+            raise RuntimeError('simulated new version startup failure')
 
 
 class MenuBarServiceTests(unittest.TestCase):
@@ -55,14 +73,6 @@ class MenuBarServiceTests(unittest.TestCase):
 
     def test_stop_handles_bundle_rename_with_original_launch_arguments(self):
         pid = 12345
-        library = Mock()
-
-        def process_path(process, buffer, size):
-            self.assertEqual(process, pid)
-            buffer.value = os.fsencode(self.binary)
-            return len(buffer.value)
-
-        library.proc_pidpath.side_effect = process_path
         for suffix in ('', ' --menubar', ' -psn_0_12345'):
             with self.subTest(arguments=suffix):
                 def run(arguments, **kwargs):
@@ -76,10 +86,46 @@ class MenuBarServiceTests(unittest.TestCase):
                     self.fail('unexpected command: ' + repr(arguments))
 
                 with patch.object(deploy.subprocess, 'run', side_effect=run), \
-                     patch.object(deploy.ctypes, 'CDLL', return_value=library), \
-                     patch.object(deploy.os, 'kill', side_effect=[None, ProcessLookupError]) as kill:
-                    self.service.stop()
-                self.assertEqual(kill.call_args_list, [call(pid, deploy.signal.SIGTERM), call(pid, 0)])
+                     patch.object(deploy, 'user_processes', return_value=[(pid, self.binary)]), \
+                     patch.object(deploy.Path, 'read_bytes', return_value=plistlib.dumps({'CFBundleIdentifier': deploy.MENU_IDENTIFIER})), \
+                     patch.object(deploy, 'verify_code') as verify:
+                    self.assertEqual(self.service.processes(), [(pid, self.binary)])
+                    verify.assert_called_once()
+
+    def test_stop_waits_for_bootout_and_handles_a_menu_without_a_status_port(self):
+        processes = [(12345, self.binary)]
+        def run(arguments, **kwargs):
+            if arguments[0] == '/usr/sbin/lsof':
+                return subprocess.CompletedProcess(arguments, 1, '', '')
+            return subprocess.CompletedProcess(arguments, 0, b'', b'')
+        with patch.object(self.service, 'processes', side_effect=[processes, processes, processes, []]), \
+             patch.object(deploy.subprocess, 'run', side_effect=run), \
+             patch.object(deploy.os, 'kill') as kill, patch.object(deploy.time, 'sleep'):
+            self.service.stop()
+        kill.assert_called_once_with(12345, deploy.signal.SIGTERM)
+
+    def test_an_unresponsive_menu_prevents_payload_replacement_without_force_killing(self):
+        processes = [(12345, self.binary)]
+        def run(arguments, **kwargs):
+            if arguments[0] == '/usr/sbin/lsof':
+                return subprocess.CompletedProcess(arguments, 1, '', '')
+            return subprocess.CompletedProcess(arguments, 1, b'', b'Could not find service')
+        with patch.object(self.service, 'processes', return_value=processes), \
+             patch.object(deploy.subprocess, 'run', side_effect=run), \
+             patch.object(deploy.time, 'monotonic', side_effect=[0, 6]), \
+             patch.object(deploy.os, 'kill') as kill:
+            with self.assertRaisesRegex(RuntimeError, '未允许替换'):
+                self.service.stop()
+        kill.assert_called_once_with(12345, deploy.signal.SIGTERM)
+
+    def test_foreign_port_owner_is_rejected_before_unloading_or_signaling(self):
+        with patch.object(self.service, 'processes', return_value=[]), \
+             patch.object(deploy.subprocess, 'run', return_value=subprocess.CompletedProcess([], 0, '9999\n', '')) as run, \
+             patch.object(deploy.os, 'kill') as kill:
+            with self.assertRaisesRegex(RuntimeError, '其他程序'):
+                self.service.stop()
+        self.assertEqual(run.call_count, 1)
+        kill.assert_not_called()
 
     def test_foreign_processes_and_non_menu_arguments_are_rejected(self):
         cases = [
@@ -162,7 +208,8 @@ class DeploymentTests(unittest.TestCase):
         self.app = self.root / 'menu.app'
         (self.app / 'Contents/MacOS').mkdir(parents=True)
         (self.app / 'Contents/MacOS/quietbridge-native').write_bytes(b'new-menu')
-        (self.app / 'Contents/Info.plist').write_bytes(plistlib.dumps({'CFBundleShortVersionString': '0.5.27', 'CFBundleVersion': '55'}))
+        (self.app / 'Contents/Info.plist').write_bytes(plistlib.dumps({'CFBundleShortVersionString': '0.5.27', 'CFBundleVersion': '55',
+            'CFBundleIdentifier': deploy.MENU_IDENTIFIER, 'CFBundleExecutable': 'quietbridge-native'}))
         bridge = self.app / 'Contents/Resources/bridge'
         bridge.mkdir(parents=True)
         (bridge / 'server.py').write_text('import json; print(json.dumps({"result":{"serverInfo":{"name":"quietbridge"}}}))')
@@ -174,7 +221,7 @@ class DeploymentTests(unittest.TestCase):
             (extension / name).write_bytes((ROOT / 'extensions/chromium' / name).read_bytes())
         (extension / 'browser_events.py').write_bytes((ROOT / 'services/mcp/browser_events.py').read_bytes())
         (extension / 'compatibility.py').write_bytes((ROOT / 'services/mcp/compatibility.py').read_bytes())
-        for module in ('session_registry.py', 'lifecycle_store.py'):
+        for module in ('session_registry.py', 'lifecycle_store.py', 'browser_preview.py'):
             (extension / module).write_bytes((ROOT / 'services/mcp' / module).read_bytes())
         (extension / 'popup.html').write_text('new-ui')
         helper_app = self.root / 'helper.app'
@@ -207,6 +254,136 @@ class DeploymentTests(unittest.TestCase):
 
     def install(self, service):
         return deploy.deploy(self.home, self.helper, self.app, self.support, service)
+
+    def prepare_upgrade(self, running=True, fail_new=False):
+        info_path = self.app / 'Contents/Info.plist'
+        new_info = info_path.read_bytes()
+        old_info = plistlib.loads(new_info)
+        old_info.update(CFBundleShortVersionString='0.5.26', CFBundleVersion='54')
+        info_path.write_bytes(plistlib.dumps(old_info))
+        binary = self.app / 'Contents/MacOS/quietbridge-native'
+        binary.write_bytes(b'old-version-before-payload')
+        service = UpgradeService(binary, running=running, fail_new=fail_new)
+        state = deploy.prepare_install(self.home, '0.5.27', '55', service)
+        self.assertEqual(binary.read_bytes(), b'old-version-before-payload')
+        self.assertFalse(service.running, 'preinstall must finish stopping before payload replacement')
+        # Model PackageKit replacing the source after preinstall returns.
+        info_path.write_bytes(new_info)
+        binary.write_bytes(b'new-version-payload')
+        return service, state
+
+    def test_preinstall_stop_state_survives_payload_and_restarts_only_the_new_version(self):
+        service, state = self.prepare_upgrade()
+        self.assertEqual(state['phase'], 'stopped')
+        self.assertTrue(state['wasRunning'])
+        self.assertEqual(Path(state['restoreBinary']).read_bytes(), b'old-version-before-payload')
+        result = deploy.finish_install(self.home, self.helper, self.app, self.support, service)
+        self.assertTrue(result['stoppedBeforePayload'])
+        self.assertTrue(result['startupVerified'])
+        self.assertEqual(service.starts, 1)
+        self.assertEqual(service.observed, [('55', b'new-version-payload')])
+        self.assertEqual(deploy.read_upgrade(self.home)['phase'], 'committed')
+
+    def test_preinstall_preserves_a_previously_stopped_application(self):
+        service, _ = self.prepare_upgrade(running=False)
+        result = deploy.finish_install(self.home, self.helper, self.app, self.support, service)
+        self.assertFalse(result['startupVerified'])
+        self.assertEqual(service.starts, 0)
+        self.assertEqual(deploy.read_upgrade(self.home)['phase'], 'committed')
+
+    def test_deployment_failure_before_file_transaction_restores_independent_old_copy(self):
+        service, state = self.prepare_upgrade()
+        with patch.object(deploy, 'handshake', side_effect=RuntimeError('fixture handshake failure')):
+            with self.assertRaisesRegex(RuntimeError, '已恢复安装前'):
+                deploy.finish_install(self.home, self.helper, self.app, self.support, service)
+        self.assertEqual(service.observed, [('54', b'old-version-before-payload')])
+        self.assertEqual(deploy.read_upgrade(self.home)['phase'], 'rolled-back')
+        self.assertEqual(plistlib.loads(self.agent.read_bytes())['ProgramArguments'], [state['restoreBinary'], '--menubar'])
+        self.assertEqual((self.app / 'Contents/MacOS/quietbridge-native').read_bytes(), b'new-version-payload',
+                         'user rollback must not pretend to restore root-owned PackageKit payloads')
+
+    def test_new_startup_failure_rolls_back_files_before_resuming_original_version(self):
+        original = self.config.read_bytes()
+        service, _ = self.prepare_upgrade(fail_new=True)
+        with self.assertRaisesRegex(RuntimeError, 'startup failure'):
+            deploy.finish_install(self.home, self.helper, self.app, self.support, service)
+        self.assertEqual(self.config.read_bytes(), original)
+        self.assertEqual(service.observed, [('55', b'new-version-payload'), ('54', b'old-version-before-payload')])
+        self.assertEqual(deploy.read_upgrade(self.home)['phase'], 'rolled-back')
+
+    def test_recovery_handles_payload_interruption_without_postinstall_or_user_transaction(self):
+        service, state = self.prepare_upgrade()
+        self.assertFalse((self.runtime / 'transactions').exists())
+        recovery = deploy.upgrade_recovery_command(self.home, state)
+        self.assertTrue(recovery.is_file())
+        self.assertEqual(recovery.stat().st_mode & 0o777, 0o700)
+        self.assertEqual((recovery.parent / 'deploy.py').read_bytes(), Path(deploy.__file__).read_bytes())
+        self.assertTrue((recovery.parent / 'compatibility.py').is_file())
+        self.assertTrue((recovery.parent / 'adapters/workbuddy/configuration.py').is_file())
+        with self.assertRaisesRegex(ValueError, '替换文件前已暂停'):
+            deploy.preflight(self.home)
+        self.assertTrue(deploy.recover_latest(self.home, service))
+        self.assertEqual(service.observed, [('54', b'old-version-before-payload')])
+        self.assertEqual(deploy.read_upgrade(self.home)['phase'], 'rolled-back')
+        deploy.preflight(self.home)
+        self.assertFalse(deploy.recover_latest(self.home, service))
+
+    def test_finder_launched_old_app_without_launch_agent_can_be_restored_after_replacement(self):
+        self.agent.unlink()
+        service, _ = self.prepare_upgrade()
+        self.assertTrue(deploy.recover_latest(self.home, service))
+        self.assertEqual(service.observed, [('54', b'old-version-before-payload')])
+        self.assertTrue(self.agent.is_file())
+
+    def test_interrupted_final_receipt_write_does_not_roll_back_a_committed_new_release(self):
+        service, _ = self.prepare_upgrade()
+        deploy.finish_install(self.home, self.helper, self.app, self.support, service)
+        state = deploy.read_upgrade(self.home)
+        state['phase'] = 'deploying'
+        deploy.save_upgrade(self.home, state)
+        stopped = service.stops
+        self.assertTrue(deploy.recover_latest(self.home, service))
+        self.assertEqual(service.stops, stopped)
+        self.assertEqual(service.observed, [('55', b'new-version-payload')])
+        self.assertEqual(deploy.read_upgrade(self.home)['phase'], 'committed')
+
+    def test_recovery_preserves_intervening_launch_agent_edits(self):
+        service, state = self.prepare_upgrade()
+        modified = self.agent.read_bytes() + b'\n'
+        self.agent.write_bytes(modified)
+        with self.assertRaisesRegex(ValueError, '安装期间被修改'):
+            deploy.restore_upgrade(self.home, state, service)
+        self.assertEqual(self.agent.read_bytes(), modified)
+        self.assertEqual(service.starts, 0)
+        self.assertEqual(deploy.read_upgrade(self.home)['phase'], 'recovery-required')
+
+    def test_pending_upgrade_cannot_be_overwritten_or_claimed_by_another_package(self):
+        service, _ = self.prepare_upgrade()
+        original = deploy.upgrade_path(self.home).read_bytes()
+        with self.assertRaisesRegex(ValueError, '已暂停'):
+            deploy.prepare_install(self.home, '0.5.28', '56', service)
+        info_path = self.app / 'Contents/Info.plist'
+        value = plistlib.loads(info_path.read_bytes())
+        value['CFBundleVersion'] = '56'
+        info_path.write_bytes(plistlib.dumps(value))
+        with self.assertRaisesRegex(ValueError, '匹配'):
+            deploy.finish_install(self.home, self.helper, self.app, self.support, service)
+        self.assertEqual(deploy.upgrade_path(self.home).read_bytes(), original)
+        self.assertEqual(service.starts, 0)
+
+    def test_rollback_conflict_never_restarts_an_old_app_with_partially_restored_files(self):
+        service, _ = self.prepare_upgrade()
+        apply = deploy.Transaction.apply
+        def conflicting_change(transaction):
+            apply(transaction)
+            self.config.write_bytes(b'{"external":"preserve"}')
+            raise RuntimeError('fixture interrupted deployment')
+        with patch.object(deploy.Transaction, 'apply', conflicting_change):
+            with self.assertRaisesRegex(RuntimeError, '恢复未完成'):
+                deploy.finish_install(self.home, self.helper, self.app, self.support, service)
+        self.assertEqual(self.config.read_bytes(), b'{"external":"preserve"}')
+        self.assertEqual(service.starts, 0)
+        self.assertEqual(deploy.read_upgrade(self.home)['phase'], 'recovery-required')
 
     def test_old_visible_app_path_remains_a_recognised_connection(self):
         self.assertEqual(deploy.APP.name, 'QuietBridge.app')

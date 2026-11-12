@@ -23,7 +23,25 @@ fi
 # Installer's private Scripts directory may not be traversable by the desktop
 # user. Stage read-only, root-owned preflight code; never run their Python as root.
 preflight="$(/usr/bin/mktemp -d /private/tmp/quietbridge-preflight.XXXXXX)"
-trap '/bin/rm -rf "$preflight"' EXIT
+prepared=false
+complete=false
+version=''
+build=''
+finish_preinstall() {
+    result=$?
+    trap - EXIT
+    if [[ "$prepared" == true && "$complete" != true ]]; then
+        if ! /usr/bin/sudo -H -u "$user" "$python" -B "$preflight/deploy.py" --abort-install \
+                --package-version "$version" --package-build "$build"; then
+            echo '应用恢复未完成；请运行“恢复安装.command”。' >&2
+        fi
+    fi
+    /bin/rm -rf "$preflight"
+    exit "$result"
+}
+trap finish_preinstall EXIT
+version="$(/usr/libexec/PlistBuddy -c 'Print :version' "$(dirname "$0")/upgrade.plist")"
+build="$(/usr/libexec/PlistBuddy -c 'Print :build' "$(dirname "$0")/upgrade.plist")"
 /bin/cp "$(dirname "$0")/deploy.py" "$(dirname "$0")/compatibility.py" "$preflight/"
 /bin/cp -R "$(dirname "$0")/adapters" "$preflight/adapters"
 /bin/chmod -R a+rX "$preflight"
@@ -61,7 +79,16 @@ if [[ -n "$legacy" ]]; then
         echo '旧应用签名或标识无法验证；未移动应用目录。' >&2
         exit 1
     fi
-    /bin/mv "$legacy" "$current"
 elif [[ -e "$current" ]]; then
     verify_existing_app "$current"
 fi
+# Stop only after every read-only preflight/signature check, before renaming or
+# allowing PackageKit to replace any payload. Persist the original running state
+# for postinstall; it must not mistake this deliberate stop for a stopped app.
+/usr/bin/sudo -H -u "$user" "$python" -B "$preflight/deploy.py" --prepare-install \
+    --package-version "$version" --package-build "$build"
+prepared=true
+if [[ -n "$legacy" ]]; then
+    /bin/mv "$legacy" "$current"
+fi
+complete=true

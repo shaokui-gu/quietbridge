@@ -67,6 +67,8 @@ async function refresh() {
     [label, title, description, tone] = ['应用未运行', 'QuietBridge 已退出', '请先打开 QuietBridge，再使用浏览器控制。', 'warning'];
   } else if (syncing) {
     [label, title, description, tone] = ['连接中', '正在连接原生端', '正在同步扩展与本地应用的状态。', ''];
+  } else if (connection.status === 'request_rejected') {
+    [label, title, description, tone] = ['请求被拒绝', '原生端未接受请求', '请检查任务分配、权限及扩展版本，处理后刷新状态。', 'warning'];
   } else if (!connected) {
     [label, title, description, tone] = ['连接异常', '无法连接原生端', '请检查 QuietBridge 是否正在运行，然后刷新状态。', 'error-tone'];
   } else if (assignment === 'paused') {

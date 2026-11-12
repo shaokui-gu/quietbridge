@@ -7,14 +7,16 @@ enum ApplicationAuthorization {
     // Versions and copies with the same bundle identifier share consent, regardless of signing.
     static func describe(_ identity: ProcessIdentity, name: String, expectedExecutablePath: String?,
                          readBundle: (Int32) -> (identifier: String?, url: URL?) = runningBundle,
-                         readPath: (Int32) -> Result<String, NativeFailure> = NativePlatform.executablePathResult) throws -> JSONValue {
+                         readPath: (Int32) -> Result<String, NativeFailure> = NativePlatform.executablePathResult,
+                         verifyCloneSignature: (ProcessIdentity) throws -> Void = ApplicationExecutableIdentity.verifyChromeSignature) throws -> JSONValue {
         try NativePlatform.verify(identity)
         let bundle = readBundle(identity.pid)
         var bundleID = bundle.identifier.flatMap { $0.isEmpty ? nil : $0 }
         let pathResult = readPath(identity.pid)
-        let path = (try? pathResult.get()).map { URL(fileURLWithPath: $0).resolvingSymlinksInPath().path }
-        if let path, let expectedExecutablePath, path != URL(fileURLWithPath: expectedExecutablePath).resolvingSymlinksInPath().path {
-            throw NativeFailure(code: "STALE_APP", message: "Application executable changed during selection; select the application again")
+        var path = (try? pathResult.get()).map { URL(fileURLWithPath: $0).resolvingSymlinksInPath().path }
+        if let observed = path, let expectedExecutablePath {
+            path = try ApplicationExecutableIdentity.resolve(identity, observedPath: observed, expectedPath: expectedExecutablePath,
+                bundleIdentifier: bundle.identifier, bundleURL: bundle.url, verifySignature: verifyCloneSignature)
         }
         if bundleID == nil, let path, let url = bundle.url,
            let installed = InstalledApplication.read(url), installed.executablePath == path {
