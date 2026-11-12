@@ -516,6 +516,29 @@ class BrowserEventsTests(unittest.TestCase):
                                 'snapshotId': 'snap-1', 'direction': 'down', 'lines': 6}, **self.paths)
         self.assertEqual(self.sync()['command']['params'], {'snapshotId': 'snap-1', 'deltaY': -6})
 
+    def test_action_result_accepts_bounded_float_coordinates(self):
+        for extra in ({'x': 123.5, 'y': 240.25}, {'x': 12, 'y': 40}):
+            self.prepare_command()
+            queued = events.internal_action({'action': 'command', 'taskId': 'task',
+                                             'operation': 'scroll', 'snapshotId': 'snap-1',
+                                             'direction': 'down', 'lines': 3}, **self.paths)
+            result = {'performed': True, 'verified': False,
+                      'observed': {'route': 'cdp', 'tabId': 7, **extra}}
+            reply = self.sync(commandResult={'requestId': queued['commandId'], 'status': 'ok', 'result': result})
+            self.assertEqual(reply['commandAck']['status'], 'accepted', '浮点坐标不得导致回执被拒')
+            got = events.internal_action({'action': 'result', 'taskId': 'task',
+                                          'commandId': queued['commandId']}, **self.paths)
+            self.assertEqual(got['status'], 'ok')
+            self.assertEqual(got['result']['observed']['x'], extra['x'])
+        for bad in ({'x': float('nan')}, {'x': float('inf')}, {'x': 1e12}):
+            self.prepare_command()
+            queued = events.internal_action({'action': 'command', 'taskId': 'task',
+                                             'operation': 'scroll', 'snapshotId': 'snap-1',
+                                             'direction': 'down', 'lines': 3}, **self.paths)
+            result = {'performed': True, 'verified': False, 'observed': bad}
+            reply = self.sync(commandResult={'requestId': queued['commandId'], 'status': 'ok', 'result': result})
+            self.assertEqual(reply['commandAck']['status'], 'rejected', 'NaN/Inf/超界坐标必须拒绝')
+
     def test_malformed_action_result_is_rejected(self):
         for result in ({'performed': True, 'verified': True, 'observed': {'note': 'x' * 300}},
                        {'performed': 'yes', 'verified': True, 'observed': {}}):
@@ -840,6 +863,31 @@ class BrowserEventsTests(unittest.TestCase):
         self.assertEqual(record['mapping']['method'], 'title')
         with self.assertRaises(ValueError):
             events.internal_action({'action': 'verify_mapping', 'taskId': 'task'}, **self.paths)
+
+    def test_verify_mapping_accepts_chrome_window_title_decoration(self):
+        self.prepare_assignment()
+        self.sync(assignmentTitle='QuietBridge Soak Step 5')
+        call = lambda windows: events.internal_action(  # noqa: E731
+            {'action': 'verify_mapping', 'taskId': 'task', 'windows': windows}, **self.paths)
+        decorated = 'QuietBridge Soak Step 5 - Google Chrome - 不务正业的程序员'
+        hit = call([{'windowId': 41, 'title': decorated}])
+        self.assertTrue(hit['verified'], 'macOS Chrome 窗口标题后缀不得阻止映射')
+        self.assertEqual(hit['match'], 'prefixed')
+        self.assertEqual(hit['windowId'], 41)
+        self.assertEqual(events.status('task', **self.paths)['mapping']['match'], 'prefixed')
+        self.assertEqual(
+            call([{'windowId': 42, 'title': 'QuietBridge Soak Step 50 - Google Chrome'}])['reason'],
+            'no_match', '编号前缀相同但页面标题不同不得命中')
+        self.assertEqual(
+            call([{'windowId': 46, 'title': 'Archive - QuietBridge Soak Step 5'}])['reason'],
+            'no_match', '标签标题出现在窗口标题中段不得命中')
+        self.assertFalse(
+            call([{'windowId': 43, 'title': 'QuietBridge Soak Step 5 - Google Chrome'},
+                  {'windowId': 44, 'title': 'QuietBridge Soak Step 5 - Google Chrome - P2'}])['verified'],
+            '多个前缀命中仍须报歧义')
+        exact = call([{'windowId': 45, 'title': ' QuietBridge Soak Step 5 '}])
+        self.assertTrue(exact['verified'])
+        self.assertEqual(exact['match'], 'exact')
 
     def test_window_mapping_uses_active_tab_metadata_without_changing_task_tab(self):
         self.prepare_assignment()

@@ -513,7 +513,7 @@ async function sync() {
       return { permission, on, revision: enableRevision };
     });
     keepAlive(on && permission);
-    const payload = { action: 'sync', enabled: on, permission, applicationSession, clientVersion: '0.4.10', capabilities: ['cdp_input', 'document_binding', 'background_popups', 'paged_read', 'render_probe'],
+    const payload = { action: 'sync', enabled: on, permission, applicationSession, clientVersion: '0.4.11', capabilities: ['cdp_input', 'document_binding', 'background_popups', 'paged_read', 'render_probe'],
       windowEvidence: on && permission ? await windowEvidence() : null,
       observerStatus, lifecycleError };
     if (panelBridge) {

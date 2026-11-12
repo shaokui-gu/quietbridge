@@ -251,7 +251,11 @@ export class BackgroundBrowser {
     const replies = await this.lifecycle('guard_install', deadline => this.chrome.scripting.executeScript({
       target: { tabId: s.tabId, documentIds: [s.documentId] }, world: 'MAIN', injectImmediately: true,
       func: installPopupGuard, args: [s.taskId, s.bindingId, { issuedAt, deadline }] }),
-      Math.max(1, Math.min(1200, command.expiresAt * 1000 - Date.now())));
+    // MAIN-world injection on a just-navigated or off-screen document regularly
+    // needs more than the 1.2s lifecycle default. popup-guard rejects any claim
+    // whose window exceeds 3000ms, so stay just under it and keep the command
+    // deadline as the outer bound; never retry after that deadline passes.
+      Math.max(1, Math.min(2900, command.expiresAt * 1000 - Date.now())));
     await this.check(s, command);
     const result = replies?.[0];
     if (result?.documentId && result.documentId !== s.documentId) throw new Error('STALE_DOCUMENT：弹窗守卫文档已变化');

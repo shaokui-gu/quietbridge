@@ -2,6 +2,7 @@
 import copy
 import fcntl
 import json
+import math
 import os
 from compatibility import application_runtime, browser_layout, browser_runtime_root, environment
 from pathlib import Path
@@ -186,7 +187,7 @@ def valid_selector(value):
 
 
 CREATED_FIELDS = {'requestId', 'browserWindowId', 'tabId'}
-COMMAND_TTL = 8
+COMMAND_TTL = 15
 CANDIDATE_TTL = 20
 CANDIDATE_REFRESH_TIMEOUT = 3
 CANDIDATE_QUERY_TIMEOUT = 3
@@ -382,7 +383,10 @@ def validate_action_result(result, operation):
     require(type(observed) is dict and len(observed) <= 16, '动作观测字段错误')
     for key, value in observed.items():
         require(type(key) is str and 0 < len(key) <= 32, '观测键错误')
-        require(type(value) in (bool, int) or (type(value) is str and len(value) <= 200),
+        # 点击/悬停的观测点来自 CSS 坐标，宽度可能带小数；接受有界有限浮点。
+        require(type(value) in (bool, int) or
+                (type(value) is float and math.isfinite(value) and abs(value) <= 1e9) or
+                (type(value) is str and len(value) <= 200),
                 '观测值类型或长度错误')
     children = result.get('children', [])
     require(type(children) is list and len(children) <= 4, '子标签数量错误')
@@ -598,6 +602,31 @@ def creation_url(value):
     require(parsed.scheme in ('http', 'https') and bool(parsed.hostname) and
             parsed.username is None and parsed.password is None, '仅允许无凭据的 http/https 地址')
     return value
+
+
+TITLE_SEPARATORS = (' - ', ' — ', ' – ', ' | ', ' · ')
+
+
+def window_title_relation(window_title, target):
+    """Compare a native window title with the bound tab title.
+
+    macOS Chrome always decorates the window title as
+    "<page title> - Google Chrome - <profile>", so exact equality alone fails
+    whenever the title has to come from the window list instead of the
+    extension's active-tab evidence. A prefixed match is accepted only when the
+    page title is followed by a real separator, so "Step 5" can never match
+    "Step 50" or an unrelated window that merely contains the same text.
+    """
+    window = window_title.strip()
+    want = target.strip()
+    if not window or not want:
+        return None
+    if window == want:
+        return 'exact'
+    for separator in TITLE_SEPARATORS:
+        if window.startswith(want + separator):
+            return 'prefixed'
+    return None
 
 
 def bound_native_target(task):
@@ -1252,7 +1281,10 @@ def _internal_action(args, task_file, event_file, refreshed=None, observation=No
                 require(type(window) is dict and set(window) == {'windowId', 'title'} and
                         valid_int(window['windowId'], 1) and type(window['title']) is str and
                         len(window['title']) <= 200, '窗口证据格式错误')
-            hits = [w for w in windows if w['title'].strip() == title.strip()]
+            exact = [w for w in windows if window_title_relation(w['title'], title) == 'exact']
+            prefixed = [w for w in windows if window_title_relation(w['title'], title) == 'prefixed']
+            hits = exact or prefixed
+            match = 'exact' if exact else ('prefixed' if prefixed else None)
             if len(hits) == 1:
                 visibility = ({'windowActiveTabId': evidence['tabId'],
                                'targetTabActiveAtVerification': evidence['tabId'] == record['tabId'],
@@ -1260,16 +1292,16 @@ def _internal_action(args, task_file, event_file, refreshed=None, observation=No
                               if verified_evidence else {})
                 record['mappingVerified'] = True
                 record['mapping'] = {'windowId': hits[0]['windowId'], 'method': method,
-                                     'title': title, 'at': time.time(), **visibility}
+                                     'title': title, 'match': match, 'at': time.time(), **visibility}
                 return {'verified': True, 'windowId': hits[0]['windowId'], 'method': method,
-                        'candidates': 1, **visibility}
+                        'match': match, 'candidates': 1, **visibility}
             record['mappingVerified'] = False
             record['mapping'] = {'verified': False, 'method': method, 'title': title,
                                  'reason': 'no_match' if not hits else 'ambiguous',
                                  'candidates': len(hits), 'at': time.time()}
             return {'verified': False, 'method': method,
                     'reason': 'no_match' if not hits else 'ambiguous', 'candidates': len(hits),
-                    'limitation': '仅接受唯一原生窗口标题匹配；后台标签可用其所在窗口的活动标签标题作证据，不激活或切换标签。'}
+                    'limitation': '仅接受唯一原生窗口标题匹配（精确，或“标签标题 + 分隔符”前缀）；后台标签可用其所在窗口的活动标签标题作证据，不激活或切换标签。'}
         if action in ('annotate', 'annotations'):
             require(args['taskId'] == task_id and task and
                     task.get('state') in ('awaiting_window', 'bound'), '需要当前活动任务')
@@ -1687,7 +1719,7 @@ def make_tool(task_file, validate_task=None, check_cancelled=None, preflight_roo
     return {'name': 'quietbridge_browser_events', 'description': 'render_probe 仅在用户明确同意呈现诊断时使用，stage 依次 inspect/attach/enable/layout/capture；各阶段是独立命令，非自动串联。inspect 不附加，attach 不 Page.enable，enable 不查询布局，layout 不截图，capture 仅对该文档 30 秒内 layout 的视口单次截图并丢弃图像，只返回时间/状态/长度。既有 attachedBefore=true 表示已有调试连接，不能假称首次附加对照。禁止任意 CDP、自动重复 capture、切桌、激活或将探针当作后台绘制修复；不会清除已有动作复核要求。网页操作必须不抢焦点并使用共享窗口能力。保持用户的前台应用、键盘窗口、物理鼠标和当前 Space；只走固定标签扩展通道，禁止 activate/AXRaise、切换 Space、前台键鼠或原生输入兜底。bind+assign 后用 verify_mapping 核验系统窗口与标签对应关系，再调用 quietbridge_windows action=share source=window 建立系统窗口连续视频。网页动作完成后扩展可能生成并立即丢弃一次有界绘制提醒，帮助离屏 Chrome 提交新画面；它受固定 task/tab/document 身份约束，不是预览帧、不证明动作成功、空闲时不运行。导航后的提醒等新文档身份确认后执行。单次 screenshot 仍是独立观察证据，不等于持续预览已建立。'
                                                           '长页面阅读优先 command operation=read：mode=links 返回脱敏 href/name（query/fragment 只标记存在，不含原值），mode=content 返回当前已渲染正文 article/text。每页 limit<=100、maxChars=4000..16000；续读携带相同 mode/readId 和 nextOffset。sourceTruncated=true 表示采集达到上限，不能声称完整。正文分片按 URL+id 去重，textOffset/textComplete 用于拼接，同一帖子多片不能重复计数；text 块不等于评论数。只读当前已加载 DOM，无后台请求、不含未加载楼层；403/404/未登录应报告，不能猜接口或复制登录资料。read 不产生输入 ref；成功导航后可用新文档 read/screenshot/diagnostics 轻量复核，点击、填写等输入仍须 snapshot 复核。'
                                                           '无活动任务时 candidates 仅查询全局扩展心跳与候选，connectionScope=extension_preflight、taskChannelReady=false 不表示扩展掉线或已允许任务输入；clientVersion 来自真实心跳。begin 后 candidates 使用独立任务通道，不能将全局候选当作 assign 证据。会话首个握手最多等待 3 秒；channel_pending/BROWSER_CHANNEL_STARTING 时按 retryAfterMs 最多两次只读复查，不重建任务或重载扩展。首次 candidates 无缓存时最多等待 3 秒；refreshPending=true 仅表示尚待扩展回传，按 retryAfterMs 只读复查，不推断无标签或权限失败。verify_mapping 可用目标窗口活动标签的标题核验后台任务标签的所属窗口，不切换焦点；系统窗口连续视频可能显示窗口当前活动标签，snapshot/screenshot 仍可独立复核逻辑绑定标签。BROWSER_DEBUGGER_RESTRICTED 表示 Chrome 拒绝调试其他扩展页面，通知用户处理冲突，不重复输入或自动换目标。'
-                                                          '通过已授权扩展观察及操作固定浏览器标签。优先 candidates（可带当前 taskId；refreshPending 表示异步刷新），先 quietbridge_task bind 真实系统窗口，再以候选中的 browserWindowId/tabId 显式 assign；ID 不能用 CGWindowID 代替。候选超过 20 秒时 assign 自动等待至多 3 秒获取新证据，原标签、窗口、地址及任务目标均未变化才分配；不必反复刷新候选，不自动重建窗口。绑定后持续复用同一标签，不按前台焦点换目标。create_target 仅用于尚无窗口的活动任务，可带 url，focused=false；同一任务重复申请复用原请求或结果，不因超时另开窗口。command 下发限定操作（snapshot/read/click/fill/select/scroll/navigate/diagnostics/screenshot/keypress，单飞，8 秒过期），result 轮询（pending/ok/error/expired/canceled/evicted/unknown，不重放，附 latencyMs），cancel 如实报告 mayHaveExecuted。navigate 成功受理后等待原标签新文档就绪，可用 screenshot/read/diagnostics 复核导航，不必每页完整 snapshot；navigation_observation 表示此步骤。仅当前绑定、新 epoch、就绪且地址匹配才解除导航等待；落地地址变化时返回 verification.reason=navigation_destination_changed、nextAction=snapshot；获取当前 snapshot 核实后继续原绑定，无需重新 assign。文档未就绪时继续只读等待。其他输入或结果未知仍须 snapshot 复核；获取输入 ref 也须 snapshot。performed 不代表业务成功，浏览器分配不授权桌面输入或 wait_ready 判定。'
+                                                          '通过已授权扩展观察及操作固定浏览器标签。优先 candidates（可带当前 taskId；refreshPending 表示异步刷新），先 quietbridge_task bind 真实系统窗口，再以候选中的 browserWindowId/tabId 显式 assign；ID 不能用 CGWindowID 代替。候选超过 20 秒时 assign 自动等待至多 3 秒获取新证据，原标签、窗口、地址及任务目标均未变化才分配；不必反复刷新候选，不自动重建窗口。绑定后持续复用同一标签，不按前台焦点换目标。create_target 仅用于尚无窗口的活动任务，可带 url，focused=false；同一任务重复申请复用原请求或结果，不因超时另开窗口。command 下发限定操作（snapshot/read/click/fill/select/scroll/navigate/diagnostics/screenshot/keypress，单飞，15 秒过期，含扩展 service worker 冷启动预算），result 轮询（pending/ok/error/expired/canceled/evicted/unknown，不重放，附 latencyMs），cancel 如实报告 mayHaveExecuted。navigate 成功受理后等待原标签新文档就绪，可用 screenshot/read/diagnostics 复核导航，不必每页完整 snapshot；navigation_observation 表示此步骤。仅当前绑定、新 epoch、就绪且地址匹配才解除导航等待；落地地址变化时返回 verification.reason=navigation_destination_changed、nextAction=snapshot；获取当前 snapshot 核实后继续原绑定，无需重新 assign。文档未就绪时继续只读等待。其他输入或结果未知仍须 snapshot 复核；获取输入 ref 也须 snapshot。performed 不代表业务成功，浏览器分配不授权桌面输入或 wait_ready 判定。'
                                                           '前提：Chrome 已加载 QuietBridge Browser 并授予站点权限、原生宿主已登记（可在 quietbridge_permissions 或安装页核对）。网页内容在 task begin 声明 targetSurface=web_content，自动选 background_browser；导航使用本通道 navigate，不为导航操作地址栏。浏览器自身工具栏与真实原生打开/保存对话框属于 browser_ui/native_dialog 的独立原生阶段，不在本通道操作。网页里的弹窗、跨域 frame、受限 URL 或 AX 空树不是原生阶段证据。扩展未就绪时通知用户恢复，禁止回落 AX 或桌面输入。snapshot 返回 snapshotId 和 coverage：elementCount 是顶层 DOM 节点数（最多 10000），elements 是可见交互元素（最多 300），二者不必相等；coverage.truncated 表示交互元素确实被截断，长文改用 read。click/fill/select/scroll 必须传 snapshotId。滚动使用 direction=down/up、lines=6（1..10）；不要猜 deltaY 符号。到达边界与滚动未生效会分别报告，不把 performed 当作已移动。screenshot 直接截取该标签。tabs 列出任务归属标签，select_tab 只改逻辑目标，不激活标签或窗口。keypress 只支持页面按键。',
             'inputSchema': {'type': 'object', 'properties': {'action': {'type': 'string', 'enum': ['status', 'candidates', 'create_target', 'command', 'result', 'cancel', 'annotate', 'annotations', 'verify_mapping', 'assign', 'tabs', 'select_tab']},
                 'taskId': {'type': 'string'}, 'browserWindowId': {'type': 'integer'}, 'tabId': {'type': 'integer'},

@@ -180,6 +180,9 @@ enum BrowserSessionPaths {
             session.authorization = authorization
             session.state = "attached"
             let result = try render(session, cancellation: cancellation)
+            // 同一窗口重复绑定必须替换旧记录，否则每次 task bind 都会留下一个
+            // 永不释放的 attached 会话，长任务里会累积成 TASK_IN_USE。
+            sessions.removeAll { $0.state == "attached" && $0.identity?.pid == pid && $0.windowID == windowID }
             sessions.append(session)
             return result
         }
@@ -189,7 +192,16 @@ enum BrowserSessionPaths {
             return session.plan.json
         }
         if action == "list" {
-            return .object(["sessions": .array(try sessions.map { try render($0, cancellation: cancellation) }),
+            // 兜底去重：历史版本可能已累积同窗口的 attached 记录，对外只报最新一条。
+            var seen = Set<String>()
+            var unique: [Session] = []
+            for session in sessions.reversed() where session.state == "attached" {
+                let key = "\(session.identity?.pid ?? 0):\(session.windowID ?? 0)"
+                if seen.insert(key).inserted { unique.append(session) }
+            }
+            var visible = sessions.filter { $0.state != "attached" }
+            visible.append(contentsOf: unique.reversed())
+            return .object(["sessions": .array(try visible.map { try render($0, cancellation: cancellation) }),
                             "scope": .string("connection"), "launchSupported": .bool(true)])
         }
         guard let session = sessions.first(where: { $0.plan.sessionID.uuidString == sessionID }) else {
