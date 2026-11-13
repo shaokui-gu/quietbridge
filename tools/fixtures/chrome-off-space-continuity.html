@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang="zh-CN">
+<meta charset="utf-8">
+<title>QuietBridge Chrome 连续画面测试</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  body { margin: 0; min-height: 100vh; background: #12273a; color: #f3f7fb;
+    font: 24px system-ui, sans-serif; display: grid; place-items: center; }
+  main { width: min(940px, 90vw); padding: 32px; }
+  h1 { font-size: 80px; margin: 0 0 24px; }
+  .values { display: flex; gap: 64px; flex-wrap: wrap; }
+  .value { font: bold 52px ui-monospace, monospace; margin-top: 12px; }
+  .marker { height: 24px; width: 24px; background: #ffc35a; border-radius: 50%;
+    animation: move 2s linear infinite alternate; margin: 36px 0; }
+  @keyframes move { to { transform: translateX(620px); } }
+  small { color: #c7d5e3; line-height: 1.7; }
+</style>
+<main>
+  <h1 id="step">STEP</h1>
+  <div class="values">
+    <div>页面时钟<div class="value" id="clock">00:00:00.000</div></div>
+    <div>动画帧计数<div class="value" id="frames">0</div></div>
+  </div>
+  <div class="marker"></div>
+  <small>导航后保持静置，观察预览中的时钟和圆点。页面计数不能证明系统视频持续更新；正式流程不自动截图。</small>
+</main>
+<script>
+  document.querySelector('#step').textContent = 'STEP ' + (new URLSearchParams(location.search).get('step') || '1');
+  function clock() {
+    document.querySelector('#clock').textContent = new Date().toISOString().slice(11, 23);
+  }
+  clock(); setInterval(clock, 200);
+  let frames = 0;
+  function frame() {
+    document.querySelector('#frames').textContent = String(++frames);
+    requestAnimationFrame(frame);
+  }
+  requestAnimationFrame(frame);
+</script>
+</html>

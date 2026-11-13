@@ -2,11 +2,17 @@ import { safeUrl } from './state.mjs';
 import { installPopupGuard } from './popup-guard.mjs';
 
 function debuggerError(error, stage) {
-  if (String(error?.message || error).includes('Cannot access a chrome-extension:// URL of different extension')) {
-    return new Error('BROWSER_DEBUGGER_RESTRICTED：' + stage +
-      ' 被 Chrome 拒绝：目标含其他扩展页面。请通知用户检查扩展冲突；未切换目标、未重放输入，先核实既有结果。');
-  }
-  return error;
+  const raw = String(error?.message || error);
+  const foreign = raw.includes('Cannot access a chrome-extension:// URL of different extension');
+  const occupied = /^Another debugger is already attached to the (?:tab|target|background page) with id: [\w-]+\.?$/u.test(raw);
+  if (!foreign && !occupied) return error;
+  const code = foreign ? 'BROWSER_DEBUGGER_RESTRICTED' : 'BROWSER_DEBUGGER_IN_USE';
+  const detail = foreign ? '页面包含其他扩展页面，Chrome 禁止调试；这不表示另一调试客户端占用。' :
+    'Chrome 明确报告已有调试客户端；不强制断开或接管。';
+  const result = new Error(code + '：' + stage + ' 被拒绝。' + detail + 'Chrome 原文：' + raw);
+  result.debuggerFailure = { reason: foreign ? 'foreign_extension_page' : 'debugger_in_use',
+    stage, chromeMessage: raw.slice(0, 200), foreignFrameExtensionIds: [], frameEvidence: 'not_checked' };
+  return result;
 }
 
 // Only browser-scoped input is exposed here. There is deliberately no OS input,
@@ -116,7 +122,7 @@ export class BackgroundBrowser {
     if (this.detached.has(s.tabId)) throw new Error('BACKGROUND_UNAVAILABLE：调试连接被断开，请显式重新分配原标签');
     if (!this.attached.has(s.tabId)) {
       try { await this.chrome.debugger.attach({ tabId: s.tabId }, '1.3'); }
-      catch (error) { throw debuggerError(error, 'attach'); }
+      catch (error) { throw await this.attachmentError(error, 'attach', s, command); }
       this.attached.set(s.tabId, s.bindingId);
     }
     try { await this.check(s, command); }
@@ -126,6 +132,41 @@ export class BackgroundBrowser {
       this.pageEnabled.add(s.tabId);
     }
     await this.check(s, command);
+  }
+
+  async attachmentError(cause, stage, s, command) {
+    const error = debuggerError(cause, stage);
+    if (error.debuggerFailure?.reason !== 'foreign_extension_page' || !s || !command) return error;
+    // Read declared iframe origins in the same top-level document. No debugger,
+    // DOM mutations, screenshot, frame contents, URL paths or query parameters.
+    let timer;
+    try {
+      await this.check(s, command);
+      const replies = await Promise.race([
+        this.chrome.scripting.executeScript({ target: { tabId: s.tabId, documentIds: [s.documentId] },
+          func: () => {
+            const ids = new Set();
+            for (const frame of Array.from(document.querySelectorAll('iframe[src],frame[src]')).slice(0, 128)) {
+              try {
+                const url = new URL(frame.getAttribute('src'), document.baseURI);
+                if (url.protocol === 'chrome-extension:' && /^[a-p]{32}$/u.test(url.hostname)) ids.add(url.hostname);
+              } catch {}
+              if (ids.size >= 8) break;
+            }
+            return [...ids];
+          } }),
+        new Promise((_, reject) => { timer = setTimeout(() => reject(new Error('frame evidence unavailable')), 500); })
+      ]);
+      await this.check(s, command);
+      const reply = replies?.[0];
+      if ((!reply?.documentId || reply.documentId === s.documentId) && Array.isArray(reply?.result) &&
+          reply.result.length <= 8 && reply.result.every(id => typeof id === 'string' && /^[a-p]{32}$/u.test(id))) {
+        error.debuggerFailure.foreignFrameExtensionIds = [...new Set(reply.result)];
+        error.debuggerFailure.frameEvidence = 'top_document_iframe_src';
+      }
+    } catch {} // Evidence failure never replaces Chrome's original rejection.
+    finally { clearTimeout(timer); }
+    return error;
   }
 
   async debuggerCommand(target, method, params) {
@@ -275,7 +316,13 @@ export class BackgroundBrowser {
 
   async run(command, s) {
     const mutating = !['snapshot', 'read', 'diagnostics', 'screenshot', 'render_probe'].includes(command.operation);
-    if (mutating) { await this.protect(s, command); await this.popup(s, command, 'arm'); }
+    if (mutating) {
+      try { await this.protect(s, command); await this.popup(s, command, 'arm'); }
+      catch (error) {
+        if (error?.debuggerFailure) error.debuggerFailure.inputDispatched = false;
+        throw error;
+      }
+    }
     let result;
     try { result = await this.execute(command, s); }
     finally {
@@ -308,44 +355,7 @@ export class BackgroundBrowser {
         if (result && children.length) result.children = children;
       }
     }
-    // A discarded one-shot capture nudges an occluded Chrome renderer to
-    // submit its current compositor frame to WindowServer. The continuous
-    // preview remains the native window stream; this image never leaves JS.
-    // Navigation is pulsed by the worker after the replacement document is
-    // reconciled, because this command's document lease may already be stale.
-    if (mutating && result?.performed !== false && command.operation !== 'navigate') {
-      await this.pulse(s);
-    }
     return result;
-  }
-
-  async pulse(s) {
-    if (!s || s.pending || !this.attached.has(s.tabId)) return false;
-    const now = Date.now() / 1000;
-    const command = { taskId: s.taskId, bindingId: s.bindingId, assignmentVersion: s.assignmentVersion,
-      tabId: s.tabId, browserWindowId: s.browserWindowId, documentId: s.documentId,
-      navigationEpoch: s.navigationEpoch, operation: 'render_refresh', params: {},
-      expiresAt: now + 2 };
-    let timer;
-    try {
-      await this.check(s, command);
-      const reply = await Promise.race([
-        this.debuggerCommand({ tabId: s.tabId }, 'Page.captureScreenshot', {
-          format: 'jpeg', quality: 1, fromSurface: true, captureBeyondViewport: false
-        }),
-        new Promise((_, reject) => {
-          timer = setTimeout(() => reject(new Error('RENDER_REFRESH_TIMEOUT')), 1500);
-        })
-      ]);
-      await this.check(s, command);
-      return typeof reply?.data === 'string' && reply.data.length > 0;
-    } catch {
-      // Rendering assistance is best effort and never changes the command
-      // result or the debugger lifecycle.
-      return false;
-    } finally {
-      clearTimeout(timer);
-    }
   }
 
   // Explicit diagnostic stages: no input, activation, arbitrary CDP, or image export.
@@ -372,7 +382,7 @@ export class BackgroundBrowser {
         const cleanup = pending.then(() => this.chrome.debugger.detach({ tabId: s.tabId })).catch(() => {});
         this.releasing.set(s.tabId, cleanup);
         cleanup.finally(() => { if (this.releasing.get(s.tabId) === cleanup) this.releasing.delete(s.tabId); }).catch(() => {});
-        throw debuggerError(attachError || error, 'probe_attach');
+        throw await this.attachmentError(attachError || error, 'probe_attach', s, command);
       }
       try { await this.check(s, command); }
       catch (error) { await this.release(s.tabId, s.taskId).catch(() => {}); throw error; }

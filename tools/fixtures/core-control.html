@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="zh-CN">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>QuietBridge 核心操作验收</title>
+<style>
+  body { max-width: 800px; margin: 48px auto; padding: 0 24px; font: 20px/1.6 system-ui; color: #1d2939; }
+  input, button { font: inherit; padding: 8px 12px; }
+  section { min-height: 70vh; padding-top: 24px; border-bottom: 1px solid #d0d5dd; }
+  #result { margin-top: 20px; }
+</style>
+<main>
+  <h1 id="step">核心操作</h1>
+  <label>测试内容 <input id="value" autocomplete="off"></label>
+  <button id="confirm" type="button">确认内容</button>
+  <p id="result" aria-live="polite">尚未确认</p>
+  <p><a id="next" href="?step=2">进入第 2 页</a></p>
+  <section><h2>滚动区 1</h2><p>向下滚动后核实位置变化。</p></section>
+  <section><h2>滚动区 2</h2><p>观察、填写、点击、导航和滚动均只影响此页面。</p></section>
+  <section><h2>滚动区 3</h2><p>操作结束后释放共享，并再次绑定同一窗口。</p></section>
+</main>
+<script>
+  const step = new URLSearchParams(location.search).get('step') || '1';
+  document.querySelector('#step').textContent = '核心操作 · 第 ' + step + ' 页';
+  document.querySelector('#confirm').onclick = () => {
+    document.querySelector('#result').textContent = '已确认：' + document.querySelector('#value').value;
+  };
+</script>
+</html>

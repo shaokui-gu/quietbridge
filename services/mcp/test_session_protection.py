@@ -96,6 +96,24 @@ class ProtectionIntegrationTests(unittest.TestCase):
         self.assertTrue(server.protection_status()['retained'])
         self.fixture.fake._stop.assert_not_called()
 
+    def test_target_lease_stays_claimed_until_native_connection_closes(self):
+        from session_registry import live_slots
+        task = self.bind()
+        def closing():
+            record = json.loads(self.fixture.path.read_text())['tasks'][task['taskId']]
+            self.assertEqual(record['state'], 'stopping')
+            with server.task_store() as data:
+                data['tasks'][task['taskId']]['lease']['expiresAt'] = time.time() - 1
+                data['tasks'][task['taskId']]['lease']['expiresAtUptime'] = time.monotonic() - 1
+            slots = live_slots(json.loads(self.fixture.path.with_name('session-registry.json').read_text()))
+            self.assertTrue(any(slot['taskId'] == task['taskId'] for slot in slots.values()),
+                            'A new writer cannot claim the window during native cleanup')
+        self.fixture.fake._stop.side_effect = closing
+        server.interrupt_task('user_stopped_in_quietbridge')
+        record = json.loads(self.fixture.path.read_text())['tasks'][task['taskId']]
+        self.assertEqual(record['state'], 'interrupted')
+        self.assertEqual(live_slots(json.loads(self.fixture.path.with_name('session-registry.json').read_text())), {})
+
     def test_same_run_can_start_another_phase_without_restarting_protection(self):
         first = self.bind()
         self.fixture.payload(action='end', taskId=first['taskId'], confirm=True)
@@ -142,7 +160,7 @@ class ProtectionIntegrationTests(unittest.TestCase):
         self.assertTrue(server.POWER_GUARD['active'])
         self.fixture.fake._stop.assert_not_called()
         self.assertEqual(self.fixture.fake.request.call_args_list[0].args, ('preview', {'action': 'release'}))
-        self.assertEqual(json.loads(self.fixture.path.read_text())['tasks'][bound['taskId']]['state'], 'interrupted')
+        self.assertEqual(json.loads(self.fixture.path.read_text())['tasks'][bound['taskId']]['state'], 'suspended')
 
     def test_watchdog_renews_native_protection_without_renewing_activity(self):
         self.bind()

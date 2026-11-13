@@ -11,6 +11,7 @@ Requires Python 3.9+ (system /usr/bin/python3). No third-party packages.
 """
 
 import collections
+import copy
 import base64
 import json
 import os
@@ -35,6 +36,7 @@ for _dependency in ('compatibility', 'lifecycle_store'):
         sys.modules.pop(_dependency, None)
 
 from browser_events import application_session, config_dir, read_file, make_tool as make_browser_events_tool, TASK_FILE as SESSION_TASK_FILE, validate_render_probe, RENDER_PROBE_STAGES
+from browser_events import resume_assignment as resume_browser_assignment
 from lifecycle_store import stop_reason as host_stop_reason, host_binding
 from compatibility import canonical_tool, environment, runtime_root
 from recovery import GUIDANCE as RECOVERY_GUIDANCE, policy as recovery_policy
@@ -122,6 +124,11 @@ def task_reply(record, **details):
         'requiresWindowShare': True, 'requiresTargetEvidence': True,
         'extensionTabRequired': extension,
     }
+    if record.get('state') == 'suspended' and IDLE_RESUME and TASK_OWNER.owns(record):
+        details['resumption'] = {'automatic': True, 'requiresObservation': True,
+            'nextSteps': [{'tool': 'quietbridge_windows', 'arguments': {
+                'action': 'share', 'appHandle': IDLE_RESUME['binding']['appHandle'],
+                'windowId': record['windowId'], 'source': (IDLE_RESUME['share'] or {}).get('source', 'window')}}]}
     return json.dumps(dict(record, routing=routing, **details), ensure_ascii=False)
 
 
@@ -134,7 +141,7 @@ AGENT_INSTRUCTIONS = """QuietBridge 用于保持用户正常使用电脑的后�
 6. 串行派发并读回核实。dispatched/performed 不代表成功；点击回执中的 focusPreserved=false 或 null 时暂停后续输入并核实原因，不能直接重复点击或自动恢复焦点。FOCUS_STATE_UNKNOWN、FOREGROUND_REQUIRED、共享或窗口投递错误均不得通过激活窗口绕过。超时或执行状态未知时先观察或查询既有命令，不重放副作用。结束时 quietbridge_task(action=end, confirm=true) 释放共享租约。"""
 AGENT_INSTRUCTIONS += "\n准备检查无需先 begin：permissions 的 browserChannel 表示扩展全局心跳与授权；无活动任务的 candidates 返回 connectionScope=extension_preflight、clientVersion 和候选元数据，taskChannelReady=false 不表示扩展离线，也不授权输入或共享。begin 后必须使用自己的会话通道；channel_pending/BROWSER_CHANNEL_STARTING 时保留原任务，只读复查 candidates 最多两次，不要求用户重载扩展、不重建目标。全局候选不能替代会话内 assign 的候选证据。"
 AGENT_INSTRUCTIONS += "\n7. " + RECOVERY_GUIDANCE
-AGENT_INSTRUCTIONS += "\n8. quietbridge_task end 仅结束当前界面操作阶段并释放绑定和共享预览；阶段切换和短暂停顿不结束会话锁屏保护。end 返回 previewCleanup；released 仅确认面板/租约释放，捕获停止需看 captureStop.stopState=completed、stopConfirmed=true 或对应 captureStopCompleted 日志；requested/failed/缺失不能称捕获已确认退出。failed/unconfirmed 时通知用户清理未确认，不把 state=ended 当作共享已关闭。同一宿主本轮可 begin/bind 多个界面阶段。120 秒无实际界面操作会中断该阶段，ping、权限/任务状态查询和扩展心跳不续期。宿主 FinalStop/SessionEnd、取消、断连或退出结束会话保护；已核实宿主归属的会话保护允许最长 30 分钟无实际工具活动，未核实归属时保留 120 秒兜底，不能声称连接器在线就证明会话仍在运行。TASK_INTERRUPTED/TASK_CANCELLED 后不得复活旧任务或重放输入，先核实既有结果，再 begin 并显式绑定新阶段。TARGET_MISMATCH 只说明目标不一致，不证明旧任务已失效；先查看状态，不自动结束或接管其他任务。"
+AGENT_INSTRUCTIONS += "\n8. quietbridge_task end 仅结束当前界面操作阶段并释放绑定和共享预览；阶段切换和短暂停顿不结束会话锁屏保护。end 返回 previewCleanup；released 仅确认面板/租约释放，捕获停止需看 captureStop.stopState=completed、stopConfirmed=true 或对应 captureStopCompleted 日志；requested/failed/缺失不能称捕获已确认退出。failed/unconfirmed 时通知用户清理未确认，不把 state=ended 当作共享已关闭。同一宿主本轮可 begin/bind 多个界面阶段。120 秒无实际界面操作时释放共享并将原绑定暂停为 suspended；同一存活 worker 的下次原目标调用自动核验恢复，TASK_SUSPENDED/TASK_RESUMED 要立即按 resumption.nextSteps 重建共享与新快照，继续已授权工作，不等待用户提醒重连。恢复调用不派发输入，旧引用失效，未知结果不重放；恢复失败只读复查最多两次，再说明具体阻塞并按 recovery.userDecision 弹框等待选择。ping、权限/任务状态查询和扩展心跳不续期也不唤起共享。宿主 FinalStop/SessionEnd、取消、断连或退出结束会话保护及自动恢复意图；已核实宿主归属的会话保护允许最长 30 分钟无实际工具活动，未核实归属时保留 120 秒兜底。TASK_CANCELLED 或 interruption.explicitStop=true 是明确停止，不弹继续选择、不自动重建。其他 TASK_INTERRUPTED 仅结束旧界面阶段，保留业务进度并用 Agent 交互工具让用户选择处理后继续/保持暂停/结束；不能复活旧任务。TARGET_MISMATCH 只说明目标不一致；先查看状态，不自动结束或接管其他任务。"
 AGENT_INSTRUCTIONS += "\n9. QuietBridge 最多同时运行三个独立会话。宿主 hook 自动提供可信逐调用身份，Agent 不填写会话 ID 或 _quietbridgeRoute。每项复用自己的 taskId、appHandle、窗口/标签、快照和命令结果；卡片切换只是用户查看画面，不能据此变更操作目标。SESSION_CAPACITY_FULL/TARGET_IN_USE 时通知用户并等待，不能结束或接管其他会话。同一个原生应用进程的不同窗口暂按进程互斥；浏览器使用不同专用窗口。某项停止、超时或执行进程退出后只处理本项，禁止重启整个连接器影响其他项。"
 AGENT_INSTRUCTIONS += "\n10. " + BROWSER_ROUTING_GUIDANCE
 
@@ -334,10 +341,12 @@ def operation_log(event, **fields):
 
 
 class HelperError(Exception):
-    def __init__(self, code, message):
+    def __init__(self, code, message, *, target_conflict=None, interruption=None):
         Exception.__init__(self, "%s: %s" % (code, message))
         self.code = code
         self.message = message
+        self.target_conflict = target_conflict
+        self.interruption = interruption
 
 
 class HelperClient(object):
@@ -555,6 +564,7 @@ CALL_RECORDS = None
 INPUT_CONNECTION = None
 SHARE_RECORD = None
 SHARE_SELECTION = None  # 显式范围仅属于同一连接和目标，不影响其他应用或任务。
+IDLE_RESUME = None  # Only this live worker may resume its own idle-suspended target.
 
 
 def input_window(app, window=None, snapshot=None, allow_unique=False):
@@ -629,7 +639,16 @@ def native_preview_matches(task_id):
 
 
 def stop_browser_preview():
-    """Compatibility no-op; there is no screenshot-mailbox producer."""
+    """Remove legacy experimental preview metadata without native I/O."""
+    import browser_events as events
+    path = Path(TASK_FILE).with_name('browser-events.json')
+    if path.exists():
+        try:
+            with events.event_store(path) as data:
+                for key in ('windowPreview', 'navigationCapture', 'previewLease', 'previewFrame'):
+                    data.setdefault('peer', {}).pop(key, None)
+        except (ValueError, OSError):
+            pass
 
 
 def selected_share_source(app, window):
@@ -823,22 +842,183 @@ def cancellable_wait(seconds):
 
 def interrupt_task(reason):
     """Only this bridge's task/socket is revoked; never start a helper to clean up."""
-    global SHARE_SELECTION
+    global SHARE_SELECTION, IDLE_RESUME
     with TOOL_LOCK:
+        IDLE_RESUME = None
+        stopping_id = None
         try:
             if TASK_OWNER.fd is not None and os.path.lexists(TASK_FILE):
                 with task_store() as data:
                     record = data['tasks'].get(data.get('activeTaskId'))
                     if record and TASK_OWNER.owns(record) and record['state'] not in ('ended', 'interrupted'):
-                        record.update(state='interrupted', interruptionReason=reason, interruptedAt=time.time())
+                        stopping_id = record['taskId']
+                        record.update(state='stopping', interruptionReason=reason, interruptedAt=time.time())
                         TASK_BINDINGS.pop(record['taskId'], None)
-                        operation_log('task.interrupted', taskId=record['taskId'], reason=reason)
         finally:
             SHARE_SELECTION = None
+            stop_browser_preview()
             STATE.update(snapshot=None, snapshot_app=None, snapshot_window=None)
             POWER_GUARD.update(active=False, nextRenewAt=0.0)
             SESSION_PROTECTION.clear()
             HELPER._stop()
+            if stopping_id is not None:
+                with task_store() as data:
+                    record = data['tasks'].get(stopping_id)
+                    if record and TASK_OWNER.owns(record) and record['state'] == 'stopping':
+                        record['state'] = 'interrupted'
+                        operation_log('task.interrupted', taskId=stopping_id, reason=reason)
+
+
+def suspend_idle_task(reason='idle_timeout', retain_protection=False):
+    """Release idle resources while retaining only this worker's target consent."""
+    global IDLE_RESUME, SHARE_SELECTION
+    with task_store() as data:
+        record = data['tasks'].get(data.get('activeTaskId'))
+        if not record or not TASK_OWNER.owns(record):
+            return
+        binding = TASK_BINDINGS.get(record['taskId'])
+        if record['state'] == 'bound' and binding:
+            browser = read_file(Path(TASK_FILE).with_name('browser-events.json'), {}).get('tasks', {}).get(record['taskId'])
+            IDLE_RESUME = {'record': copy.deepcopy(record), 'binding': copy.deepcopy(binding),
+                           'share': copy.deepcopy(SHARE_SELECTION),
+                           'browser': copy.deepcopy(browser or binding.get('browserTarget')),
+                           'applicationSession': application_session(), 'nativeRetained': retain_protection}
+            record.update(state='suspended', suspensionReason=reason, suspendedAt=time.time())
+            TASK_BINDINGS.pop(record['taskId'], None)
+            operation_log('task.suspended', taskId=record['taskId'], reason=reason,
+                          automaticResume=True, protectionRetained=retain_protection)
+        elif record['state'] != 'suspended' or IDLE_RESUME is None:
+            return
+    STATE.update(snapshot=None, snapshot_app=None, snapshot_window=None)
+    if retain_protection:
+        release_task_preview()
+    else:
+        SHARE_SELECTION = None
+        stop_browser_preview()
+        POWER_GUARD.update(active=False, nextRenewAt=0.0)
+        SESSION_PROTECTION.clear()
+        HELPER._stop()
+
+
+def resume_idle_task(name, args):
+    """Revalidate on new work, never from a timer or by replaying the triggering call."""
+    global IDLE_RESUME, SHARE_SELECTION
+    eligible = (name in TASK_TARGET_TOOLS - {'quietbridge_situation'} or
+                name == 'quietbridge_windows' and args.get('action') == 'share' or
+                name == 'quietbridge_browser_events' and args.get('action') in ('command', 'result', 'assign', 'verify_mapping'))
+    saved = IDLE_RESUME
+    if not saved or not eligible:
+        return None
+    if READ_ONLY:
+        return None
+    original = saved['record']
+    task_id, window = original['taskId'], original['windowId']
+    with task_store() as data:
+        record = data['tasks'].get(data.get('activeTaskId'))
+        if not record or record.get('taskId') != task_id or record.get('state') != 'suspended' or not TASK_OWNER.owns(record):
+            IDLE_RESUME = None
+            return None
+        if (args.get('taskId', task_id) != task_id or args.get('windowId', window) != window or
+                args.get('appHandle', saved['binding']['appHandle']) != saved['binding']['appHandle']):
+            raise HelperError('TARGET_MISMATCH', '等待恢复仅允许原任务和原窗口，未连接其他目标')
+        if saved['applicationSession'] != application_session():
+            IDLE_RESUME = None
+            raise HelperError('REQUIRES_REVALIDATION', 'QuietBridge 应用运行会话已改变，不能自动恢复旧任务')
+        stopped = host_stop_reason(record, task_root())
+        if stopped:
+            raise HelperError('TASK_INTERRUPTED', '宿主已经停止，未恢复共享或派发输入',
+                              interruption={'explicitStop': True, 'reason': stopped})
+    check_request_cancelled()
+    if saved.get('nativeRetained') and HELPER._alive():
+        try:
+            # Native and bridge timers can expire in either order. A revoked
+            # idle socket cannot reacquire preview; rotate just that socket.
+            HELPER.request('preview', {'action': 'renew'}, timeout=3, retry_safe=False)
+        except HelperError as error:
+            if error.code != 'TASK_INTERRUPTED':
+                raise
+            HELPER._stop()
+            POWER_GUARD.update(active=False, nextRenewAt=0.0)
+        saved['nativeRetained'] = False
+    # Resolve a fresh handle; an idle native socket may already be revoked.
+    app = call_helper('getApp', {'selector': str(original['pid'])}) or {}
+    handle = app.get('appHandle')
+    if not handle or app.get('pid') != original['pid']:
+        raise HelperError('WINDOW_UNAVAILABLE', '原应用进程已不可用，未选择其他应用')
+    identity = call_helper('windowIdentity', {'appHandle': handle, 'windowId': window}) or {}
+    if (identity.get('pid') != original['pid'] or identity.get('windowId') != window or
+            identity.get('processIdentity') != original['processIdentity']):
+        IDLE_RESUME = None
+        with task_store() as data:
+            data['tasks'][task_id]['state'] = 'invalidated'
+        raise HelperError('TASK_INVALIDATED', '原窗口或进程代际已经变化，未恢复共享')
+    check_request_cancelled()
+    stopped = host_stop_reason(original, task_root())
+    if stopped:
+        raise HelperError('TASK_INTERRUPTED', '恢复期间宿主已停止，未恢复共享',
+                          interruption={'explicitStop': True, 'reason': stopped})
+    STATE['apps'][handle] = {key: app.get(key) for key in ('pid', 'name', 'bundleId')}
+    restored = copy.deepcopy(original)
+    restored['state'] = 'bound'
+    if original.get('interactionMode') != 'desktop':
+        native = call_helper('browserSession', {'action': 'attach', 'pid': original['pid'],
+                            'windowId': window, 'confirm': True}) or {}
+        if (native.get('state') != 'attached' or native.get('running') is not True or
+                native.get('processIdentity') != original['processIdentity'] or
+                native.get('windowId') != window or native.get('pid') != original['pid'] or
+                not native.get('sessionId') or not any(w.get('windowId') == window for w in native.get('windows', []))):
+            raise HelperError('ATTACH_UNVERIFIED', '原 Chrome 窗口重新核验未通过，未恢复共享')
+        restored['sessionId'] = native['sessionId']
+    TASK_OWNER.renew(restored)
+    with task_store() as data:
+        current = data['tasks'].get(data.get('activeTaskId'))
+        if current is None or current['taskId'] != task_id or current['state'] != 'suspended' or not TASK_OWNER.owns(current):
+            raise HelperError('TASK_INTERRUPTED', '恢复期间任务归属已变化，未恢复共享')
+        check_request_cancelled()
+        require_protection_scope(current)
+        from session_registry import claim_target
+        try:
+            claim_target(task_root(), SESSION_KEY or TASK_OWNER.id, restored, TASK_FILE)
+        except ValueError as error:
+            raise HelperError(str(error).split(':', 1)[0], str(error),
+                              target_conflict=getattr(error, 'conflict', None))
+        data['tasks'][task_id] = restored
+    TASK_BINDINGS[task_id] = {'appHandle': handle, 'connection': current_connection(), 'requiresObservation': True}
+    STATE.update(app=handle, snapshot=None, snapshot_app=None, snapshot_window=None)
+    SHARE_SELECTION = None
+    share_args = {'action': 'share', 'appHandle': handle, 'windowId': window,
+                  'source': (saved['share'] or {}).get('source', 'window')}
+    next_steps = []
+    try:
+        if original.get('interactionMode') == 'desktop':
+            hold_power_guard(restored)
+            ensure_share(handle, window, source=share_args['source'], require_frame=False)
+            next_steps.append({'tool': 'quietbridge_state', 'arguments': {'appHandle': handle, 'windowId': window}})
+        else:
+            if saved['browser']:
+                resume_browser_assignment(saved['browser'], restored, TASK_FILE,
+                                          Path(task_root()) / 'browser-events.json' if SESSION_KEY else None)
+                TASK_BINDINGS[task_id]['browserTarget'] = copy.deepcopy(saved['browser'])
+            else:
+                next_steps.append({'tool': 'quietbridge_browser_events', 'arguments': {'action': 'candidates', 'taskId': task_id}})
+            next_steps.extend([
+                {'tool': 'quietbridge_browser_events', 'arguments': {'action': 'verify_mapping', 'taskId': task_id}},
+                {'tool': 'quietbridge_windows', 'arguments': share_args},
+                {'tool': 'quietbridge_browser_events', 'arguments': {'action': 'command', 'taskId': task_id, 'operation': 'snapshot'}}])
+    except (HelperError, ValueError, OSError):
+        # A failed recovery stays suspended, without a writable task or a
+        # partly restored preview. Only a subsequent caller may try again.
+        with task_store() as data:
+            current = data['tasks'].get(task_id)
+            if current and current.get('state') == 'bound' and TASK_OWNER.owns(current):
+                current.update(state='suspended', suspensionReason='resume_failed', lease=original['lease'])
+        TASK_BINDINGS.pop(task_id, None)
+        release_task_preview()
+        raise
+    IDLE_RESUME = None
+    operation_log('task.resumed', taskId=task_id, windowId=window, inputDispatched=False)
+    return {'taskId': task_id, 'appHandle': handle, 'windowId': window, 'nextSteps': next_steps,
+            'inputDispatched': False, 'requiresObservation': True}
 
 
 def reap_task_lease():
@@ -847,10 +1027,12 @@ def reap_task_lease():
     expired = False
     with task_store() as data:
         record = data['tasks'].get(data.get('activeTaskId'))
-        expired = bool(record and record['state'] not in ('ended', 'interrupted') and TASK_OWNER.expired(record))
+        expired = bool(record and record['state'] not in ('ended', 'interrupted', 'suspended', 'invalidated') and TASK_OWNER.expired(record))
     if expired:
         binding = protection_host_binding()
-        if SESSION_PROTECTION.record is not None and SESSION_PROTECTION.remaining(binding) > 0:
+        if record.get('state') == 'bound' and TASK_BINDINGS.get(record['taskId']):
+            suspend_idle_task(retain_protection=SESSION_PROTECTION.record is not None and SESSION_PROTECTION.remaining(binding) > 0)
+        elif SESSION_PROTECTION.record is not None and SESSION_PROTECTION.remaining(binding) > 0:
             # An idle interface phase cannot end the surrounding host run.
             with task_store() as data:
                 record = data['tasks'].get(data.get('activeTaskId'))
@@ -884,7 +1066,9 @@ def reap_protection_session():
     if binding is not None and binding.get('stoppedAt') is not None:
         interrupt_task(binding.get('reason', 'host_turn_ended'))
     elif SESSION_PROTECTION.remaining(binding) <= 0:
-        interrupt_task('session_idle_timeout')
+        suspend_idle_task('session_idle_timeout')
+        if SESSION_PROTECTION.record is not None:
+            interrupt_task('session_idle_timeout')
     elif not HELPER._alive():
         interrupt_task('native_connection_lost')
     elif time.monotonic() >= POWER_GUARD['nextRenewAt']:
@@ -1004,15 +1188,79 @@ def native_task_check(record, binding):
                           w.get("pid", record["pid"]) == record["pid"] for w in windows) else "invalidated"
 
 
+def target_recovery_status(record):
+    """Read-only recovery evidence; never create, select or bind a replacement."""
+    record.pop('windowClosure', None)
+    result = {'status': 'inspect_required', 'taskId': record['taskId'],
+              'closedWindowConfirmed': False, 'maxAutomaticRecoveries': 2,
+              'automaticRecoveriesUsed': (record.get('windowRecovery') or {}).get('attempt', 0)}
+    creation = record.get('windowCreation') or {}
+    binding = TASK_BINDINGS.get(record['taskId'])
+    if (record.get('interactionMode') != 'background_browser' or not creation or
+            creation.get('windowId') != record.get('windowId') or
+            creation.get('processIdentity') != record.get('processIdentity')):
+        return dict(result, reason='no_task_created_window_evidence')
+    if (not TASK_OWNER.owns(record) or not binding or
+            binding.get('connection') != current_connection() or not HELPER._alive() or
+            not lease_live(record, Path(TASK_FILE).parent)):
+        return dict(result, reason='owner_or_connection_changed')
+    session = application_session()
+    if not session or creation.get('applicationSession') != session or host_stop_reason(record, task_root()):
+        return dict(result, reason='application_or_host_stopped')
+    try:
+        # A missing native session/AX title alone does not establish closure.
+        # Both reads validate the original handle's live process generation.
+        try:
+            call_helper('windowIdentity', {'appHandle': binding['appHandle'], 'windowId': record['windowId']})
+        except HelperError as error:
+            if error.code != 'WINDOW_UNAVAILABLE':
+                return dict(result, reason='original_process_unverified', errorCode=error.code)
+        else:
+            return dict(result, reason='original_window_still_exists')
+        listing = call_helper('listWindows', {'appHandle': binding['appHandle']})
+        rows = listing.get('windows') if isinstance(listing, dict) else listing
+        if (not isinstance(rows, list) or any(not isinstance(row, dict) or
+                type(row.get('windowId')) is not int for row in rows) or
+                any(row['windowId'] == record['windowId'] for row in rows)):
+            return dict(result, reason='window_list_does_not_confirm_closure')
+        assert_task_connection(binding)
+        check_request_cancelled()
+    except HelperError as error:
+        return dict(result, reason='closure_check_failed', errorCode=error.code)
+    if host_stop_reason(record, task_root()) or application_session() != session:
+        return dict(result, reason='application_or_host_stopped')
+    record['windowClosure'] = {'checkedAt': time.time(), 'applicationSession': session,
+                              'appHandle': binding['appHandle'], 'connectionId': HELPER.connection_id}
+    if result['automaticRecoveriesUsed'] >= result['maxAutomaticRecoveries']:
+        return dict(result, status='decision_required', reason='repeated_window_closure',
+                    closedWindowConfirmed=True)
+    return dict(result, status='recreate_allowed', reason='confirmed_closed_task_window',
+                closedWindowConfirmed=True, formerWindowId=record['windowId'],
+                formerBrowserWindowId=creation['browserWindowId'],
+                formerTabId=creation['tabId'], inputDispatched=False)
+
+
+def interruption_evidence(record):
+    stopped = host_stop_reason(record, task_root())
+    reason = stopped or record.get('interruptionReason')
+    return {'reason': reason, 'explicitStop': bool(stopped or reason == 'client_cancelled')}
+
+
 def task_status(record):
-    if record.get('lease') and not lease_live(record, Path(TASK_FILE).parent) and record['state'] not in ('ended', 'interrupted'):
+    if record.get('state') == 'suspended':
+        return dict(record, resumption={'automatic': bool(IDLE_RESUME and TASK_OWNER.owns(record)),
+                    'trigger': 'next_target_tool', 'requiresObservation': True})
+    if record.get('lease') and not lease_live(record, Path(TASK_FILE).parent) and record['state'] not in ('ended', 'interrupted', 'invalidated'):
         record.update(state='interrupted', interruptionReason='owner_disconnected_or_expired', interruptedAt=time.time())
-        return dict(record)
+        return dict(record, interruption=interruption_evidence(record))
     if record.get('lease') and not TASK_OWNER.owns(record):
         return dict(record, ownership='another_connector')
     previous_state = record["state"]
-    if record["state"] in ("awaiting_window", "invalidated", "ended", "interrupted"):
-        return dict(record)
+    if record['state'] == 'invalidated':
+        return dict(record, targetRecovery=target_recovery_status(record))
+    if record["state"] in ("awaiting_window", "ended", "interrupted"):
+        return (dict(record, interruption=interruption_evidence(record))
+                if record['state'] == 'interrupted' else dict(record))
     binding = TASK_BINDINGS.get(record["taskId"])
     if binding is None or binding["connection"] != current_connection() or not HELPER._alive():
         record["state"] = "requires_revalidation"
@@ -1020,9 +1268,9 @@ def task_status(record):
         try:
             record["state"] = native_task_check(record, binding)
         except HelperError as exc:
-            if exc.code in ("STALE_APP", "APP_UNAVAILABLE", "WINDOW_UNAVAILABLE", "BROWSER_PROCESS_MISMATCH"):
+            if exc.code in ("APP_UNAVAILABLE", "WINDOW_UNAVAILABLE", "BROWSER_PROCESS_MISMATCH"):
                 record["state"] = "invalidated"
-            elif exc.code == "REQUIRES_REVALIDATION":
+            elif exc.code in ("REQUIRES_REVALIDATION", "STALE_APP"):
                 record["state"] = "requires_revalidation"
             else:
                 raise
@@ -1030,13 +1278,15 @@ def task_status(record):
         # The target vanished, not the host run. End its preview while keeping
         # the independently bounded session protection for the next phase.
         release_task_preview()
-    return dict(record)
+    return (dict(record, targetRecovery=target_recovery_status(record))
+            if record['state'] == 'invalidated' else dict(record))
 
 
 def require_protection_scope(record):
     current = host_binding(record, task_root())
     if current is not None and current.get('stoppedAt') is not None:
-        raise HelperError('TASK_INTERRUPTED', '宿主运行已经停止，未派发新阶段输入；不能用迟到回执复活任务')
+        raise HelperError('TASK_INTERRUPTED', '宿主运行已经停止，未派发新阶段输入；不能用迟到回执复活任务',
+                          interruption={'explicitStop': True, 'reason': current.get('reason', 'host_turn_ended')})
     if SESSION_PROTECTION.record is None:
         return
     anchor = SESSION_PROTECTION.record
@@ -1127,15 +1377,15 @@ def release_task_preview():
 
 
 def tool_task(args):
-    global SHARE_SELECTION
-    if not isinstance(args, dict) or set(args) - {"action", "taskId", "appHandle", "windowId", "confirm", "interactionMode", "targetSurface"}:
-        raise HelperError("INVALID_ARGUMENT", "仅接受 action、taskId、appHandle、windowId、confirm、interactionMode、targetSurface")
+    global SHARE_SELECTION, IDLE_RESUME
+    if not isinstance(args, dict) or set(args) - {"action", "taskId", "appHandle", "windowId", "confirm", "interactionMode", "targetSurface", "recoveryOf"}:
+        raise HelperError("INVALID_ARGUMENT", "仅接受 action、taskId、appHandle、windowId、confirm、interactionMode、targetSurface、recoveryOf")
     action = args.get("action")
     if action not in ("begin", "bind", "status", "end"):
         raise HelperError("INVALID_ARGUMENT", "action 必须为 begin、bind、status、end")
-    if action == "begin" and set(args) - {"action", "interactionMode", "targetSurface"}:
-        raise HelperError("INVALID_ARGUMENT", "begin 仅接受 interactionMode 与 targetSurface")
-    if action != "begin" and any(key in args for key in ('interactionMode', 'targetSurface')):
+    if action == "begin" and set(args) - {"action", "interactionMode", "targetSurface", "recoveryOf"}:
+        raise HelperError("INVALID_ARGUMENT", "begin 仅接受 interactionMode、targetSurface、recoveryOf")
+    if action != "begin" and any(key in args for key in ('interactionMode', 'targetSurface', 'recoveryOf')):
         raise HelperError("INVALID_ARGUMENT", "任务执行模式及操作对象不能中途更改；只能在 begin 时指定")
     if action == "status" and set(args) - {"action", "taskId"}:
         raise HelperError("INVALID_ARGUMENT", "status 仅接受 action 和 taskId")
@@ -1148,6 +1398,53 @@ def tool_task(args):
         reap_protection_session()
     with task_store() as data:
         if action == "begin":
+            recovery = None
+            if 'recoveryOf' in args:
+                origin_id = args['recoveryOf']
+                origin = data['tasks'].get(origin_id) if isinstance(origin_id, str) else None
+                if not origin or not TASK_OWNER.owns(origin):
+                    raise HelperError('TASK_INTERRUPTED', '恢复来源不属于本连接，未重建窗口')
+                stopped = host_stop_reason(origin, task_root())
+                if stopped:
+                    raise HelperError('TASK_INTERRUPTED', '恢复来源的宿主已停止，未重建窗口',
+                                      interruption={'explicitStop': True, 'reason': stopped})
+                closure = origin.get('windowClosure') or {}
+                successor = data['tasks'].get((origin.get('windowRecoveryNext') or ''))
+                if successor:
+                    # Lost begin receipts must not produce another replacement.
+                    if (data.get('activeTaskId') != successor['taskId'] or not TASK_OWNER.owns(successor) or
+                            successor.get('state') in ('ended', 'interrupted', 'stopping') or
+                            not lease_live(successor, Path(TASK_FILE).parent) or
+                            host_stop_reason(successor, task_root()) or interaction_mode != 'background_browser' or
+                            closure.get('applicationSession') != application_session() or
+                            not HELPER._alive() or closure.get('connectionId') != HELPER.connection_id):
+                        raise HelperError('REQUIRES_REVALIDATION', '恢复阶段已结束或运行归属改变；未复活历史阶段或建立新窗口')
+                    return task_reply(successor, recoveryReused=True)
+                if (origin.get('state') != 'ended' or data.get('activeTaskId') is not None or
+                        not origin.get('windowCreation') or interaction_mode != 'background_browser' or
+                        not closure.get('applicationSession') or closure['applicationSession'] != application_session() or
+                        not HELPER._alive() or closure.get('connectionId') != HELPER.connection_id or
+                        not 0 <= time.time() - closure.get('checkedAt', 0) < 120):
+                    raise HelperError('REQUIRES_REVALIDATION', '先核实本任务窗口已关闭并 end 自己的失效阶段；不得覆盖活动目标或迁移进程')
+                attempt = (origin.get('windowRecovery') or {}).get('attempt', 0) + 1
+                if attempt > 2:
+                    raise HelperError('RECOVERY_DECISION_REQUIRED', '窗口连续关闭，自动恢复已暂停；请在 Agent 选择下一步，未认定为取消')
+                listing = call_helper('listWindows', {'appHandle': closure['appHandle']})
+                rows = listing.get('windows') if isinstance(listing, dict) else listing
+                if (not isinstance(rows, list) or any(not isinstance(row, dict) or
+                        type(row.get('windowId')) is not int for row in rows) or
+                        any(row['windowId'] == origin['windowId'] for row in rows)):
+                    raise HelperError('REQUIRES_REVALIDATION', '原窗口关闭状态已变化，未建立恢复阶段')
+                check_request_cancelled()
+                stopped = host_stop_reason(origin, task_root())
+                if stopped:
+                    raise HelperError('TASK_INTERRUPTED', '恢复核验期间宿主已停止，未建立新阶段',
+                                      interruption={'explicitStop': True, 'reason': stopped})
+                if (closure['applicationSession'] != application_session() or not HELPER._alive() or
+                        closure['connectionId'] != HELPER.connection_id):
+                    raise HelperError('REQUIRES_REVALIDATION', '恢复核验期间运行会话或连接改变，未建立新阶段')
+                recovery = {'rootTaskId': (origin.get('windowRecovery') or {}).get('rootTaskId', origin_id),
+                            'previousTaskId': origin_id, 'attempt': attempt}
             previous = data["tasks"].get(data.get("activeTaskId"))
             if isinstance(previous, dict) and previous.get("state") not in ('ended', 'interrupted'):
                 if previous.get('lease') and not TASK_OWNER.owns(previous) and lease_live(previous, Path(TASK_FILE).parent):
@@ -1157,6 +1454,7 @@ def tool_task(args):
                 previous.update(state='interrupted', interruptionReason='replaced_by_explicit_begin', interruptedAt=time.time())
                 TASK_BINDINGS.pop(previous['taskId'], None)
             SHARE_SELECTION = None
+            IDLE_RESUME = None
             if isinstance(previous, dict) and previous.get("windowId") is not None and HELPER._alive():
                 release_task_preview()
             task_id = str(uuid.uuid4())
@@ -1165,6 +1463,8 @@ def tool_task(args):
                       "interactionMode": interaction_mode}
             if 'targetSurface' in args:
                 record['targetSurface'] = args['targetSurface']
+            if recovery:
+                record['windowRecovery'] = recovery
             TASK_OWNER.attach(record, Path(TASK_FILE).parent)
             from session_registry import reserve
             try:
@@ -1173,6 +1473,8 @@ def tool_task(args):
                 raise HelperError(str(error).split(':', 1)[0], str(error))
             data["tasks"][task_id] = record
             data["activeTaskId"] = task_id
+            if recovery:
+                origin['windowRecoveryNext'] = task_id
             return task_reply(record)
         task_id = args.get("taskId", data["activeTaskId"])
         record = data["tasks"].get(task_id)
@@ -1190,6 +1492,7 @@ def tool_task(args):
                 raise HelperError('TASK_IN_USE', '任务属于另一个活动连接，未结束其任务')
             if active:
                 require_protection_scope(record)
+                IDLE_RESUME = None
             TASK_BINDINGS.pop(task_id, None)
             if active:
                 data["activeTaskId"] = None
@@ -1209,8 +1512,11 @@ def tool_task(args):
             raise HelperError("INVALID_ARGUMENT", "bind 需要显式 appHandle、有效 windowId、confirm=true")
         if READ_ONLY:
             raise HelperError("READ_ONLY", "QUIETBRIDGE_READ_ONLY=1，bind 已禁用")
-        if record['state'] in ('ended', 'interrupted'):
-            raise HelperError('TASK_INTERRUPTED', '任务已结束或中断；先核实目标并 begin 新任务，不能复活旧输入')
+        if record['state'] == 'suspended' and IDLE_RESUME and TASK_OWNER.owns(record):
+            raise HelperError('TASK_SUSPENDED', '等待暂停保留原目标；请自动调用原窗口 share 恢复并重新观察，无需重新 bind 或等待用户确认')
+        if record['state'] in ('ended', 'interrupted', 'suspended'):
+            raise HelperError('TASK_INTERRUPTED', '任务已结束或中断；先核实目标并 begin 新任务，不能复活旧输入',
+                              interruption=interruption_evidence(record))
         if record.get('lease') and not TASK_OWNER.owns(record):
             raise HelperError('TASK_IN_USE' if lease_live(record, Path(TASK_FILE).parent) else 'TASK_INTERRUPTED',
                               '原任务属于其他连接；不能静默恢复或接管')
@@ -1256,7 +1562,8 @@ def tool_task(args):
             record.update(state='awaiting_window', mode=None)
             for key in ('pid', 'windowId', 'processIdentity', 'sessionId'):
                 record.pop(key, None)
-            raise HelperError(str(error).split(':', 1)[0], str(error))
+            raise HelperError(str(error).split(':', 1)[0], str(error),
+                              target_conflict=getattr(error, 'conflict', None))
         TASK_BINDINGS[task_id] = {"appHandle": app, "connection": current_connection()}
         TASK_OWNER.attach(record, Path(TASK_FILE).parent)
         data["activeTaskId"] = task_id
@@ -1295,9 +1602,13 @@ def task_guard(name, args):
                     name == 'quietbridge_browser_events' and args.get('action') not in ('status', 'candidates', 'annotations')):
                 raise HelperError('TASK_NOT_BOUND', '会话保护仍在，当前界面阶段已结束；先 begin 并绑定新阶段，不能复用已结束目标或无任务输入')
             return args, None
+        if (record.get('state') == 'suspended' and IDLE_RESUME and TASK_OWNER.owns(record) and
+                (name in TASK_TARGET_TOOLS or name in ('quietbridge_windows', 'quietbridge_browser_events', 'quietbridge_browser_session'))):
+            raise HelperError('TASK_SUSPENDED', '原任务因等待暂时释放共享；请立即调用原窗口 share 自动恢复，随后重新观察，无需用户提醒')
         if record.get('lease') and (record['state'] == 'interrupted' or not lease_live(record, Path(TASK_FILE).parent)):
             if name in TASK_TARGET_TOOLS or name in ('quietbridge_windows', 'quietbridge_browser_events', 'quietbridge_browser_session'):
-                raise HelperError('TASK_INTERRUPTED', '原任务已中断或租约已过期；查看任务状态后显式创建新任务')
+                raise HelperError('TASK_INTERRUPTED', '原任务已中断或租约已过期；查看任务状态后显式创建新任务',
+                                  interruption=interruption_evidence(record))
         if record.get('lease') and not TASK_OWNER.owns(record) and (
                 name in TASK_TARGET_TOOLS or name in ('quietbridge_windows', 'quietbridge_browser_session') or
                 (name == 'quietbridge_browser_events' and args.get('action') not in ('status', 'candidates', 'annotations'))):
@@ -1345,6 +1656,10 @@ def task_guard(name, args):
     if record.get("interactionMode") == "desktop":
         hold_power_guard(record)
     context = dict(binding, windowId=record["windowId"])
+    if binding.get('requiresObservation') and name in {
+            'quietbridge_click', 'quietbridge_hover', 'quietbridge_scroll', 'quietbridge_drag',
+            'quietbridge_type_text', 'quietbridge_paste', 'quietbridge_key', 'quietbridge_set_value'}:
+        raise HelperError('TASK_RESUMED', '共享刚恢复，请先对原窗口调用 quietbridge_state 或 quietbridge_visual_state；旧输入未执行')
     if name in ("quietbridge_type_text", "quietbridge_paste", "quietbridge_key") or (
             name == "quietbridge_windows" and args.get("action", "list") not in ("list", "share", "unshare")):
         raise HelperError("UNSAFE_WINDOW_DELIVERY", "原生接口仅确认应用，无法安全投递到绑定窗口，已拒绝")
@@ -1389,6 +1704,10 @@ def validate_task_result(method, result, binding):
             result.get("appHandle", binding["appHandle"]) != binding["appHandle"]):
         STATE.update(snapshot=None, snapshot_app=None, snapshot_window=None)
         raise HelperError("TARGET_MISMATCH", "原生观察返回不同目标，未交付结果或记录快照")
+    if method in ('getState', 'visualState', 'screenshot'):
+        for current in TASK_BINDINGS.values():
+            if current.get('appHandle') == binding['appHandle'] and current.get('connection') == binding['connection']:
+                current.pop('requiresObservation', None)
 
 
 # ---------------------------------------------------------------------------
@@ -1760,12 +2079,13 @@ def tool_apps(args):
 
 
 def tool_windows(args):
-    global SHARE_SELECTION
+    global SHARE_SELECTION, IDLE_RESUME
     action = (args.get("action") or "list").lower()
     if action == "unshare":
         # 释放共享不需要应用句柄：目标应用可能已经退出，但浮层必须能收掉。
         if READ_ONLY:
             raise HelperError("READ_ONLY", "QUIETBRIDGE_READ_ONLY=1，unshare 已禁用")
+        IDLE_RESUME = None
         stop_browser_preview()
         if not HELPER._alive():
             release_task_preview()
@@ -2432,13 +2752,15 @@ TOOLS = [
      "annotations": {"readOnlyHint": True, "destructiveHint": False}},
     {
         "name": "quietbridge_task",
-        "description": BROWSER_ROUTING_GUIDANCE + "界面任务必须不抢焦点，绑定后使用 quietbridge_windows action=share source=window 建立系统窗口连续视频预览；网页动作完成后扩展执行一次有界绘制脉冲，空闲时不轮询截图。绑定不等于首帧就绪。begin 推荐指定 targetSurface，自动选择对应执行模式；显式 interactionMode 与之冲突会拒绝。省略 targetSurface 时兼容原调用：默认 background_browser，或显式 desktop。网页阶段禁止所有原生输入和窗口激活；扩展未就绪必须等待。操作对象和模式只能在 begin 指定，不能中途更改。begin/status/bind/end 回执含 routing，表明选路及前提，不证明已绑定、已授权或已共享。begin 生成 UUID，保持 awaiting_window，不创建或启动浏览器。bind 必须显式 appHandle、windowId、confirm=true，仅绑定已有窗口，mode=attached_existing，不等于新建或数据隔离。status 只读核验进程代际和窗口；跨连接 requires_revalidation，需重新显式确认，绝不按 PID 自动接管。任务期间观察和输入严格限制目标，应用级键盘接口拒绝。网页共享前先 assign 并 verify_mapping。"
-                       "后台模式不启动桌面接管；共享预览独立维持原目标和宿主位置。end 只释放本阶段绑定和共享预览，返回 sessionProtection；同一宿主本轮下一阶段可 begin 新任务，不主动交还系统锁屏。会话停止、取消或断连才释放会话保护；已核实宿主归属时保护最多允许30分钟无实际工具活动，无归属证据时120秒兜底。界面阶段120秒无操作仍会中断，状态查询与心跳不续期。旧任务不能复活，新阶段须重新核实目标，禁止重放旧输入。其他连接的活动任务不能接管；TARGET_MISMATCH 不等于旧绑定已失效。",
+        "description": BROWSER_ROUTING_GUIDANCE + "界面任务必须不抢焦点，绑定后使用 quietbridge_windows action=share source=window 建立系统窗口连续视频预览；仅显式 screenshot 或诊断 capture 会截图，不以截图维持视频。绑定不等于首帧就绪。begin 推荐指定 targetSurface，自动选择对应执行模式；显式 interactionMode 与之冲突会拒绝。省略 targetSurface 时兼容原调用：默认 background_browser，或显式 desktop。网页阶段禁止所有原生输入和窗口激活；扩展未就绪必须等待。操作对象和模式只能在 begin 指定，不能中途更改。begin/status/bind/end 回执含 routing，表明选路及前提，不证明已绑定、已授权或已共享。begin 生成 UUID，保持 awaiting_window，不创建或启动浏览器。bind 必须显式 appHandle、windowId、confirm=true，仅绑定已有窗口，mode=attached_existing，不等于新建或数据隔离。status 只读核验进程代际和窗口；跨连接 requires_revalidation，需重新显式确认，绝不按 PID 自动接管。任务期间观察和输入严格限制目标，应用级键盘接口拒绝。网页共享前先 assign 并 verify_mapping。"
+                       "窗口关闭一次不表示用户取消；status.targetRecovery 为 recreate_allowed 时，end 自己的失效阶段后 begin(recoveryOf=旧taskId,targetSurface=web_content)，再 create_target 重建本任务专用窗口，继承最多两次的自动恢复预算；重复 begin 复用仍有效的恢复阶段。两次自动恢复后再次关闭则暂停并用 Agent 弹框提供重建后继续/保持暂停/结束任务，不推断关闭意图。后台模式不启动桌面接管；共享预览独立维持原目标和宿主位置。end 只释放本阶段绑定和共享预览，返回 sessionProtection；同一宿主本轮下一阶段可 begin 新任务，不主动交还系统锁屏。会话停止、取消或断连才释放会话保护；已核实宿主归属时保护最多允许30分钟无实际工具活动，无归属证据时120秒兜底。界面阶段120秒无操作时暂停并释放共享，同一存活 worker 的下次原目标调用自动核验恢复；TASK_SUSPENDED/TASK_RESUMED 应立即重建共享并取新快照，无需用户提醒。状态查询与心跳不续期。明确结束或取消的旧任务不能复活，未知输入不得重放。其他连接的活动任务不能接管；TARGET_MISMATCH 不等于旧绑定已失效。",
         "inputSchema": {
             "type": "object", "additionalProperties": False,
             "properties": {
                 "action": {"type": "string", "enum": ["begin", "bind", "status", "end"]},
                 "taskId": {"type": "string", "minLength": 1},
+                "recoveryOf": {"type": "string", "minLength": 1,
+                               "description": "仅 begin：接续本连接已核实关闭并 end 的专用 Chrome 阶段 taskId；继承恢复计数，连续最多两次，重复调用复用同一新阶段。不是用户停止后的自动重启许可。"},
                 "appHandle": APP_HANDLE_PROP, "windowId": WINDOW_PROP,
                 "confirm": {"type": "boolean", "const": True},
                 "interactionMode": {"type": "string", "enum": ["background_browser", "desktop"],
@@ -2451,11 +2773,11 @@ TOOLS = [
                 {"properties": {"action": {"const": "begin"}},
                  "not": {"anyOf": [{"required": [k]} for k in ("taskId", "appHandle", "windowId", "confirm")]}},
                 {"properties": {"action": {"const": "bind"}}, "required": ["appHandle", "windowId", "confirm"],
-                 "not": {"anyOf": [{"required": [k]} for k in ("interactionMode", "targetSurface")]}},
+                 "not": {"anyOf": [{"required": [k]} for k in ("interactionMode", "targetSurface", "recoveryOf")]}},
                 {"properties": {"action": {"const": "status"}},
-                 "not": {"anyOf": [{"required": [k]} for k in ("appHandle", "windowId", "confirm", "interactionMode", "targetSurface")]}},
+                 "not": {"anyOf": [{"required": [k]} for k in ("appHandle", "windowId", "confirm", "interactionMode", "targetSurface", "recoveryOf")]}},
                 {"properties": {"action": {"const": "end"}}, "required": ["confirm"],
-                 "not": {"anyOf": [{"required": [k]} for k in ("appHandle", "windowId", "interactionMode", "targetSurface")]}},
+                 "not": {"anyOf": [{"required": [k]} for k in ("appHandle", "windowId", "interactionMode", "targetSurface", "recoveryOf")]}},
             ],
         },
         "handler": tool_task, "readOnly": True,
@@ -2516,7 +2838,7 @@ TOOLS = [
     {
         "name": "quietbridge_windows",
         "description": "不抢焦点地列出窗口或使用共享窗口能力。界面任务绑定后，先 action=share 并显式 appHandle/windowId/source=window，仅共享已确认目标，核对 streamReady 与 trackingWindowId；浏览器窗口须先 verify_mapping。后续观察和输入自动核验、续租并复用捕获流，不要逐次 unshare/share。share 持续到 unshare 或 quietbridge_task end；不激活目标或切换 Space，也不提供焦点隔离。"
-                       "后台浏览器任务同样使用系统窗口连续视频；网页动作完成后扩展会丢弃地触发一次有界绘制脉冲，以帮助离屏 Chrome 把新画面送入窗口流。该脉冲不是预览帧，空闲时不运行，也不能证明页面动作已成功。原生任务省略范围时默认 application。显式 application/desktop 保留系统捕获范围；只有任务确实需要跨应用、Dock 或系统界面时才显式 source=desktop，不能为解决点击失败扩大范围。"
+                       "后台浏览器任务同样使用系统窗口连续视频；不在动作或导航后自动截图，也不轮询截图促帧。原生任务省略范围时默认 application。显式 application/desktop 保留系统捕获范围；只有任务确实需要跨应用、Dock 或系统界面时才显式 source=desktop，不能为解决点击失败扩大范围。"
                        "unshare 是幂等清理，阶段 end 后仍可调用，只释放本连接共享，不结束宿主会话保护，也不为清理启动新连接。activate 会改变前台焦点，不抢焦点任务禁止调用，更不能作为失败兜底。锁屏时共享立即关闭并清除画面。",
         "inputSchema": {
             "type": "object",
@@ -2526,7 +2848,7 @@ TOOLS = [
                 "windowId": {"type": "integer", "minimum": 1, "maximum": 4294967295},
                 "durationSeconds": {"type": "number", "minimum": 60, "maximum": 3600, "default": 1800},
                 "source": {"type": "string", "enum": ["application", "window", "desktop"],
-                           "description": "window 在后台浏览器和原生任务中均表示系统目标窗口连续视频；网页动作后的绘制脉冲不会替代这个视频流，也不作为成功证据。application 使用系统应用捕获，后台 Space 时原生端收窄为目标窗口；desktop 包含目标显示器当前桌面，仅用于确有跨应用需要的任务。共享不授权激活、置前或切换 Space；显式应用/桌面范围随动作续租。"},
+                           "description": "window 在后台浏览器和原生任务中均表示系统目标窗口连续视频；不在网页动作后自动截图。application 使用系统应用捕获，后台 Space 时原生端收窄为目标窗口；desktop 包含目标显示器当前桌面，仅用于确有跨应用需要的任务。共享不授权激活、置前或切换 Space；显式应用/桌面范围随动作续租。"},
             },
         },
         "handler": tool_windows,
@@ -2712,6 +3034,30 @@ TOOLS = [
 TOOLS.append(dict(next(t for t in TOOLS if t["name"] == "quietbridge_click"),
                   name="quietbridge_hover", description=NATIVE_INPUT_GUIDANCE + "悬停指定窗口局部坐标或最新快照元素；使用 AX 展开动作或窗口定向 hover，不移动物理鼠标。执行严格任务目标校验；无法后台悬停时报告阻塞，不能把鼠标移到用户当前桌面兜底。",
                   handler=lambda args: tool_click(args, method="hover")))
+def remember_created_browser_window(task_id):
+    """Persist native/extension provenance only after independent mapping."""
+    browser_data = read_file(Path(TASK_FILE).with_name('browser-events.json'), {})
+    browser = browser_data.get('tasks', {}).get(task_id) or {}
+    target = browser.get('targetEvidence') or {}
+    created = next((item for item in browser_data.get('peer', {}).get('createdTargets', [])
+                    if item.get('taskId') == task_id and item.get('requestId') == target.get('createdRequestId') and
+                    item.get('browserWindowId') == browser.get('browserWindowId') and
+                    item.get('tabId') == browser.get('rootTabId', browser.get('tabId'))), None)
+    if not created or target.get('mode') != 'created' or not browser.get('mappingVerified'):
+        return
+    with task_store() as data:
+        record = data['tasks'].get(task_id)
+        if (record and data.get('activeTaskId') == task_id and TASK_OWNER.owns(record) and
+                record.get('state') == 'bound' and
+                (browser.get('mapping') or {}).get('windowId') == record.get('windowId') and
+                browser.get('targetIdentity') == {key: record.get(key) for key in
+                    ('taskId', 'state', 'windowId', 'pid', 'processIdentity', 'sessionId')}):
+            record['windowCreation'] = {key: copy.deepcopy(created[key]) for key in
+                                        ('requestId', 'browserWindowId', 'tabId')}
+            record['windowCreation'].update(windowId=record['windowId'],
+                processIdentity=copy.deepcopy(record['processIdentity']), applicationSession=application_session())
+
+
 def validate_browser_assignment(task_id):
     with task_store() as data:
         record = data['tasks'].get(task_id) if isinstance(task_id, str) else None
@@ -2743,7 +3089,9 @@ def _bound_windows(task_id):
     rows = windows.get('windows') if isinstance(windows, dict) else windows
     if not isinstance(rows, list):
         return []
-    return [{'windowId': row['windowId'], 'title': row.get('title') or ''}
+    from browser_events import valid_window_bounds
+    return [{'windowId': row['windowId'], 'title': row.get('title') or '',
+             **({'bounds': row['bounds']} if valid_window_bounds(row.get('bounds')) else {})}
             for row in rows if isinstance(row, dict) and isinstance(row.get('windowId'), int)]
 
 
@@ -2818,8 +3166,16 @@ def _events_dispatch(args):
                 output = str(output) + '\n共享待补: %s: %s' % (exc.code, exc.message)
         return output
     output = _events_handler(args)
+    if isinstance(args, dict) and args.get('action') == 'verify_mapping':
+        remember_created_browser_window(args.get('taskId'))
     if isinstance(args, dict) and args.get('action') in ('assign', 'select_tab'):
         stop_browser_preview()
+        # Preserve only target metadata across expiry; document refs expire.
+        binding = TASK_BINDINGS.get(args.get('taskId'))
+        if binding is not None:
+            browser = read_file(Path(TASK_FILE).with_name('browser-events.json'), {}).get('tasks', {}).get(args['taskId'])
+            if browser:
+                binding['browserTarget'] = {k: copy.deepcopy(v) for k, v in browser.items() if k not in ('event', 'mapping')}
     if isinstance(args, dict) and args.get('action') == 'assign':
         payload = json.loads(output) if isinstance(output, str) else output
         operation_log('browser.assigned', taskId=args.get('taskId'),
@@ -2876,7 +3232,7 @@ TOOL_MAP = dict((t["name"], t) for t in TOOLS)
 HINTS = {
     "TASK_ROUTE_MISMATCH": "先 quietbridge_task status 核实本阶段 routing；网页和原生界面是不同阶段，不为故障重试更换通道。",
     "BACKGROUND_ONLY": "继续使用 quietbridge_browser_events 的原任务、原标签；先检查 status，不能改用前台输入或新建窗口。",
-    "TARGET_LOST": "原窗口不可用时保留任务状态，显式重新选择；不自动新建 Chrome 窗口。",
+    "TARGET_LOST": "先 task status 核实 targetRecovery；本任务创建且确认关闭的 Chrome 专用窗口按恢复计划重建，不能选择其他现存窗口或将一次关闭视为取消。",
     "PERMISSION_DENIED": "请用户通过 QuietBridge 的权限向导授予辅助功能/屏幕录制；暂停操作，不自行打开系统设置抢焦点。",
     "FOREGROUND_REQUIRED": "此路径需要前台，不符合不抢焦点要求；停止并报告阻塞，禁止调用 activate/AXRaise、切换 Space 或移动物理鼠标兜底。",
     "FOCUS_STATE_UNKNOWN": "焦点状态无法确认，原生点击已拒绝派发；先只读观察并报告，不能激活窗口或绕过焦点检查。",
@@ -2914,6 +3270,11 @@ def call_tool(name, args):
                           'not_dispatched' if last and last.get('dispatched') is False else
                           'unknown' if last else 'not_requested'))
             payload = result.get('permissionStatus')
+            if name == 'quietbridge_task':
+                try:
+                    payload = json.loads(result['content'][0]['text'])
+                except (ValueError, KeyError, IndexError, TypeError):
+                    pass
             if name == _events_tool['name']:
                 try:
                     payload = json.loads(result['content'][0]['text'])
@@ -2923,7 +3284,8 @@ def call_tool(name, args):
                     if payload.get('status') == 'queued':
                         execution = 'queued'
                     elif isinstance(args, dict) and args.get('action') == 'result':
-                        execution = 'unknown'
+                        execution = ('not_dispatched' if (payload.get('debuggerFailure') or {}).get('inputDispatched') is False
+                                     else 'unknown')
                     elif not inputs:
                         execution = 'not_requested'
             if result.get('isError') and not inputs:
@@ -2942,10 +3304,13 @@ def call_tool(name, args):
             structured['errorCode'] = error_code
             structured['suggestedNext'] = ('query_existing_result' if execution in ('queued', 'unknown') else
                                            'observe_target' if error_code else 'inspect_verification')
+            if result.get('interruption') is not None:
+                payload = dict(payload or {}, interruption=result['interruption'])
             recovery = recovery_policy(error_code, execution, payload)
             if recovery:
                 structured['recovery'] = recovery
-                structured['suggestedNext'] = ('notify_user_and_wait' if recovery.get('waitForUser') else recovery['action'])
+                structured['suggestedNext'] = ('ask_user_choice' if recovery.get('waitForUser') and recovery.get('userDecision') else
+                                               'notify_user_and_wait' if recovery.get('waitForUser') else recovery['action'])
                 for block in result['content']:
                     if block.get('type') == 'text':
                         if result.get('isError') or 'permissionStatus' in result:
@@ -2956,6 +3321,12 @@ def call_tool(name, args):
                         break
             if 'situation' in result:
                 structured['situation'] = result.pop('situation')
+            if 'resumption' in result:
+                structured['resumption'] = result.pop('resumption')
+            if 'targetConflict' in result:
+                structured['targetConflict'] = result.pop('targetConflict')
+            if 'interruption' in result:
+                structured['interruption'] = result.pop('interruption')
             if 'permissionStatus' in result:
                 structured['permissionStatus'] = result.pop('permissionStatus')
             if SHARE_RECORD is not None:
@@ -3001,6 +3372,12 @@ def _call_tool(name, args):
     try:
         check_request_cancelled()
         reap_task_lease()
+        resumption = resume_idle_task(name, args or {})
+        if resumption:
+            return {'isError': True, 'errorCode': 'TASK_RESUMED', 'resumption': resumption,
+                    'content': [{'type': 'text', 'text': 'TASK_RESUMED: 等待超时后的原目标已重新核验，本次输入未派发。'
+                                '请立即按 nextSteps 自动恢复共享并重新观察，无需用户提醒重连。\n' +
+                                json.dumps(resumption, ensure_ascii=False)}]}
         if name == "quietbridge_wait_ready":
             timeout, _ = wait_ready_options(args)
             WAIT_DEADLINE = time.monotonic() + timeout
@@ -3038,13 +3415,18 @@ def _call_tool(name, args):
             hint = "重新 quietbridge_windows 核对确切窗口、Space 与可见性；不要自动激活或换到其他窗口。"
         if hint:
             text += "\n建议: " + hint
-        return {"content": [{"type": "text", "text": text}], "isError": True, "errorCode": exc.code}
+        result = {"content": [{"type": "text", "text": text}], "isError": True, "errorCode": exc.code}
+        if exc.target_conflict is not None:
+            result['targetConflict'] = exc.target_conflict
+        if exc.interruption is not None:
+            result['interruption'] = exc.interruption
+        return result
     except ValueError as exc:
         if name != "quietbridge_browser_events":
             return {"content": [{"type": "text", "text": "INVALID_ARGUMENT: %s" % exc}], "isError": True, "errorCode": "INVALID_ARGUMENT"}
         message = str(exc)
         code = next((c for c in ("BROWSER_HOST_UNAVAILABLE", "BROWSER_PERMISSION_MISSING", "BROWSER_DISABLED", "BACKGROUND_WAITING", "STALE_SNAPSHOT", "CANDIDATE_REFRESH_TIMEOUT",
-                                "BROWSER_OBSERVER_NOT_READY", "BROWSER_LIFECYCLE_TIMEOUT", "BROWSER_LIFECYCLE_FAILED",
+                                "BROWSER_OBSERVER_NOT_READY", "BROWSER_LIFECYCLE_TIMEOUT", "BROWSER_LIFECYCLE_FAILED", "BROWSER_MAPPING_PENDING",
                                 "BROWSER_TARGET_CHANGED", "STALE_TARGET", "STALE_DOCUMENT") if message.startswith(c)), "BROWSER_TARGET_WAITING")
         return {"content": [{"type": "text", "text": message + "\n保持原任务与标签；等待扩展恢复或重新观察，禁止回落桌面输入。"}],
                 "isError": True, "errorCode": code}

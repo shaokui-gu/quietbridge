@@ -23,6 +23,7 @@ test('真实 worker 入口：握手、默认无任务、内部派发、隔离、
   let context;
   let chrome;
   function boot() {
+    timers.clear(); // Service-worker restart discards its previous timers.
     const nav = Object.fromEntries(['onBeforeNavigate', 'onCommitted', 'onDOMContentLoaded',
       'onCompleted', 'onErrorOccurred', 'onHistoryStateUpdated'].map(k => [k, listener()]));
     chrome = {
@@ -203,6 +204,11 @@ async function lifecycleHarness() {
   const nativePorts = [];
   let nativeHandler = async () => ({ ok: true, protocolVersion: 2, heartbeatAt: 1, taskAssignment: 'no_assignment' });
   const calls = [];
+  const timers = new Map();
+  let timerId = 0, clockOffset = 0;
+  class WorkerDate extends Date {
+    static now() { return Date.now() + clockOffset; }
+  }
   const nav = Object.fromEntries(['onBeforeNavigate', 'onCommitted', 'onDOMContentLoaded',
     'onCompleted', 'onErrorOccurred', 'onHistoryStateUpdated'].map(k => [k, listener()]));
   const chrome = {
@@ -254,8 +260,9 @@ async function lifecycleHarness() {
   };
   let context;
   const boot = () => {
-    context = vm.createContext({ chrome, BackgroundBrowser, initialState, reduce, safeUrl, originOf, pause, URL, Date,
-      setTimeout() { return 1; }, clearTimeout() {}, setInterval() { return 2; }, clearInterval() {} });
+    context = vm.createContext({ chrome, BackgroundBrowser, initialState, reduce, safeUrl, originOf, pause, URL, Date: WorkerDate,
+      setTimeout(fn, ms) { const id = ++timerId; timers.set(id, { fn, at: WorkerDate.now() + ms }); return id; },
+      clearTimeout(id) { timers.delete(id); }, setInterval() { return -1; }, clearInterval() {} });
     vm.runInContext(code, context);
   };
   boot();
@@ -272,6 +279,18 @@ async function lifecycleHarness() {
   };
   await flush();
   return { local, chrome, calls, flush, async restart() { boot(); await flush(); },
+    now: () => WorkerDate.now(),
+    async advance(ms) {
+      const until = WorkerDate.now() + ms;
+      for (let i = 0; i < 100; i++) {
+        const due = [...timers.entries()].filter(([, t]) => t.at <= until).sort((a, b) => a[1].at - b[1].at)[0];
+        if (!due) break;
+        clockOffset += Math.max(0, due[1].at - WorkerDate.now());
+        timers.delete(due[0]);
+        due[1].fn(); await flush();
+      }
+      clockOffset += Math.max(0, until - WorkerDate.now());
+    },
     get state() { return state; },
     get ports() { return ports; },
     get nativePorts() { return nativePorts; },
@@ -317,6 +336,17 @@ test('window mapping reads the active tab title without selecting it or changing
     if (changed === null) assert.equal(evidence.title, 'New document');
     else assert.equal(evidence, null);
   }
+});
+
+test('mapping adds read-only Chrome window geometry without input or title changes', async () => {
+  const h = await coreNavigationHarness(), { h: worker } = h;
+  worker.chrome.tabs.query = async () => [{ id: 7, windowId: 2, url: 'https://example.org/path', title: 'LINUX DO' }];
+  worker.chrome.windows = { async get(id) { return { id, left: -1800, top: 39, width: 1800, height: 1048 }; } };
+  worker.chrome.alarms.onAlarm.fn({ name: 'observer-sync' }); await worker.flush();
+  const evidence = worker.calls.filter(c => c.action === 'sync' && c.windowEvidence).at(-1).windowEvidence;
+  assert.deepEqual(evidence.bounds, { x: -1800, y: 39, width: 1800, height: 1048 });
+  assert.equal(evidence.title, 'LINUX DO');
+  assert.equal(h.captures, 0);
 });
 
 test('popup 销毁后仅持久用户意图与完整授权共同触发启用并消费 nonce', async () => {
@@ -753,6 +783,35 @@ test('worker 重启后不得重复执行同一命令', async () => {
   assert.match(report.commandResult.error, /结果未知/);
 });
 
+test('debugger rejection report preserves native reason and frame IDs without retrying navigation', async () => {
+  const h = await lifecycleHarness();
+  h.permission = true;
+  const chromeMessage = 'Cannot access a chrome-extension:// URL of different extension';
+  let attaches = 0, updates = 0;
+  h.chrome.debugger.attach = async () => { attaches++; throw new Error(chromeMessage); };
+  h.chrome.tabs.update = async () => { updates++; };
+  h.chrome.scripting.executeScript = async options => [{ documentId: 'doc-1',
+    result: options.func?.toString().includes("iframe[src]") ? ['a'.repeat(32)] : true }];
+  const assignment = { taskId: 'task', token: 'b'.repeat(64), bindingId: 'c'.repeat(32),
+    assignmentVersion: 1, globalOrigins: true, selector: '', tabId: 7, browserWindowId: 2, mappingVerified: false };
+  const syncs = [];
+  h.native = async message => {
+    syncs.push(structuredClone(message));
+    if (message.action !== 'sync') return { ok: true };
+    return { ok: true, protocolVersion: 2, heartbeatAt: 3, taskAssignment: 'assigned', assignment,
+      ...(message.commandResult ? {} : { command: { requestId: 'd3'.repeat(16), taskId: 'task',
+        operation: 'navigate', params: { url: 'https://example.org/next' } } }) };
+  };
+  await h.send({ action: 'enable' }); await h.flush();
+  const report = syncs.find(m => m.commandResult).commandResult;
+  assert.equal(report.status, 'error');
+  assert.ok(report.debuggerFailure, JSON.stringify(report));
+  assert.equal(report.debuggerFailure.chromeMessage, chromeMessage);
+  assert.deepEqual(report.debuggerFailure.foreignFrameExtensionIds, ['a'.repeat(32)]);
+  assert.equal(report.debuggerFailure.frameEvidence, 'top_document_iframe_src');
+  assert.equal(attaches, 1); assert.equal(updates, 0);
+});
+
 test('诊断命令读取页面错误与视口，不声称已复核动作', async () => {
   const h = await lifecycleHarness();
   h.permission = true;
@@ -945,7 +1004,7 @@ test('navigation reconciles missed callbacks before the next observation without
   assert.equal(h.state.documentId, 'doc-2');
   assert.equal(h.state.bindingId, assignment.bindingId);
   assert.equal(h.state.assignmentVersion, 1);
-  assert.equal(navigationPulses, 1, 'the reconciled document gets one discarded render refresh');
+  assert.equal(navigationPulses, 0, 'navigation cannot capture immediately; the experiment waits five seconds');
   assert.deepEqual(Array.from(observed[0].documentIds), ['doc-2']);
   assert.equal(reports.length, 2);
   assert.ok(reports.every(r => r.status === 'ok'));
@@ -1086,6 +1145,60 @@ test('same-document URL changes and restored documents reconcile epochs without 
     assert.equal(JSON.stringify((await h.send({ action: 'status' })).state).includes('private=fixture'), false);
     epoch = h.state.navigationEpoch;
   }
+});
+
+async function coreNavigationHarness() {
+  const h = await lifecycleHarness();
+  h.permission = true;
+  const assignment = { taskId: 'task', token: 'b'.repeat(64), bindingId: 'c'.repeat(32),
+    assignmentVersion: 1, globalOrigins: true, selector: '', tabId: 7, browserWindowId: 2, mappingVerified: false };
+  let frame = { documentId: 'doc-1', url: 'https://example.org/path' };
+  let command = null, reportSeen = false, offSpace = true, sharing = true, captures = 0, navigationCount = 0;
+  h.chrome.webNavigation.getFrame = async () => frame;
+  h.chrome.tabs.get = async id => ({ id, windowId: 2, url: frame.url });
+  h.chrome.tabs.update = async (_id, props) => { frame = { documentId: 'doc-' + (navigationCount + 1), url: props.url }; };
+  h.chrome.scripting.executeScript = async options => [{ result:
+    options.func?.name === 'installPopupGuard' ? 'ready' : options.args?.[1] === 'drain' ? [] : true }];
+  h.chrome.debugger.sendCommand = async (_target, method) => {
+    if (method === 'Page.captureScreenshot') { captures++; return { data: 'pixels-must-never-leave-extension' }; }
+    return { identifier: 'script' };
+  };
+  h.native = async message => {
+    if (message.action === 'event') { assignment.event = structuredClone(message.event); return { ok: true }; }
+    if (message.action !== 'sync') return { ok: true };
+    if (message.commandResult) reportSeen = true;
+    return { ok: true, protocolVersion: 2, heartbeatAt: h.now() / 1000,
+      taskAssignment: 'assigned', assignment,
+      command: reportSeen ? null : command,
+      windowPreview: sharing ? { taskId: assignment.taskId, bindingId: assignment.bindingId,
+        assignmentVersion: 1, tabId: 7, browserWindowId: 2, windowId: 207258,
+        targetOnCurrentSpace: offSpace == null ? null : !offSpace, expiresAt: h.now() / 1000 + 4 } : null };
+  };
+  await h.send({ action: 'enable' }); await h.flush();
+  return { h, assignment, get captures() { return captures; },
+    async navigate() {
+      navigationCount++; reportSeen = false;
+      command = { requestId: navigationCount.toString(16).padStart(32, '0'), taskId: 'task', operation: 'navigate',
+        documentId: h.state.documentId, navigationEpoch: h.state.navigationEpoch,
+        params: { url: 'https://example.org/next-' + navigationCount } };
+      h.chrome.alarms.onAlarm.fn({ name: 'observer-sync' }); await h.flush();
+    },
+    set sharing(value) { sharing = value; },
+    set offSpace(value) { offSpace = value; },
+    replaceDocument() { frame = { documentId: 'replacement', url: 'https://example.org/another' }; }
+  };
+}
+
+test('ordinary URL navigation and subsequent sync never capture or publish experimental frame reports', async () => {
+  const test = await coreNavigationHarness(), { h } = test;
+  await test.navigate();
+  assert.equal(test.captures, 0);
+  await h.advance(31000);
+  assert.equal(test.captures, 0, 'five-second and idle screenshot experiments are removed');
+  await test.navigate(); await h.advance(6000);
+  assert.equal(test.captures, 0);
+  assert.equal(h.calls.some(message => message.navigationCapture || message.previewFrame), false);
+  assert.equal(h.state.documentId, 'doc-3');
 });
 
 test('worker uses native window previews and no longer produces screenshot-mailbox frames', async () => {

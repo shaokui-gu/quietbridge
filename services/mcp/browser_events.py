@@ -533,9 +533,12 @@ def lease_live(record, parent, now=None):
         return False
     try:
         token = lease['ownerId']
-        if (str(uuid.UUID(token)) != token or
+        # A revoked worker keeps the window excluded while its native channel
+        # closes. Expiring the activity timer must not admit a new writer before
+        # cleanup; the kernel owner lock still releases on worker exit.
+        if (str(uuid.UUID(token)) != token or (record.get('state') != 'stopping' and (
                 not 0 < lease['expiresAt'] - (time.time() if now is None else now) <= 125 or
-                not 0 < lease['expiresAtUptime'] - time.monotonic() <= 125):
+                not 0 < lease['expiresAtUptime'] - time.monotonic() <= 125))):
             return False
         path = Path(parent) / ('task-owner-' + token + '.lock')
         fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
@@ -560,12 +563,50 @@ def active_task(task_file):
     task = data['tasks'].get(task_id) if type(task_id) is str else None
     if task is not None and (task.get('state') in ('ended', 'interrupted') or not lease_live(task, Path(task_file).parent)):
         return None, None
+    if task is not None:
+        from lifecycle_store import stop_reason
+        parent = Path(task_file).parent
+        config = parent.parent.parent if parent.parent.name == 'sessions' else parent
+        if task.get('state') == 'stopping' or stop_reason(task, config):
+            return None, None
     return task_id, task
 
 
 def target_identity(task):
     return {k: copy.deepcopy(task.get(k)) for k in
             ('taskId', 'state', 'windowId', 'pid', 'processIdentity', 'sessionId')}
+
+
+def resume_assignment(previous, task, task_file, preflight_event_file=None):
+    """A fresh document lease for an idle-resumed task; never reuse input refs."""
+    with event_store(Path(task_file).with_name('browser-events.json')) as data:
+        peer = data.setdefault('peer', {})
+        root_peer = connected_peer(preflight_event_file) if preflight_event_file else {}
+        root_ready = (root_peer.get('enabled') and root_peer.get('permission') and
+                      root_peer.get('origin') == previous.get('origin'))
+        # Idle tasks leave the extension's channel registry. A fresh root
+        # heartbeat can prove consent while that private channel restarts;
+        # no root tab/document evidence is imported.
+        require(peer.get('applicationSession') == application_session() and
+                peer.get('enabled') and peer.get('permission') and
+                (root_ready or 0 <= time.time() - peer.get('lastSeen', 0) < CANDIDATE_TTL),
+                'BROWSER_HOST_UNAVAILABLE: 等待原扩展通道恢复后再核验原标签')
+        require(previous.get('taskId') == task['taskId'] and not previous.get('paused') and
+                not data.get('tasks', {}).get(task['taskId'], {}).get('paused') and
+                previous.get('origin') == peer.get('origin'), 'STALE_TARGET: 原标签授权或归属已经变化')
+        version = max(data.get('assignmentVersion', 0), previous.get('assignmentVersion', 0)) + 1
+        data['assignmentVersion'] = version
+        record = copy.deepcopy(previous)
+        record.update(token=secrets.token_hex(32), bindingId=secrets.token_hex(16),
+                      assignmentVersion=version, targetIdentity=target_identity(task),
+                      mappingVerified=False, event=None)
+        record.pop('mapping', None)
+        finish_pending(peer, 'canceled', time.time())
+        peer.update(snapshot=None, pendingVerify={'taskId': task['taskId'], 'operation': 'resume',
+                                                 'commandId': 'idle-resume'})
+        for key in ('assignmentTitle', 'windowEvidence', 'observerStatus', 'previewLease', 'previewFrame', 'windowPreview'):
+            peer.pop(key, None)
+        data['tasks'] = {task['taskId']: record}
 
 
 def prune_creation(peer, task_id, task):
@@ -629,6 +670,12 @@ def window_title_relation(window_title, target):
     return None
 
 
+def valid_window_bounds(bounds):
+    return (type(bounds) is dict and set(bounds) == {'x', 'y', 'width', 'height'} and
+            all(type(value) in (int, float) and math.isfinite(value) and abs(value) <= 1000000
+                for value in bounds.values()) and bounds['width'] > 0 and bounds['height'] > 0)
+
+
 def bound_native_target(task):
     return (task is not None and task.get('state') == 'bound' and
             valid_int(task.get('windowId'), 1, 4294967295) and
@@ -647,6 +694,29 @@ LIFECYCLE_STAGES = {'observer_load', 'observer_configure', 'observer_stop', 'gua
 LIFECYCLE_CODES = {'BROWSER_LIFECYCLE_TIMEOUT', 'BROWSER_LIFECYCLE_FAILED'}
 
 
+def validate_debugger_failure(value):
+    fields = {'reason', 'stage', 'chromeMessage', 'foreignFrameExtensionIds', 'frameEvidence'}
+    require(type(value) is dict and set(value) in (fields, fields | {'inputDispatched'}) and
+            ('inputDispatched' not in value or value['inputDispatched'] is False), '调试失败证据字段错误')
+    require(value['reason'] in ('foreign_extension_page', 'debugger_in_use') and
+            type(value['stage']) is str and re.fullmatch(r'[A-Za-z][A-Za-z0-9_.]{0,79}', value['stage']),
+            '调试失败阶段错误')
+    message = value['chromeMessage']
+    require(type(message) is str and len(message) <= 200 and
+            (re.fullmatch(r'Cannot access a chrome-extension:// URL of different extension\.?', message) if
+             value['reason'] == 'foreign_extension_page' else
+             re.fullmatch(r'Another debugger is already attached to the (?:tab|target|background page) with id: [\w-]+\.?', message)),
+            'Chrome 调试错误原文不匹配')
+    ids = value['foreignFrameExtensionIds']
+    require(type(ids) is list and len(ids) <= 8 and all(type(x) is str and re.fullmatch('[a-p]{32}', x) for x in ids) and
+            len(set(ids)) == len(ids), '调试失败 frame 身份错误')
+    require(value['frameEvidence'] in ('not_checked', 'top_document_iframe_src') and
+            (not ids or value['frameEvidence'] == 'top_document_iframe_src') and
+            (value['reason'] == 'foreign_extension_page' or (not ids and value['frameEvidence'] == 'not_checked')),
+            '调试失败 frame 证据错误')
+    return copy.deepcopy(value)
+
+
 def current_observer_status(peer, record):
     observation = peer.get('observerStatus')
     event = (record or {}).get('event') or {}
@@ -661,7 +731,7 @@ def sync_peer(message, origin, task_file, event_file):
     session = application_session()
     require(session is not None, 'APP_NOT_RUNNING: 请先打开 QuietBridge')
     base = {'action', 'enabled', 'permission'}
-    optional = ('candidates', 'created', 'commandResult', 'clientVersion', 'assignmentTitle', 'capabilities', 'panelState', 'panelResult', 'applicationSession', 'windowEvidence', 'observerStatus', 'lifecycleError', 'previewFrame')
+    optional = ('candidates', 'created', 'commandResult', 'clientVersion', 'assignmentTitle', 'capabilities', 'panelState', 'panelResult', 'applicationSession', 'windowEvidence', 'observerStatus', 'lifecycleError', 'previewFrame', 'navigationCapture')
     require(type(message) is dict and base <= message.keys() <= base | set(optional), '握手字段错误')
     require(type(message['enabled']) is bool and type(message['permission']) is bool, '权限类型错误')
     require('applicationSession' not in message or message['applicationSession'] is None or
@@ -750,12 +820,15 @@ def sync_peer(message, origin, task_file, event_file):
         if 'windowEvidence' in message:
             evidence = message['windowEvidence']
             if evidence is not None:
-                require(type(evidence) is dict and set(evidence) == {'bindingId', 'browserWindowId', 'tabId', 'title'} and
+                require(type(evidence) is dict and set(evidence) in (
+                            {'bindingId', 'browserWindowId', 'tabId', 'title'},
+                            {'bindingId', 'browserWindowId', 'tabId', 'title', 'bounds'}) and
                         type(evidence['bindingId']) is str and re.fullmatch('[a-f0-9]{32}', evidence['bindingId']) and
                         valid_int(evidence['browserWindowId']) and valid_int(evidence['tabId']) and
                         type(evidence['title']) is str and 0 < len(evidence['title']) <= 200 and
                         evidence['title'].strip() and not any(ord(c) < 32 for c in evidence['title']),
                         '浏览器窗口证据格式错误')
+                require('bounds' not in evidence or valid_window_bounds(evidence['bounds']), '浏览器窗口几何证据错误')
             assignment_now = current_assignment(data, task_file)
             if (message['enabled'] and message['permission'] and evidence is not None and assignment_now and
                     evidence['bindingId'] == assignment_now['bindingId'] and
@@ -855,7 +928,8 @@ def sync_peer(message, origin, task_file, event_file):
                 assignment_now = current_assignment(data, task_file)
                 event_now = (assignment_now or {}).get('event') or {}
                 try:
-                    require(set(reply) in ({'requestId', 'status', 'error'}, {'requestId', 'status', 'result'}) and
+                    require(set(reply) in ({'requestId', 'status', 'error'}, {'requestId', 'status', 'error', 'debuggerFailure'},
+                                           {'requestId', 'status', 'result'}) and
                             reply.get('status') in ('ok', 'error') and
                             ('result' if reply['status'] == 'ok' else 'error') in reply, '命令结果字段错误')
                     if reply['status'] == 'ok' and pending.get('documentId') and pending['operation'] in OBSERVATIONS and (
@@ -923,6 +997,17 @@ def sync_peer(message, origin, task_file, event_file):
                                                  'operation': pending['operation'],
                                                  'latencyMs': latency,
                                                  'error': error, 'at': now}
+                        if 'debuggerFailure' in reply:
+                            evidence = validate_debugger_failure(reply['debuggerFailure'])
+                            expected = ('BROWSER_DEBUGGER_RESTRICTED' if evidence['reason'] == 'foreign_extension_page'
+                                        else 'BROWSER_DEBUGGER_IN_USE')
+                            require(error.startswith(expected + '：') or error.startswith(expected + ':'),
+                                    '调试失败错误码不匹配')
+                            peer['commandResult']['debuggerFailure'] = evidence
+                            # Attachment was rejected before guard setup and
+                            # requested input. This is a known pre-input stop.
+                            if evidence.get('inputDispatched') is False and pending['operation'] not in OBSERVATIONS:
+                                peer['pendingVerify'] = None
                 except (ValueError, TypeError, KeyError, OverflowError):
                     # A known command's malformed result must not poison all later
                     # heartbeats. Reject its content, record an error and acknowledge
@@ -961,6 +1046,10 @@ def sync_peer(message, origin, task_file, event_file):
         active_id, _ = active_task(task_file)
         data['tasks'] = {k: v for k, v in data['tasks'].items() if k == active_id}
         record = current_assignment(data, task_file)
+        # Ignore an old extension's experiment report and never authorize a new
+        # capture. Normal preview remains the native continuous window stream.
+        for key in ('navigationCapture', 'windowPreview'):
+            peer.pop(key, None)
         task_id, task = active_task(task_file)
         assignment = copy.deepcopy(record) if record and record['origin'] == origin else None
         panel_command = peer.get('panelCommand')
@@ -993,12 +1082,12 @@ def sync_peer(message, origin, task_file, event_file):
             command['delivered'] = True
             command.setdefault('deliveredAt', now)
             peer['command'] = command
-        from browser_preview import sync_preview
-        preview_lease = sync_preview(peer, record, message, now)
-        if len(json.dumps(data, ensure_ascii=False).encode('utf-8')) > MAX_BYTES * 9 // 10:
-            peer.pop('previewFrame', None)
+        # Retire screenshot-mailbox preview even if a legacy peer sends a frame.
+        # Explicit screenshot commands above remain available as observations.
+        peer.pop('previewLease', None)
+        peer.pop('previewFrame', None)
         return {'ok': True, 'protocolVersion': 2, 'heartbeatAt': now,
-                'previewLease': preview_lease,
+                'previewLease': None,
                 'applicationSession': session,
                 'sessionReset': session_reset,
                 'commandAck': command_ack,
@@ -1274,17 +1363,25 @@ def _internal_action(args, task_file, event_file, refreshed=None, observation=No
                 0 <= time.time() - evidence.get('at', 0) < CANDIDATE_TTL)
             title = evidence['title'] if verified_evidence else peer.get('assignmentTitle')
             method = 'window_active_title' if verified_evidence else 'title'
-            require(type(title) is str and title, '扩展尚未回传标签标题')
+            require(type(title) is str and title, 'BROWSER_MAPPING_PENDING: 扩展尚未回传标签标题；只读等待原映射证据')
             windows = args['windows']
             require(type(windows) is list and len(windows) <= 200, '窗口证据数量错误')
             for window in windows:
-                require(type(window) is dict and set(window) == {'windowId', 'title'} and
+                require(type(window) is dict and set(window) in ({'windowId', 'title'}, {'windowId', 'title', 'bounds'}) and
                         valid_int(window['windowId'], 1) and type(window['title']) is str and
                         len(window['title']) <= 200, '窗口证据格式错误')
+                require('bounds' not in window or valid_window_bounds(window['bounds']), '原生窗口几何证据错误')
             exact = [w for w in windows if window_title_relation(w['title'], title) == 'exact']
             prefixed = [w for w in windows if window_title_relation(w['title'], title) == 'prefixed']
             hits = exact or prefixed
             match = 'exact' if exact else ('prefixed' if prefixed else None)
+            if (len(hits) > 1 and verified_evidence and valid_window_bounds(evidence.get('bounds')) and
+                    all(valid_window_bounds(w.get('bounds')) for w in hits)):
+                matched_bounds = [w for w in hits if valid_window_bounds(w.get('bounds')) and
+                    all(abs(w['bounds'][k] - evidence['bounds'][k]) <= 2 for k in ('x', 'y', 'width', 'height'))]
+                if len(matched_bounds) == 1:
+                    hits = matched_bounds
+                    method = 'window_active_title_and_bounds'
             if len(hits) == 1:
                 visibility = ({'windowActiveTabId': evidence['tabId'],
                                'targetTabActiveAtVerification': evidence['tabId'] == record['tabId'],
@@ -1301,7 +1398,7 @@ def _internal_action(args, task_file, event_file, refreshed=None, observation=No
                                  'candidates': len(hits), 'at': time.time()}
             return {'verified': False, 'method': method,
                     'reason': 'no_match' if not hits else 'ambiguous', 'candidates': len(hits),
-                    'limitation': '仅接受唯一原生窗口标题匹配（精确，或“标签标题 + 分隔符”前缀）；后台标签可用其所在窗口的活动标签标题作证据，不激活或切换标签。'}
+                    'limitation': '接受唯一标题匹配；同名时须有新鲜、完整、唯一的窗口位置与尺寸证据。无法区分时保留原目标并报告，不导航改标题、不移动或激活窗口。'}
         if action in ('annotate', 'annotations'):
             require(args['taskId'] == task_id and task and
                     task.get('state') in ('awaiting_window', 'bound'), '需要当前活动任务')
@@ -1426,10 +1523,13 @@ def _internal_action(args, task_file, event_file, refreshed=None, observation=No
                             'message': '原标签已落地到不同地址（可能为重定向或规范化）；获取当前 snapshot 核实一次即可继续，不需重新分配标签。'}
                 else:
                     reply['error'] = copy.deepcopy(done['error'])
+                    if 'debuggerFailure' in done:
+                        reply['debuggerFailure'] = copy.deepcopy(done['debuggerFailure'])
                     message = done['error']
                     code = re.match(r'^([A-Z][A-Z0-9_]{1,63})[:：]', message)
                     reply['errorCode'] = ('BROWSER_DEBUGGER_RESTRICTED' if
                         'Cannot access a chrome-extension:// URL of different extension' in message else
+                        'BROWSER_DEBUGGER_IN_USE' if message.startswith('Another debugger is already attached to the ') else
                         code.group(1) if code else 'BROWSER_COMMAND_FAILED')
                     reply['nextAction'] = 'stop'
                 return reply
@@ -1492,7 +1592,21 @@ def _internal_action(args, task_file, event_file, refreshed=None, observation=No
         version = data.get('assignmentVersion', 0) + 1
         data['assignmentVersion'] = version
         old_command = peer.get('command') or {}
-        needs_verify = peer.get('pendingVerify') or (old_command if old_command.get('delivered') else None)
+        # Never relabel another task's verification barrier as this task's.
+        # Reassigning this same task still preserves unknown input outcomes.
+        verify = peer.get('pendingVerify') or {}
+        needs_verify = ((verify if verify.get('taskId') == task_id else None) or
+                        (old_command if old_command.get('taskId') == task_id and old_command.get('delivered') else None))
+        if record is None:
+            # Retain the old command's bounded terminal receipt so a delayed
+            # worker reply is discarded and uncertainty is not rewritten as
+            # success. Its input barrier belongs only to the ended task.
+            finish_pending(peer, 'canceled', time.time())
+            for key in ('command', 'commandResult', 'commandResults', 'commandSeen', 'commandCanceled',
+                        'commandExpired', 'pendingVerify', 'snapshot',
+                        'assignmentTitle', 'windowEvidence', 'observerStatus', 'lifecycleError'):
+                peer.pop(key, None)
+            needs_verify = None
         peer['snapshot'] = None
         peer['pendingVerify'] = {'taskId': task_id, 'operation': 'reassign', 'commandId': 'binding-change'} if needs_verify else None
         data['tasks'][task_id] = {'taskId': task_id, 'origin': peer['origin'],
@@ -1716,10 +1830,11 @@ def make_tool(task_file, validate_task=None, check_cancelled=None, preflight_roo
             return json.dumps(result, ensure_ascii=False)
         require(set(args) == {'action', 'taskId'} and args['action'] == 'status', '状态查询需要 taskId')
         return json.dumps(status(args['taskId'], task_file=private_tasks, event_file=private_events), ensure_ascii=False)
-    return {'name': 'quietbridge_browser_events', 'description': 'render_probe 仅在用户明确同意呈现诊断时使用，stage 依次 inspect/attach/enable/layout/capture；各阶段是独立命令，非自动串联。inspect 不附加，attach 不 Page.enable，enable 不查询布局，layout 不截图，capture 仅对该文档 30 秒内 layout 的视口单次截图并丢弃图像，只返回时间/状态/长度。既有 attachedBefore=true 表示已有调试连接，不能假称首次附加对照。禁止任意 CDP、自动重复 capture、切桌、激活或将探针当作后台绘制修复；不会清除已有动作复核要求。网页操作必须不抢焦点并使用共享窗口能力。保持用户的前台应用、键盘窗口、物理鼠标和当前 Space；只走固定标签扩展通道，禁止 activate/AXRaise、切换 Space、前台键鼠或原生输入兜底。bind+assign 后用 verify_mapping 核验系统窗口与标签对应关系，再调用 quietbridge_windows action=share source=window 建立系统窗口连续视频。网页动作完成后扩展可能生成并立即丢弃一次有界绘制提醒，帮助离屏 Chrome 提交新画面；它受固定 task/tab/document 身份约束，不是预览帧、不证明动作成功、空闲时不运行。导航后的提醒等新文档身份确认后执行。单次 screenshot 仍是独立观察证据，不等于持续预览已建立。'
+    return {'name': 'quietbridge_browser_events', 'description': '网页操作必须不抢焦点并使用共享窗口能力。保持用户的前台应用、键盘窗口、物理鼠标和当前 Space；只走固定标签扩展通道，禁止 activate/AXRaise、切换 Space、前台键鼠或原生输入兜底。bind+assign 后用 verify_mapping 核验系统窗口与标签对应关系，再调用 quietbridge_windows action=share source=window 建立系统窗口连续视频。网页动作和导航不自动截图，不启动定时截图实验；预览只使用系统窗口视频。单次 screenshot 仍是独立观察证据，不等于持续预览已建立。'
                                                           '长页面阅读优先 command operation=read：mode=links 返回脱敏 href/name（query/fragment 只标记存在，不含原值），mode=content 返回当前已渲染正文 article/text。每页 limit<=100、maxChars=4000..16000；续读携带相同 mode/readId 和 nextOffset。sourceTruncated=true 表示采集达到上限，不能声称完整。正文分片按 URL+id 去重，textOffset/textComplete 用于拼接，同一帖子多片不能重复计数；text 块不等于评论数。只读当前已加载 DOM，无后台请求、不含未加载楼层；403/404/未登录应报告，不能猜接口或复制登录资料。read 不产生输入 ref；成功导航后可用新文档 read/screenshot/diagnostics 轻量复核，点击、填写等输入仍须 snapshot 复核。'
-                                                          '无活动任务时 candidates 仅查询全局扩展心跳与候选，connectionScope=extension_preflight、taskChannelReady=false 不表示扩展掉线或已允许任务输入；clientVersion 来自真实心跳。begin 后 candidates 使用独立任务通道，不能将全局候选当作 assign 证据。会话首个握手最多等待 3 秒；channel_pending/BROWSER_CHANNEL_STARTING 时按 retryAfterMs 最多两次只读复查，不重建任务或重载扩展。首次 candidates 无缓存时最多等待 3 秒；refreshPending=true 仅表示尚待扩展回传，按 retryAfterMs 只读复查，不推断无标签或权限失败。verify_mapping 可用目标窗口活动标签的标题核验后台任务标签的所属窗口，不切换焦点；系统窗口连续视频可能显示窗口当前活动标签，snapshot/screenshot 仍可独立复核逻辑绑定标签。BROWSER_DEBUGGER_RESTRICTED 表示 Chrome 拒绝调试其他扩展页面，通知用户处理冲突，不重复输入或自动换目标。'
-                                                          '通过已授权扩展观察及操作固定浏览器标签。优先 candidates（可带当前 taskId；refreshPending 表示异步刷新），先 quietbridge_task bind 真实系统窗口，再以候选中的 browserWindowId/tabId 显式 assign；ID 不能用 CGWindowID 代替。候选超过 20 秒时 assign 自动等待至多 3 秒获取新证据，原标签、窗口、地址及任务目标均未变化才分配；不必反复刷新候选，不自动重建窗口。绑定后持续复用同一标签，不按前台焦点换目标。create_target 仅用于尚无窗口的活动任务，可带 url，focused=false；同一任务重复申请复用原请求或结果，不因超时另开窗口。command 下发限定操作（snapshot/read/click/fill/select/scroll/navigate/diagnostics/screenshot/keypress，单飞，15 秒过期，含扩展 service worker 冷启动预算），result 轮询（pending/ok/error/expired/canceled/evicted/unknown，不重放，附 latencyMs），cancel 如实报告 mayHaveExecuted。navigate 成功受理后等待原标签新文档就绪，可用 screenshot/read/diagnostics 复核导航，不必每页完整 snapshot；navigation_observation 表示此步骤。仅当前绑定、新 epoch、就绪且地址匹配才解除导航等待；落地地址变化时返回 verification.reason=navigation_destination_changed、nextAction=snapshot；获取当前 snapshot 核实后继续原绑定，无需重新 assign。文档未就绪时继续只读等待。其他输入或结果未知仍须 snapshot 复核；获取输入 ref 也须 snapshot。performed 不代表业务成功，浏览器分配不授权桌面输入或 wait_ready 判定。'
+                                                          '无活动任务时 candidates 仅查询全局扩展心跳与候选，connectionScope=extension_preflight、taskChannelReady=false 不表示扩展掉线或已允许任务输入；clientVersion 来自真实心跳。begin 后 candidates 使用独立任务通道，不能将全局候选当作 assign 证据。会话首个握手最多等待 3 秒；channel_pending/BROWSER_CHANNEL_STARTING 时按 retryAfterMs 最多两次只读复查，不重建任务或重载扩展。首次 candidates 无缓存时最多等待 3 秒；refreshPending=true 仅表示尚待扩展回传，按 retryAfterMs 只读复查，不推断无标签或权限失败。verify_mapping 用窗口活动标签标题核验归属，同名时用新鲜的唯一位置与尺寸匹配，不导航改标题、不切换焦点；系统窗口连续视频可能显示窗口当前活动标签，snapshot/screenshot 仍可独立复核逻辑绑定标签。BROWSER_DEBUGGER_RESTRICTED 表示目标含其他扩展页面；BROWSER_DEBUGGER_IN_USE 才表示已有调试客户端。debuggerFailure 保留 Chrome 原文、阶段及同文档声明的扩展 iframe ID（不含路径和页面内容）。不要根据 debugger 权限或 JSON 后缀猜测原因，不重载重试或自动换目标。'
+                                                          '通过已授权扩展观察及操作固定浏览器标签。优先 candidates（可带当前 taskId；refreshPending 表示异步刷新），先 quietbridge_task bind 真实系统窗口，再以候选中的 browserWindowId/tabId 显式 assign；ID 不能用 CGWindowID 代替。候选超过 20 秒时 assign 自动等待至多 3 秒获取新证据，原标签、窗口、地址及任务目标均未变化才分配；不必反复刷新候选，不自动重建窗口。绑定后持续复用同一标签，不按前台焦点换目标。create_target 仅在任务明确需要新建且尚无目标窗口时使用，可带 url，focused=false；仅 task status 确认本任务创建窗口关闭并给出 recreate_allowed 时，可在 begin(recoveryOf=旧taskId) 的未绑定阶段恢复专用窗口；不能用于权限/占用/调试器错误兜底；同一任务重复申请复用原请求或结果，不因超时另开窗口。command 下发限定操作（snapshot/read/click/fill/select/scroll/navigate/diagnostics/screenshot/keypress，单飞，15 秒过期，含扩展 service worker 冷启动预算），result 轮询（pending/ok/error/expired/canceled/evicted/unknown，不重放，附 latencyMs），cancel 如实报告 mayHaveExecuted。navigate 成功受理后等待原标签新文档就绪，可用 screenshot/read/diagnostics 复核导航，不必每页完整 snapshot；navigation_observation 表示此步骤。仅当前绑定、新 epoch、就绪且地址匹配才解除导航等待；落地地址变化时返回 verification.reason=navigation_destination_changed、nextAction=snapshot；获取当前 snapshot 核实后继续原绑定，无需重新 assign。文档未就绪时继续只读等待。其他输入或结果未知仍须 snapshot 复核；获取输入 ref 也须 snapshot。performed 不代表业务成功，浏览器分配不授权桌面输入或 wait_ready 判定。'
+                                                          'render_probe 仅在用户明确同意呈现诊断时使用，stage 依次 inspect/attach/enable/layout/capture；各阶段是独立命令，非自动串联。inspect 不附加，attach 不 Page.enable，enable 不查询布局，layout 不截图，capture 仅对该文档 30 秒内 layout 的视口单次截图并丢弃图像，只返回时间/状态/长度。既有 attachedBefore=true 表示已有调试连接，不能假称首次附加对照。禁止任意 CDP、自动重复 capture、切桌、激活或将探针当作后台绘制修复；不会清除已有动作复核要求。'
                                                           '前提：Chrome 已加载 QuietBridge Browser 并授予站点权限、原生宿主已登记（可在 quietbridge_permissions 或安装页核对）。网页内容在 task begin 声明 targetSurface=web_content，自动选 background_browser；导航使用本通道 navigate，不为导航操作地址栏。浏览器自身工具栏与真实原生打开/保存对话框属于 browser_ui/native_dialog 的独立原生阶段，不在本通道操作。网页里的弹窗、跨域 frame、受限 URL 或 AX 空树不是原生阶段证据。扩展未就绪时通知用户恢复，禁止回落 AX 或桌面输入。snapshot 返回 snapshotId 和 coverage：elementCount 是顶层 DOM 节点数（最多 10000），elements 是可见交互元素（最多 300），二者不必相等；coverage.truncated 表示交互元素确实被截断，长文改用 read。click/fill/select/scroll 必须传 snapshotId。滚动使用 direction=down/up、lines=6（1..10）；不要猜 deltaY 符号。到达边界与滚动未生效会分别报告，不把 performed 当作已移动。screenshot 直接截取该标签。tabs 列出任务归属标签，select_tab 只改逻辑目标，不激活标签或窗口。keypress 只支持页面按键。',
             'inputSchema': {'type': 'object', 'properties': {'action': {'type': 'string', 'enum': ['status', 'candidates', 'create_target', 'command', 'result', 'cancel', 'annotate', 'annotations', 'verify_mapping', 'assign', 'tabs', 'select_tab']},
                 'taskId': {'type': 'string'}, 'browserWindowId': {'type': 'integer'}, 'tabId': {'type': 'integer'},

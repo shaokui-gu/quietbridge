@@ -31,16 +31,15 @@ class TaskLifecycleTests(unittest.TestCase):
         self.fixture.fake.request.reset_mock()
         server.reap_task_lease()
         record = json.loads(self.fixture.path.read_text())['tasks'][bound['taskId']]
-        self.assertEqual(record['state'], 'interrupted')
-        self.assertEqual(record['interruptionReason'], 'idle_timeout')
+        self.assertEqual(record['state'], 'suspended')
+        self.assertEqual(record['suspensionReason'], 'idle_timeout')
         self.assertNotIn(bound['taskId'], server.TASK_BINDINGS)
         self.assertFalse(server.POWER_GUARD['active'])
         self.fixture.fake._stop.assert_called_once()
         self.fixture.fake.request.assert_not_called()
-        result = self.fixture.rpc('quietbridge_click', windowId=7, point={'x': 1, 'y': 1})
-        self.assertEqual(result['structuredContent']['errorCode'], 'TASK_INTERRUPTED')
+        self.assertIsNotNone(server.IDLE_RESUME)
         result = self.fixture.rpc(action='bind', taskId=bound['taskId'], appHandle='a', windowId=7, confirm=True)
-        self.assertEqual(result['structuredContent']['errorCode'], 'TASK_INTERRUPTED')
+        self.assertEqual(result['structuredContent']['errorCode'], 'TASK_SUSPENDED')
 
     def test_status_ping_and_browser_status_do_not_renew(self):
         bound = self.fixture.bind()
@@ -57,13 +56,17 @@ class TaskLifecycleTests(unittest.TestCase):
         bound = self.fixture.bind()
         start = time.time()
         uptime = time.monotonic()
-        for seconds in range(60, 2460, 60):
-            with mock.patch.object(time, 'time', return_value=start + seconds), mock.patch.object(time, 'monotonic', return_value=uptime + seconds):
-                server.reap_task_lease()
-                server.renew_task_lease('quietbridge_state', {'windowId': 7})
-                task = json.loads(self.fixture.path.read_text())['tasks'][bound['taskId']]
-                self.assertEqual(task['state'], 'bound')
-                self.assertTrue(browser_events.lease_live(task, self.fixture.path.parent))
+        # initialize tests leave a real watchdog running. Production serializes
+        # these calls under TOOL_LOCK; the fake-clock test must do the same so
+        # that watcher cannot see a half-applied time/time.monotonic patch.
+        with server.TOOL_LOCK:
+            for seconds in range(60, 2460, 60):
+                with mock.patch.object(time, 'time', return_value=start + seconds), mock.patch.object(time, 'monotonic', return_value=uptime + seconds):
+                    server.reap_task_lease()
+                    server.renew_task_lease('quietbridge_state', {'windowId': 7})
+                    task = json.loads(self.fixture.path.read_text())['tasks'][bound['taskId']]
+                    self.assertEqual(task['state'], 'bound')
+                    self.assertTrue(browser_events.lease_live(task, self.fixture.path.parent))
         self.fixture.fake._stop.assert_not_called()
 
     def test_historical_end_does_not_release_active_task(self):

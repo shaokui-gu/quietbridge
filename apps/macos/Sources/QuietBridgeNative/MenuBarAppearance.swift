@@ -172,7 +172,7 @@ enum MenuBarTheme {
     var selected = false { didSet { needsDisplay = true; updateColors() } }
     override var isFlipped: Bool { true }
 
-    init(title: String = "浏览器任务", iconName: String = "browser") {
+    init(title: String = "任务与窗口", iconName: String = "browser") {
         icon = MenuBarPanelView.icon(iconName)
         label = MenuBarPanelView.label(title, size: 13, weight: .medium)
         super.init(frame: .zero)

@@ -116,7 +116,7 @@ test('background pointer uses the bound tab; it never activates a tab/window or 
   assert.equal(result.verified, false);
   assert.equal(h.calls.some(c => c[0] === 'update'), false);
   const refreshes = h.calls.filter(c => c[0] === 'Page.captureScreenshot' && c[2]?.quality === 1);
-  assert.equal(refreshes.length, 1, 'one discarded capture follows the completed page action');
+  assert.equal(refreshes.length, 0, 'ordinary input must not implicitly take a screenshot');
   assert.equal('data' in result, false, 'the refresh image never enters the command result');
 });
 
@@ -126,10 +126,10 @@ test('read-only page commands do not emit render-refresh captures', async () => 
   assert.equal(h.calls.some(c => c[0] === 'Page.captureScreenshot' && c[2]?.quality === 1), false);
 });
 
-test('a failed render refresh never changes a completed page action', async () => {
+test('ordinary input succeeds without invoking screenshot support', async () => {
   const h = harness(), send = h.chrome.debugger.sendCommand;
   h.chrome.debugger.sendCommand = async (...args) => {
-    if (args[1] === 'Page.captureScreenshot' && args[2]?.quality === 1) throw new Error('pulse unavailable');
+    if (args[1] === 'Page.captureScreenshot' && args[2]?.quality === 1) assert.fail('ordinary click must not request an image');
     return send(...args);
   };
   const result = await h.browser.run(h.command('click', { ref: 1, snapshotId: 'snap' }), h.state);
@@ -359,6 +359,78 @@ test('foreign extension frames are reported as an actionable Chrome restriction 
     assert.equal(attempts, 1, stage);
     assert.equal(h.calls.some(c => c[0] === 'update' || c[0] === 'create'), false);
     assert.equal(h.calls.some(c => c[0] === 'script' && /\.click\(/u.test(c[1].func?.toString() || '')), false);
+  }
+});
+
+test('foreign-frame rejection preserves Chrome wording and reads only bounded iframe extension IDs', async () => {
+  const h = harness(), id = 'iahnhfdhidomcpggpaimmmahffihkfnj';
+  const message = 'Cannot access a chrome-extension:// URL of different extension';
+  let attempts = 0;
+  h.chrome.debugger.attach = async () => { attempts++; throw new Error(message); };
+  h.chrome.scripting.executeScript = async options => {
+    h.calls.push(['script', options]);
+    assert.deepEqual(options.target, { tabId: 7, documentIds: ['doc'] });
+    assert.equal(options.world, undefined);
+    const frames = ['chrome-extension://' + id + '/JSON-handle/JSON-handle.html?private=secret',
+      'https://example.org/frame?private=secret', 'chrome-extension://' + id + '/duplicate'];
+    const context = vm.createContext({ URL, document: { baseURI: h.state.url,
+      querySelectorAll: () => frames.map(src => ({ getAttribute: () => src })) } });
+    return [{ documentId: 'doc', result: vm.runInContext('(' + options.func.toString() + ')()', context) }];
+  };
+  await assert.rejects(h.browser.run(h.command('navigate', { url: 'https://example.org/next' }), h.state), error => {
+    assert.match(error.message, /Chrome 原文：Cannot access/);
+    assert.deepEqual(error.debuggerFailure, { reason: 'foreign_extension_page', stage: 'attach',
+      chromeMessage: message, foreignFrameExtensionIds: [id], frameEvidence: 'top_document_iframe_src', inputDispatched: false });
+    assert.equal(JSON.stringify(error.debuggerFailure).includes('private'), false);
+    return true;
+  });
+  assert.equal(attempts, 1);
+  assert.equal(h.calls.some(c => ['update', 'detach', 'Page.captureScreenshot'].includes(c[0])), false);
+});
+
+test('actual debugger occupation has a different error and never tries frame reads or takeover', async () => {
+  const h = harness();
+  const message = 'Another debugger is already attached to the tab with id: 7.';
+  h.chrome.debugger.attach = async () => { throw new Error(message); };
+  await assert.rejects(h.browser.run(h.command('navigate', { url: 'https://example.org/next' }), h.state), error => {
+    assert.match(error.message, /^BROWSER_DEBUGGER_IN_USE/);
+    assert.equal(error.debuggerFailure.reason, 'debugger_in_use');
+    assert.equal(error.debuggerFailure.chromeMessage, message);
+    return true;
+  });
+  assert.equal(h.calls.some(c => ['update', 'detach', 'script'].includes(c[0])), false);
+});
+
+test('child attach failure after a click never claims the original input was undispatched', async () => {
+  const h = harness(); h.popup('https://example.org/child');
+  let attaches = 0;
+  h.chrome.debugger.attach = async () => {
+    if (++attaches === 2) throw new Error('Cannot access a chrome-extension:// URL of different extension');
+  };
+  await assert.rejects(h.browser.run(h.command('click', { ref: 1, snapshotId: 'snap' }), h.state), error => {
+    assert.equal(error.debuggerFailure.stage, 'attach');
+    assert.equal('inputDispatched' in error.debuggerFailure, false);
+    return true;
+  });
+  assert.equal(h.calls.filter(c => c[0] === 'Input.dispatchMouseEvent').length, 2);
+});
+
+test('unavailable or replaced frame evidence cannot hide Chrome rejection or report another document', async () => {
+  for (const mode of ['unavailable', 'wrong_document', 'navigation']) {
+    const h = harness(), message = 'Cannot access a chrome-extension:// URL of different extension';
+    h.chrome.debugger.attach = async () => { throw new Error(message); };
+    h.chrome.scripting.executeScript = async () => {
+      if (mode === 'unavailable') throw new Error('scripting unavailable');
+      if (mode === 'navigation') h.navigate();
+      return [{ documentId: mode === 'wrong_document' ? 'other' : 'doc', result: ['a'.repeat(32)] }];
+    };
+    await assert.rejects(h.browser.run(h.command('navigate', { url: 'https://example.org/next' }), h.state), error => {
+      assert.match(error.message, /^BROWSER_DEBUGGER_RESTRICTED/);
+      assert.equal(error.debuggerFailure.frameEvidence, 'not_checked');
+      assert.deepEqual(error.debuggerFailure.foreignFrameExtensionIds, []);
+      return true;
+    });
+    assert.equal(h.calls.some(c => c[0] === 'update'), false);
   }
 });
 

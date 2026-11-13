@@ -16,6 +16,7 @@ import time
 
 from browser_events import event_store
 from lifecycle_store import ID, checked, read
+from recovery import policy as recovery_policy
 from session_registry import session_key, session_directory
 
 ROUTE_FIELD = '_quietbridgeRoute'
@@ -65,12 +66,13 @@ def consume(config, name, arguments):
     return clean, record
 
 
-def failure(message):
-    code = str(message).split(':', 1)[0]
+def failure(message, execution='not_dispatched'):
+    code = str(message).split(':', 1)[0] or 'BRIDGE_ERROR'
+    recovery = recovery_policy(code, execution)
     return {'isError': True, 'content': [{'type': 'text', 'text': str(message)}],
-        'structuredContent': {'ok': False, 'errorCode': code, 'execution': {'status': 'not_dispatched'},
-            'recovery': {'waitForUser': True, 'allowAlternativeTools': False, 'replaySideEffects': False,
-                         'message': '通知用户处理 QuietBridge 会话或连接器状态；不要换通道绕过。'}}}
+        'structuredContent': {'ok': False, 'errorCode': code, 'execution': {'status': execution},
+            'suggestedNext': 'ask_user_choice' if recovery.get('waitForUser') and recovery.get('userDecision')
+                else recovery['action'], 'recovery': recovery}}
 
 
 class SessionProcess:
@@ -104,11 +106,13 @@ class SessionProcess:
         # same session; the host can observe its existing result first.
         if not self.lock.acquire(blocking=False):
             return failure('SESSION_BUSY: 本会话已有工具调用进行中；请串行调用并核实既有结果')
+        dispatch_attempted = False
         try:
             self.context = context
             request = dict(message, params=dict(message.get('params', {}), _quietbridgeContext=context))
             if cancelled is not None and cancelled.is_set():
                 return failure('TASK_CANCELLED: 调用已取消')
+            dispatch_attempted = True
             self._send(request)
             deadline = time.monotonic() + 70
             sent_cancel = False
@@ -121,17 +125,18 @@ class SessionProcess:
                 except queue.Empty:
                     continue
                 if response is None:
-                    return failure('SESSION_WORKER_EXITED: 本会话执行进程已退出；其他会话继续运行，先核实结果再建立新阶段')
+                    return failure('SESSION_WORKER_EXITED: 本会话执行进程已退出；其他会话继续运行，先核实结果再建立新阶段', 'unknown')
                 if response.get('id') != request.get('id'):
                     self.close()
-                    return failure('SESSION_PROTOCOL_ERROR: 执行进程回执不匹配')
+                    return failure('SESSION_PROTOCOL_ERROR: 执行进程回执不匹配', 'unknown')
                 self.retained = response.get('_quietbridgeRetained', True) is True
                 return response['result']
             self.close()
-            return failure('SESSION_TIMEOUT: 本会话超时并已回收；执行结果未知，请先观察，不能重放输入')
+            return failure('SESSION_TIMEOUT: 本会话超时并已回收；执行结果未知，请先观察，不能重放输入', 'unknown')
         except (OSError, ValueError, KeyError):
             self.close()
-            return failure('SESSION_WORKER_EXITED: 本会话执行进程不可用；请先核实既有结果')
+            return failure('SESSION_WORKER_EXITED: 本会话执行进程不可用；请先核实既有结果',
+                           'unknown' if dispatch_attempted else 'not_dispatched')
         finally:
             self.last_used = time.monotonic()
             self.lock.release()

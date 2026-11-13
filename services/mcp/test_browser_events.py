@@ -131,7 +131,7 @@ class BrowserEventsTests(unittest.TestCase):
                 'conditionMatched': None, 'bindingId': binding_id,
                 'sequence': sequence, 'mappingVerified': False}
 
-    def test_periodic_preview_sync_is_separate_from_commands_and_discards_stale_leases(self):
+    def test_legacy_preview_lease_and_pixels_cannot_restart_automatic_capture(self):
         from browser_preview import identity
         token = self.assign()
         self.request({'action': 'event', 'taskId': 'task', 'token': token, 'event': self.event()})
@@ -143,14 +143,13 @@ class BrowserEventsTests(unittest.TestCase):
         frame = {'leaseId': lease['leaseId'], 'identity': current,
                  'data': 'ZmFrZQ==', 'capturedAt': events.time.time()}
         response = self.sync(previewFrame=frame)
-        self.assertEqual(response['previewLease'], lease)
+        self.assertIsNone(response['previewLease'])
         peer = events.read_file(self.store)['peer']
-        self.assertEqual(peer['previewFrame'], frame)
+        self.assertNotIn('previewFrame', peer)
+        self.assertNotIn('previewLease', peer)
         self.assertEqual(peer['pendingVerify'], {'operation': 'click'})
         self.assertFalse(peer.get('commandResults'))
         self.assertNotIn('ZmFrZQ==', json.dumps(events.status('task', **self.paths)))
-        with events.event_store(self.store) as data:
-            data['peer']['previewLease']['expiresAt'] = 0
         response = self.sync(previewFrame=frame)
         self.assertIsNone(response['previewLease'])
         self.assertNotIn('previewFrame', events.read_file(self.store)['peer'])
@@ -916,6 +915,45 @@ class BrowserEventsTests(unittest.TestCase):
         self.sync(windowEvidence=None)
         self.assertFalse(events.internal_action(args, **self.paths)['verified'])
 
+
+    def test_equal_window_titles_use_unique_geometry_without_renaming_or_navigation(self):
+        self.prepare_assignment()
+        assignment = self.sync()['assignment']
+        bounds = {'x': 120, 'y': 39, 'width': 1800, 'height': 1048}
+        evidence = {'bindingId': assignment['bindingId'], 'browserWindowId': 2,
+                    'tabId': 7, 'title': 'LINUX DO', 'bounds': bounds}
+        self.sync(windowEvidence=evidence)
+        windows = [{'windowId': 900, 'title': 'LINUX DO', 'bounds': bounds},
+                   {'windowId': 901, 'title': 'LINUX DO', 'bounds': dict(bounds, x=11161)}]
+        args = {'action': 'verify_mapping', 'taskId': 'task', 'windows': windows}
+        reply = events.internal_action(args, **self.paths)
+        self.assertTrue(reply['verified'])
+        self.assertEqual(reply['windowId'], 900)
+        self.assertEqual(reply['method'], 'window_active_title_and_bounds')
+        self.assertIsNone(events.read_file(self.store)['peer'].get('command'))
+        windows[1]['bounds'] = bounds
+        self.assertEqual(events.internal_action(args, **self.paths)['reason'], 'ambiguous')
+        windows[1].pop('bounds')
+        self.assertEqual(events.internal_action(args, **self.paths)['reason'], 'ambiguous',
+                         'Missing geometry cannot prove that the second window differs')
+
+    def test_window_geometry_requires_all_coordinates_and_current_binding(self):
+        self.prepare_assignment()
+        assignment = self.sync()['assignment']
+        bounds = {'x': 120, 'y': 39, 'width': 1800, 'height': 1048}
+        evidence = {'bindingId': assignment['bindingId'], 'browserWindowId': 2, 'tabId': 7,
+                    'title': 'LINUX DO', 'bounds': bounds}
+        for invalid in (dict(bounds, width=-1), dict(bounds, x=float('nan')), dict(bounds, height=True), {'width': 1800}):
+            with self.assertRaisesRegex(ValueError, '几何'):
+                self.sync(windowEvidence=dict(evidence, bounds=invalid))
+        self.sync(assignmentTitle='LINUX DO', windowEvidence=evidence)
+        with events.event_store(self.store) as data:
+            data['peer']['windowEvidence']['at'] -= 21
+        args = {'action': 'verify_mapping', 'taskId': 'task', 'windows': [
+            {'windowId': 900, 'title': 'LINUX DO', 'bounds': bounds},
+            {'windowId': 901, 'title': 'LINUX DO', 'bounds': dict(bounds, x=11161)}]}
+        self.assertFalse(events.internal_action(args, **self.paths)['verified'])
+
     def test_foreign_extension_command_error_has_explicit_recovery_code(self):
         self.prepare_command()
         command = events.internal_action({'action': 'command', 'taskId': 'task',
@@ -928,6 +966,165 @@ class BrowserEventsTests(unittest.TestCase):
         self.assertEqual(result['status'], 'error')
         self.assertEqual(result['errorCode'], 'BROWSER_DEBUGGER_RESTRICTED')
         self.assertEqual(result['nextAction'], 'stop')
+
+    def test_debugger_failure_preserves_original_reason_and_only_bounded_frame_identity(self):
+        self.prepare_command()
+        for reason, message, code in (
+                ('foreign_extension_page', 'Cannot access a chrome-extension:// URL of different extension', 'BROWSER_DEBUGGER_RESTRICTED'),
+                ('debugger_in_use', 'Another debugger is already attached to the tab with id: 7.', 'BROWSER_DEBUGGER_IN_USE')):
+            command = events.internal_action({'action': 'command', 'taskId': 'task', 'operation': 'snapshot'}, **self.paths)
+            evidence = {'reason': reason, 'stage': 'attach', 'chromeMessage': message,
+                'foreignFrameExtensionIds': ['a' * 32] if reason == 'foreign_extension_page' else [],
+                'frameEvidence': 'top_document_iframe_src' if reason == 'foreign_extension_page' else 'not_checked'}
+            self.sync(commandResult={'requestId': command['commandId'], 'status': 'error',
+                'error': code + '：attach 被拒绝', 'debuggerFailure': evidence})
+            result = events.internal_action({'action': 'result', 'taskId': 'task',
+                'commandId': command['commandId']}, **self.paths)
+            self.assertEqual(result['errorCode'], code)
+            self.assertEqual(result['debuggerFailure'], evidence)
+            self.assertEqual(result['nextAction'], 'stop')
+
+    def test_malformed_debugger_details_are_rejected_without_poisoning_channel(self):
+        self.prepare_command()
+        evidence = {'reason': 'foreign_extension_page', 'stage': 'attach',
+            'chromeMessage': 'Cannot access a chrome-extension:// URL of different extension',
+            'foreignFrameExtensionIds': ['a' * 32], 'frameEvidence': 'top_document_iframe_src'}
+        for change in ({'data': 'pixels'}, {'chromeMessage': 'https://private.example/?secret=1'},
+                       {'foreignFrameExtensionIds': ['chrome-extension://' + 'a' * 32 + '/?secret=1']},
+                       {'frameEvidence': 'not_checked'}, {'stage': 'attach\nunsafe'}):
+            command = events.internal_action({'action': 'command', 'taskId': 'task', 'operation': 'snapshot'}, **self.paths)
+            reply = self.sync(commandResult={'requestId': command['commandId'], 'status': 'error',
+                'error': 'BROWSER_DEBUGGER_RESTRICTED：attach 被拒绝', 'debuggerFailure': evidence | change})
+            self.assertEqual(reply['commandAck']['code'], 'INVALID_BROWSER_RESULT')
+            stored = events.read_file(self.store)['peer']['commandResults'][-1]
+            self.assertNotIn('debuggerFailure', stored)
+            self.assertEqual(self.sync()['taskAssignment'], 'assigned')
+
+    def test_new_task_does_not_inherit_old_commands_snapshots_or_verification(self):
+        self.prepare_command()
+        old = events.internal_action({'action': 'command', 'taskId': 'task', 'operation': 'navigate',
+                                     'url': 'https://example.org/old'}, **self.paths)
+        self.sync()  # Delivered but outcome unknown; do not replay it.
+        with events.event_store(self.store) as data:
+            data['peer']['pendingVerify'] = {'taskId': 'task', 'operation': 'navigate', 'commandId': old['commandId']}
+        tasks = events.read_file(self.tasks)
+        previous = tasks['tasks']['task']
+        previous['state'] = 'ended'
+        tasks['tasks']['fresh'] = dict(previous, taskId='fresh', state='bound')
+        tasks['activeTaskId'] = 'fresh'
+        self.tasks.write_text(json.dumps(tasks))
+        reply = events.internal_action({'action': 'assign', 'taskId': 'fresh', 'tabId': 7,
+                                       'browserWindowId': 2}, **self.paths)
+        self.assertTrue(reply['assigned'])
+        peer = events.read_file(self.store)['peer']
+        self.assertIsNone(peer.get('pendingVerify'))
+        self.assertIsNone(peer.get('snapshot'))
+        self.assertIsNone(peer.get('command'))
+        terminal = next(t for t in peer['commandTerminals'] if t['commandId'] == old['commandId'])
+        self.assertTrue(terminal['mayHaveExecuted'])
+        self.assertEqual(terminal['taskId'], 'task')
+        self.assertEqual(self.sync(commandResult={'requestId': old['commandId'], 'status': 'error',
+                                                'error': 'late old result'})['commandAck']['status'], 'discarded')
+        assignment = self.sync()['assignment']
+        event = self.event()
+        event.update(bindingId=assignment['bindingId'])
+        self.request({'action': 'event', 'taskId': 'fresh', 'token': assignment['token'], 'event': event})
+        queued = events.internal_action({'action': 'command', 'taskId': 'fresh', 'operation': 'navigate',
+                                        'url': 'https://example.org/next'}, **self.paths)
+        self.assertEqual(queued['status'], 'queued', 'New navigation needs no old-task snapshot')
+
+    def test_same_task_reassignment_preserves_unknown_action_barrier(self):
+        self.prepare_command()
+        command = events.internal_action({'action': 'command', 'taskId': 'task', 'operation': 'navigate',
+                                         'url': 'https://example.org/next'}, **self.paths)
+        self.sync()
+        events.internal_action({'action': 'assign', 'taskId': 'task', 'tabId': 7, 'browserWindowId': 2}, **self.paths)
+        peer = events.read_file(self.store)['peer']
+        self.assertEqual(peer['pendingVerify']['taskId'], 'task')
+        self.assertEqual(peer['pendingVerify']['operation'], 'reassign')
+
+    def test_known_attach_rejection_does_not_require_snapshot_before_next_navigation(self):
+        self.prepare_command()
+        command = events.internal_action({'action': 'command', 'taskId': 'task', 'operation': 'navigate',
+                                         'url': 'https://example.org/next'}, **self.paths)
+        self.sync(commandResult={'requestId': command['commandId'], 'status': 'error',
+            'error': 'BROWSER_DEBUGGER_RESTRICTED：attach 被拒绝', 'debuggerFailure': {
+                'reason': 'foreign_extension_page', 'stage': 'attach',
+                'chromeMessage': 'Cannot access a chrome-extension:// URL of different extension',
+                'foreignFrameExtensionIds': [], 'frameEvidence': 'not_checked', 'inputDispatched': False}})
+        self.assertIsNone(events.read_file(self.store)['peer'].get('pendingVerify'))
+        queued = events.internal_action({'action': 'command', 'taskId': 'task', 'operation': 'navigate',
+                                        'url': 'https://example.org/next'}, **self.paths)
+        self.assertEqual(queued['status'], 'queued')
+
+    def test_child_attach_failure_after_input_still_requires_observation(self):
+        self.prepare_command()
+        command = events.internal_action({'action': 'command', 'taskId': 'task', 'operation': 'click',
+                                         'snapshotId': 'snap-1', 'ref': 1}, **self.paths)
+        self.sync(commandResult={'requestId': command['commandId'], 'status': 'error',
+            'error': 'BROWSER_DEBUGGER_RESTRICTED：attach 被拒绝', 'debuggerFailure': {
+                'reason': 'foreign_extension_page', 'stage': 'attach',
+                'chromeMessage': 'Cannot access a chrome-extension:// URL of different extension',
+                'foreignFrameExtensionIds': [], 'frameEvidence': 'not_checked'}})
+        self.assertEqual(events.read_file(self.store)['peer']['pendingVerify']['commandId'], command['commandId'])
+
+    def test_old_navigation_experiment_report_is_discarded_without_authorizing_capture(self):
+        self.prepare_command()
+        with events.event_store(self.store) as data:
+            data['peer']['windowPreview'] = {'targetOnCurrentSpace': False}
+            data['peer']['navigationCapture'] = {'status': 'captured'}
+        reply = self.sync(navigationCapture={'old': 'ignored'})
+        self.assertNotIn('windowPreview', reply)
+        self.assertNotIn('navigationCapture', events.status('task', **self.paths))
+        self.assertNotIn('windowPreview', events.read_file(self.store)['peer'])
+
+    def test_core_actions_and_repeated_navigation_keep_one_binding_without_experiments(self):
+        self.prepare_command()
+        initial = events.read_file(self.store)['tasks']['task']
+        token, binding = initial['token'], initial['bindingId']
+        self.sync(assignmentTitle='Example Domain')
+        self.assertTrue(events.internal_action({'action': 'verify_mapping', 'taskId': 'task',
+            'windows': [{'windowId': 900, 'title': 'Example Domain'}]}, **self.paths)['verified'])
+
+        def complete(operation, result, **params):
+            queued = events.internal_action({'action': 'command', 'taskId': 'task',
+                                            'operation': operation, **params}, **self.paths)
+            self.sync(commandResult={'requestId': queued['commandId'], 'status': 'ok', 'result': result})
+            reply = events.internal_action({'action': 'result', 'taskId': 'task',
+                                            'commandId': queued['commandId']}, **self.paths)
+            self.assertEqual(reply['status'], 'ok')
+            return reply
+
+        for operation, params in (
+                ('fill', {'snapshotId': 'snap-1', 'ref': 1, 'value': 'core-check'}),
+                ('click', {'snapshotId': 'snap-1', 'ref': 1}),
+                ('scroll', {'snapshotId': 'snap-1', 'direction': 'down', 'lines': 6})):
+            complete(operation, {'performed': True, 'verified': False, 'observed': {}}, **params)
+            complete('snapshot', self.SNAPSHOT)
+        for epoch in (2, 3, 4):
+            url = 'https://example.org/step-' + str(epoch)
+            complete('navigate', {'performed': True, 'verified': False, 'observed': {}}, url=url)
+            event = dict(self.event(sequence=epoch * 2), documentId='doc-' + str(epoch), navigationEpoch=epoch,
+                         url=url, phase='content', readyState='complete', domReady=True, loaded=True)
+            self.request({'action': 'event', 'taskId': 'task', 'token': token,
+                          'event': dict(event, phase='committed', sequence=epoch * 2 - 1,
+                                        readyState=None, domReady=False, loaded=False,
+                                        bodyPresent=False, bodyVisible=False, elementCount=0,
+                                        conditionMatched=None, contentReady=None)})
+            self.request({'action': 'event', 'taskId': 'task', 'token': token, 'event': event})
+            complete('diagnostics', {'url': url, 'readyState': 'complete', 'errors': [],
+                                    'viewport': {'width': 800, 'height': 600}, 'scroll': {'x': 0, 'y': 0}})
+            state = events.status('task', **self.paths)
+            self.assertFalse(state['commandState']['verificationRequired'])
+            self.assertEqual(state['bindingId'], binding)
+        tasks = events.read_file(self.tasks)
+        tasks['tasks']['task']['state'] = 'ended'
+        tasks['activeTaskId'] = None
+        self.tasks.write_text(json.dumps(tasks))
+        sync = self.sync()
+        self.assertIsNone(sync['assignment'])
+        self.assertIsNone(sync['command'])
+        self.assertIsNone(sync['previewLease'])
 
     def test_mapping_evidence_is_host_local_and_does_not_break_observer_assignment(self):
         self.prepare_assignment()

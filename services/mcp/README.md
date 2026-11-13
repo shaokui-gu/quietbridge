@@ -20,9 +20,11 @@ WorkBuddy ⇄ MCP(stdio/JSON-RPC) ⇄ server.py ⇄ quietbridge-native ⇄ 共�
 
 MCP `initialize` 返回全局 `instructions`，`tools/list` 的各项描述也包含对应操作要求；错误回执会继续给出相同的恢复方向。桥接版本为 `1.1.0`。PKG 使用固定连接入口，后续覆盖安装或升级保持 stdio，完成当前调用后加载新版并发送工具列表更新通知。旧版直连入口首次迁移仍需要宿主刷新与信任确认。
 
-工具回执的 `structuredContent.recovery` 区分 `user_action_required`、`revalidate_required`、`wait_required`、`outcome_unknown` 和 `blocked`。应用未运行、能力开关关闭、权限缺失及连接组件异常会给出具体操作和 `suggestedNext=notify_user_and_wait`，agent 应先告知用户并等待，不能更换其他工具绕过。成功的浏览器状态读取也会在实际连接或权限受阻时附带恢复说明；空候选列表本身不等于权限故障。共享暂未就绪只允许最多两次只读复查，仍未恢复则通知用户。执行结果未知时保留不确定性，恢复后查询原命令或观察，绝不重放副作用。
+工具回执的 `structuredContent.recovery` 区分 `user_action_required`、`revalidate_required`、`wait_required`、`outcome_unknown`、`blocked` 和明确停止的 `task_stopped`。可恢复错误不结束业务：快照过期、候选变化和通道启动先按回执对原目标作有界恢复；共享暂未就绪最多两次只读复查；输入回执超时先查询原 commandId 和观察，绝不重放副作用。正常 queued 命令继续查询原结果，不因两次普通轮询未结束就弹框。成功的状态读取也可能附带实际权限或连接阻塞；空候选本身不等于权限故障。
 
-这些恢复字段是本项目的调用约定，宿主仍负责让 agent 遵守。整个连接器未加载或离线时，插件无法返回回执，需在宿主的常驻 agent 指令中加入：“指定连接器不可用时，告知用户恢复连接并等待，不改用其他自动化工具绕过。”
+应用未运行、能力关闭、权限缺失、目标占用、无法安全恢复或自动恢复耗尽时，暂停依赖步骤，按 `recovery.userDecision` 让用户选择。立即需要选择的回执是 `suggestedNext=ask_user_choice`；自动恢复回执的 `onExhausted=ask_user_choice` 表示先恢复，耗尽后才展示。Agent 优先调用宿主可用的 `AskUserQuestion` 或等效交互工具，提供“处理后继续 / 保持暂停 / 结束任务”；没有交互工具时在对话中询问并等待，不能默认选择、直接用最终回复宣告业务结束或换工具绕过。等待时停止新输入、释放自己的共享；按具体恢复计划保留原绑定或结束已失效的界面阶段，保留已有业务结果。用户选择继续后重新核实权限、连接、目标、共享与新快照。明确取消或宿主停止的回执为 `taskMustEnd=true`，不再弹继续选择或自动重建。
+
+这些恢复字段是本项目的调用约定，宿主仍负责让 Agent 遵守；MCP 回执本身不能弹出宿主对话框。整个连接器未加载或离线时无法返回回执，需在宿主的常驻 Agent 指令中加入：“指定连接器不可用时，保留业务进度，使用宿主交互工具询问处理后继续、保持暂停或结束；无交互工具则在对话中等待，不改用其他自动化工具绕过。”
 
 界面操作必须**不抢焦点并使用共享窗口能力**：
 
@@ -76,7 +78,9 @@ MCP `initialize` 返回全局 `instructions`，`tools/list` 的各项描述也�
 
 Chrome 页面操作优先使用已授权扩展，保持同一任务、浏览器窗口 ID 和标签 ID：先 `quietbridge_browser_events(action="candidates", taskId=...)`，等待扩展刷新后再次查询，用返回的 `browserWindowId/tabId` 调用 `assign`，随后执行 `command(operation="snapshot")` 并查询 `result`。点击使用该快照中的 `ref`；每次动作后再读取快照确认页面变化。`nativeConnection=connected` 仅证明宿主可达，`paired=false` 表示尚未完成标签分配，不应改用重复开窗恢复。
 
-`create_target` 只供等待窗口、尚未绑定的活动任务显式创建专用窗口，采用 `focused=false`。同一任务重复申请会返回原请求或已创建窗口；超时不会生成新请求。扩展把创建标识及结果存入会话存储，worker 重启后只恢复已知结果，结果未知则停止重放。已绑定任务返回 `TARGET_ALREADY_BOUND`，继续使用既有标签。
+`create_target` 供任务明确需要新建且尚无目标窗口时使用，采用 `focused=false`。故障恢复仅允许一个例外：`task status.targetRecovery.status=recreate_allowed` 证明本任务自己创建并完成映射的 Chrome 专用窗口已关闭，原进程、连接、应用会话与宿主仍有效。Agent 先 end 自己的失效界面阶段，再 begin(recoveryOf=旧taskId,targetSurface=web_content)，在新阶段创建一个替代窗口，重新核实并绑定、分配、映射、共享和观察。恢复链最多自动替换两次；两次后再次关闭只要求用户选择，不推断取消意图。恢复失败也暂停选择，不能丢弃 recoveryOf 绕过预算。用户明确选择重建后，才可开启新一轮已授权阶段。既有用户窗口、原生窗口、仅标签消失或无法证明关闭时不自动重建。
+
+同一任务重复 create_target 会返回原请求或已创建窗口；超时不会生成新请求。重复 begin(recoveryOf=同一旧taskId) 复用仍有效的恢复阶段，不复活已结束阶段。扩展把创建标识及结果存入会话存储，worker 重启后只恢复已知结果，结果未知则停止重放。已绑定任务返回 `TARGET_ALREADY_BOUND`，继续使用既有标签。重建不恢复草稿，也不能证明旧业务输入未生效；提交、支付、发送等未知结果必须先查询或观察。
 
 点击仅在目标应用和目标键盘窗口已经位于前台时使用 AX 动作，后台目标走 PID/窗口定向事件；无法读取点击前的焦点状态时以 `FOCUS_STATE_UNKNOWN` 拒绝。回执记录前后 PID、键盘窗口 ID 和 `focusPreserved`，不自动激活另一个应用恢复焦点。网页任务始终走扩展的固定标签通道；扩展未绑定、共享未核实、权限不足或返回窗口投递错误时报告阻塞，不通过切换前台或新建窗口继续。前后采样相同不证明全程没有短暂切换，仍需结合实际体验核实。
 
@@ -199,7 +203,7 @@ codesign --force --deep --sign "Apple Development: Shaokui Gu (ATGH8CN43J)" "Qui
 
 ## 跨桌面预览面板（早期实现记录）
 
-本节以下描述早期合成路径，不代表当前捕获策略。当前原生应用和 Chrome 网页任务都使用 ScreenCaptureKit 连续视频；扩展只在页面动作后执行一次丢弃的绘制提醒。
+本节以下描述早期合成路径，不代表当前捕获策略。当前原生应用和 Chrome 网页任务都使用 ScreenCaptureKit 连续视频；核心收敛后的扩展源码不再隐式截图促帧。
 
 目标窗口 `isOnScreen=false`（在别的 Space / 另一块屏幕）时，helper 会弹一块 380×271 的悬浮面板（`SpacePreview.swift`，标题「跨桌面预览」），每 0.6s 抓一帧桌面对该 Space 做合成：把属于该 Space 的窗口按原坐标画在**中性灰背景**上。于是面板里没被窗口覆盖的区域会是大片纯灰——那是背景，不是没渲染。
 
@@ -223,7 +227,7 @@ codesign --force --deep --sign "Apple Development: Shaokui Gu (ATGH8CN43J)" "Qui
    - 它是**独立浮层窗口**，`quietbridge_screenshot` 走 ScreenCaptureKit 窗口捕获，**永远拍不到它**，也拍不到系统光标。
 3. **跨桌面会画到看不见的地方**。浮层坐标由窗口所在的窗口服务器空间算出；目标窗口 `isOnScreen=false` 时，代理光标与点击都落在另一个 Space。桥接层现在会在结果里附带这条告警。
 
-想在屏幕上看到光标：先 `quietbridge_windows(action="activate")` 把窗口拉到当前桌面，再做坐标点击，并在这 30 秒内看屏幕——别去看截图。
+以上为早期代理光标的显示行为说明。当前不抢焦点任务禁止为查看光标调用 `activate`、拉动窗口或切换 Space；按当前预览和操作回执核实。
 
 ## 自检
 
@@ -247,11 +251,15 @@ TCC 授权跟着 helper 的**责任进程**走。实测两种形态：
 
 界面阶段完成调用 `quietbridge_task end`：释放本阶段绑定和共享预览，保留周围宿主运行的会话保护。`end` 和 `status` 返回 `sessionProtection`，包括 retained、scope、idleTimeoutSeconds 和 remainingSeconds；没有活动阶段时也可读取。 `end` 另返回 `previewCleanup`，区分已回执释放、原生连接已关闭、清理失败和未确认；不能用 `sessionProtection.retained` 推断共享是否仍在。阶段结束后仍可幂等 `unshare` 清理本连接预览，不释放宿主会话保护、不启动新 helper；其他活动连接的资源仍受所有权检查。MCP 的 `notifications/cancelled` 和 stdin EOF 在独立读取线程中处理，取消当前请求并释放该连接的共享预览、保护与绑定；队列中的输入不再派发。取消可能发生在部分输入之后，已执行结果不会回滚或自动重放。
 
-界面任务由桥接内核文件锁证明连接归属，持有 120 秒无操作租约。实际任务操作续期；权限/任务状态查询、MCP ping 和扩展心跳不续期。该租约到期关闭阶段预览，不结束仍有效的会话保护。已核实宿主会话/轮次的保护允许 30 分钟无实际工具活动；同轮次其他业务工具的 PostToolUse 仅记录活动时间，不保存内容。持续实际活动可以运行超过 30 分钟；连接在线不能代替活动。未核实归属时仍按 120 秒兜底。桥接崩溃时文件锁自动释放，扩展在下次同步撤销分配并取消待发命令和建窗请求；已发出的动作不能撤回。
+界面任务由桥接内核文件锁证明连接归属，持有 120 秒无操作租约。实际任务操作续期；权限/任务状态查询、MCP ping 和扩展心跳不续期。该租约到期释放阶段预览并将已绑定目标记为 `suspended`，不结束仍有效的会话保护。等待用户输入后，只要原执行 worker 和 QuietBridge 应用会话仍在，下次原目标调用会自动重取句柄、核验进程代际与窗口，返回 `TASK_RESUMED` 及 `resumption.nextSteps`；Agent 应立即恢复共享、取得新快照并继续已授权工作，无需用户提醒重连。恢复调用不会执行其携带的点击或填写，旧引用不能继续使用。Chrome 自动为原标签生成新绑定，必须重新验证窗口映射、建立共享并获取 snapshot；旧文档、旧映射和待发命令不复用。目标变化、其他会话占用、权限撤销或应用重启仍会阻止恢复。
+
+已核实宿主会话/轮次的保护允许 30 分钟无实际工具活动；同轮次其他业务工具的 PostToolUse 仅记录活动时间，不保存内容。持续实际活动可以运行超过 30 分钟；连接在线不能代替活动。未核实归属时仍按 120 秒兜底。等待时不通过心跳保持共享或无限续租，恢复仅由后续目标调用触发。桥接崩溃时文件锁自动释放，扩展在下次同步撤销分配并取消待发命令和建窗请求；已发出的动作不能撤回。
 
 原生预览与保护分别有 120 秒 socket 资源租约。桥接只在自己的会话租约有效时每 30 秒续原生保护，不延长阶段/预览或伪造宿主活动。各连接独立持有保护，释放、断开和到期仅移除自身；最后一个参与者退出才全局释放防睡眠和锁屏保护。最多三个可信宿主会话分别持有任务和共享预览；卡片切换只改变查看画面，不改变任务目标。原生同进程窗口仍按进程互斥。共享 MCP 缺少可靠逐调用身份时不能混用目标；新阶段需核实与原保护属于同一宿主运行，否则返回 `SESSION_ROUTING_REQUIRED`，不接管或撤销原会话。
 
-中断记录保留 `interruptionReason` 和 `interruptedAt`。`TASK_CANCELLED`/`TASK_INTERRUPTED` 要求报告并等待用户继续，之后先核实已有结果，再 begin 新任务、重新确认目标；旧任务不能恢复输入。`TASK_IN_USE` 禁止接管另一活动连接。`TARGET_MISMATCH` 只说明目标不一致，先检查任务和原目标，不能直接判定为旧绑定并自动清理。
+等待暂停记录保留 `suspensionReason` 和 `suspendedAt`，状态查询会给出自动恢复步骤，但不会自己唤起共享。`TASK_SUSPENDED`/`TASK_RESUMED` 不要求再次征求用户继续；最多两次自动复查仍受阻时再请求选择。中断记录保留 `interruptionReason` 和 `interruptedAt`；`TASK_CANCELLED` 或 `interruption.explicitStop=true` 表示明确停止，不复活旧任务。其他 `TASK_INTERRUPTED` 表示旧界面阶段不可继续，保留业务进度并请求用户选择；继续时先核实已有结果，再 begin 新阶段并确认目标。end、unshare、取消、FinalStop、SessionEnd 与连接器退出会丢弃原绑定的空闲自动恢复意图；显式 recoveryOf 是独立且受限的窗口关闭恢复链。`TASK_IN_USE` 禁止接管另一活动连接。`TARGET_MISMATCH` 只说明目标不一致，先检查任务和原目标，不能直接判定为旧绑定并自动清理。
+
+窗口冲突 `TARGET_IN_USE` 的 `structuredContent.targetConflict` 返回实际占用任务、窗口、PID、模式、冲突范围和可核实的宿主会话 ID。Agent 应向用户说明这些身份，不能从页面标题猜测占用者或自动结束他人的任务。用户可在 QuietBridge“任务与窗口”核对身份并点击“停止此会话控制”：直接撤销对应宿主本轮，扩展离线或执行者持有任务锁时也能发起；stopping 期间保持目标互斥，资源收尾后释放。原轮次不能重新创建任务抢回窗口，其他独立会话继续执行。此入口不修改 WorkBuddy 定时计划，停止 HTTP 测试服务也不释放另一个采集会话的窗口租约。实现和隔离测试见 [窗口占用停止修复](../../docs/implementation/2026-11-12-window-owner-stop-fix.zh.md)。
 
 macOS PKG 从 0.5.53 起合并注册 Workbuddy 支持的 `PostToolUse`、`FinalStop` 和 `SessionEnd` 命令回调。成功 begin/bind 的回执把本轮宿主会话与确切任务 ID、租约拥有者关联，保留各阶段记录；FinalStop 撤销该轮，SessionEnd 撤销该会话。阶段已 end、没有活动任务时也保留停止关联。即使没有正在运行的 MCP 请求、stdio 保持连接，桥接也在下一次 500ms 检查时关闭自己的原生连接；其他保护参与者继续持有，最后一个退出才交还系统锁屏。执行中的调用同时收到取消信号。回调不保存工具内容、对话正文或宿主日志，不终止 Workbuddy，不重连连接器。异步回执用于停止关联，不能当作逐调用身份路由。
 
@@ -280,9 +288,9 @@ macOS PKG 从 0.5.53 起合并注册 Workbuddy 支持的 `PostToolUse`、`FinalS
 
 预览面板与捕获源分别绑定：预览面板跟随 WorkBuddy 的窗口、显示器和 Space。Chrome 网页任务和其他应用统一使用系统窗口/应用连续视频；系统流可能显示窗口实际选中的标签，不能证明后台任务标签的页面状态，逻辑标签仍以扩展 snapshot/screenshot/read 为准。
 
-0.6.18 的网页内容定时帧只保留为旧协议兼容代码，生产路径不再创建该租约，扩展 0.4.10 也不再声明 `browser_preview`。扩展在会修改页面的动作完成后生成一次低质量截图并立即丢弃，用于提醒处于其他 Space 的 Chrome 提交当前合成帧；导航在新文档身份确认后提醒一次。提醒不进入预览、不落盘、不证明动作成功，空闲时不轮询，也不能替代系统窗口流。后台输入不等待视频首帧，不因预览失败切换到前台输入。
+0.6.26（扩展 0.4.14）移除动作后的截图促帧、导航后 5 秒单次截图及相关原生 Space 状态轮询。普通观察、导航、点击、填写和滚动均不隐式截图，预览只使用系统窗口连续视频；旧扩展回传的实验报告和 screenshot-mailbox 帧会被丢弃，不能重启旧截图租约。显式 screenshot 仍是独立观察能力；render_probe 仅在明确诊断时调用，不能进入日常操作前置流程。Chrome 在其他 Space 的视频呈现仍受平台渲染行为影响，不以截图模拟连续视频。后台网页控制不等待视频首帧，身份或权限失败也不切换到前台输入。
 
-旧协议的预览邮箱代码仍保留以识别和清理遗留租约，但生产路径不写入预览帧。动作后的绘制提醒截图不会进入 `browser-events.json`，也不会写入操作日志。新策略及其边界见 [系统窗口预览策略记录](../../docs/implementation/2026-11-12-native-window-preview-strategy.zh.md)。
+旧协议的预览邮箱模块保留供识别和清理遗留状态，握手无条件撤销旧截图租约和帧。生产流程不再执行绘制提醒截图。当前改动及其边界见[核心能力收敛](../../docs/implementation/2026-11-12-core-stability-convergence.zh.md)；后续安装新版后使用[核心操作验收提示词](../../docs/implementation/core-control-acceptance-prompt.zh.md)。
 
 升级需重新加载扩展 0.3.2；从尚未授权 debugger 的版本升级时，在 Chrome 提示后由本人确认该权限。该权限用于固定标签的浏览器调试协议；缺权限时不尝试其他输入通道。重新连接 WorkBuddy MCP 后开始新任务。已在实际 Chrome 上验证新建窗口、候选分配、页面快照、填写、滚动、截图及任务结束后的窗口保留；不同 macOS Space 和特殊站点弹窗仍须单独验证。
 

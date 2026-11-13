@@ -278,6 +278,27 @@ import Testing
         }
     }
 
+    @Test @MainActor func rebindingTheSameWindowReusesTheAttachedSession() throws {
+        let fixture = AttachFixture()
+        let manager = fixture.manager()
+        let latch = CancellationLatch()
+        let params = try parameters(["action": .string("attach"), "pid": .number(88), "windowId": .number(9), "confirm": .bool(true)])
+        func attach() throws -> JSONValue {
+            try manager.handle(action: params.string("action"), confirm: params.optionalBoolean("confirm"),
+                pid: Int32(params.integer("pid")), windowID: params.windowID(), cancellation: latch)
+        }
+        let first = try attach()
+        let second = try attach()
+        let third = try attach()
+        #expect(first["sessionId"] == second["sessionId"], "同窗口同代际重复绑定必须复用会话")
+        #expect(second["sessionId"] == third["sessionId"])
+        guard case .array(let sessions) = try manager.handle(action: "list", cancellation: latch)["sessions"] else {
+            Issue.record("缺少会话列表"); return
+        }
+        #expect(sessions.count == 1, "不得累积幽灵 attached 会话")
+        #expect(sessions.first?["sessionId"] == first["sessionId"], "任务记录的 sessionId 必须仍可解析")
+    }
+
     @Test @MainActor func attachBindsOnlyTheConfirmedWindowWithoutLaunchOrProfile() throws {
         let fixture = AttachFixture()
         let manager = fixture.manager()

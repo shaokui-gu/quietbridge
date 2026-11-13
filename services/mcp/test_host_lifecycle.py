@@ -60,6 +60,22 @@ class HostLifecycleTests(unittest.TestCase):
         self.register(now=1011)
         self.assertEqual(lifecycle.stop_reason(self.task, self.config), 'host_final_stop_cancelled')
 
+    def test_panel_stop_revokes_browser_assignment_and_preserves_first_stop_cause(self):
+        import browser_events
+        self.register(now=time.time())
+        with lifecycle.store(self.config) as data:
+            turn = next(iter(data['turns'].values()))
+            turn.update(stoppedAt=time.time(), updatedAt=time.time(), reason='user_stopped_in_quietbridge')
+            first_stop = turn['stoppedAt']
+        # A native panel stop invalidates queued extension work even before the
+        # worker's next timer tick; it does not fabricate a browser heartbeat.
+        self.assertEqual(browser_events.active_task(self.config / 'task-windows.json'), (None, None))
+        self.stop(now=time.time() + 1)
+        binding = lifecycle.read(self.config / 'host-lifecycle/state.json', {})['turns']
+        turn = next(iter(binding.values()))
+        self.assertEqual(turn['stoppedAt'], first_stop)
+        self.assertEqual(turn['reason'], 'user_stopped_in_quietbridge')
+
     def test_later_turn_and_new_task_are_not_poisoned_by_old_stop(self):
         self.register(); self.stop()
         fresh = dict(self.task, taskId=str(uuid.uuid4()))
@@ -168,7 +184,10 @@ class HostLifecycleTests(unittest.TestCase):
     def test_idle_connector_releases_session_after_interface_phase_has_ended(self):
         self.check_idle_hook(phase_ended=True)
 
-    def check_idle_hook(self, phase_ended=False):
+    def test_panel_stop_releases_while_transport_stays_open_without_extension(self):
+        self.check_idle_hook(panel_stopped=True)
+
+    def check_idle_hook(self, phase_ended=False, panel_stopped=False):
         runner = '''import json,sys,time
 from pathlib import Path
 import server
@@ -203,16 +222,26 @@ server.TASK_OWNER.close()
             self.task = json.loads(process.stdout.readline())
             if not phase_ended:
                 self.register(now=time.time())
-            self.stop(now=time.time())
+            if panel_stopped:
+                from lifecycle_store import store
+                with store(self.config) as data:
+                    turn = next(iter(data['turns'].values()))
+                    turn.update(stoppedAt=time.time(), updatedAt=time.time(), reason='user_stopped_in_quietbridge')
+            else:
+                self.stop(now=time.time())
             until = time.monotonic() + 2
-            while not (self.config / 'released').exists() and time.monotonic() < until:
+            while time.monotonic() < until:
+                record = json.loads((self.config / 'task-windows.json').read_text())['tasks'][self.task['taskId']]
+                if (self.config / 'released').exists() and record['state'] == ('ended' if phase_ended else 'interrupted'):
+                    break
                 time.sleep(0.02)
             self.assertTrue((self.config / 'released').exists())
             self.assertIsNone(process.poll(), 'transport must remain open')
             record = json.loads((self.config / 'task-windows.json').read_text())['tasks'][self.task['taskId']]
             self.assertEqual(record['state'], 'ended' if phase_ended else 'interrupted')
             if not phase_ended:
-                self.assertEqual(record['interruptionReason'], 'host_final_stop_cancelled')
+                self.assertEqual(record['interruptionReason'],
+                                 'user_stopped_in_quietbridge' if panel_stopped else 'host_final_stop_cancelled')
         finally:
             process.stdin.close()
             try: process.wait(timeout=3)

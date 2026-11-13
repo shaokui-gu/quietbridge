@@ -173,6 +173,13 @@ enum BrowserSessionPaths {
             try dependencies.verify(identity)
             try cancellation.check()
             try NativePlatform.requireUnlocked(sessionState())
+            // 同一进程代际 + 同一窗口重复绑定必须复用原会话：任务记录里的
+            // sessionId 要始终能在 list 里解析到，否则 status 会判定目标失效。
+            if let existing = sessions.first(where: {
+                $0.state == "attached" && $0.windowID == windowID && $0.identity == Optional(identity)
+            }) {
+                return try render(existing, cancellation: cancellation)
+            }
             let session = Session()
             session.identity = identity
             session.windowID = windowID
@@ -180,8 +187,7 @@ enum BrowserSessionPaths {
             session.authorization = authorization
             session.state = "attached"
             let result = try render(session, cancellation: cancellation)
-            // 同一窗口重复绑定必须替换旧记录，否则每次 task bind 都会留下一个
-            // 永不释放的 attached 会话，长任务里会累积成 TASK_IN_USE。
+            // 进程代际变化（Chrome 重建窗口）时替换旧记录，避免泄漏。
             sessions.removeAll { $0.state == "attached" && $0.identity?.pid == pid && $0.windowID == windowID }
             sessions.append(session)
             return result

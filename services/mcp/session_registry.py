@@ -8,10 +8,32 @@ import stat
 import time
 
 from browser_events import event_store, lease_live, read_file
-from lifecycle_store import checked
+from lifecycle_store import checked, host_binding
 
 LIMIT = 3
 KEY = re.compile(r'[a-f0-9]{64}')
+
+
+class TargetInUse(ValueError):
+    """Expose only the proven lease owner, never infer identity from a title."""
+    def __init__(self, slot, scope):
+        path = Path(slot['taskFile'])
+        task = read_file(path, {}).get('tasks', {}).get(slot['taskId'], {})
+        config = path.parent.parent.parent if path.parent.parent.name == 'sessions' else path.parent
+        try:
+            binding = host_binding(task, config) or {}
+        except (OSError, ValueError, TypeError):
+            binding = {}  # Missing attribution never removes the target conflict.
+        target = slot.get('target') or {}
+        self.conflict = dict(taskId=slot['taskId'], scope=scope,
+                             **{k: target.get(k) for k in ('pid', 'windowId', 'interactionMode')})
+        if binding.get('sessionId'):
+            self.conflict['hostSessionId'] = binding['sessionId']
+        owner = '，WorkBuddy 会话 ' + binding['sessionId'] if binding.get('sessionId') else ''
+        super().__init__('TARGET_IN_USE: 目标由任务 %s 持有（窗口 %s%s）。'
+                         '请在 QuietBridge“任务与窗口”中按会话核对并由用户停止；'
+                         '停止本地 HTTP 服务或其他会话不会释放此目标，不能自动接管。' %
+                         (slot['taskId'], target.get('windowId'), owner))
 
 
 def session_key(session):
@@ -44,6 +66,8 @@ def live_slots(data):
             task = store.get('tasks', {}).get(slot.get('taskId'))
             if task is None and time.time() - slot.get('reservedAt', 0) < 5:
                 task = slot.get('reservation')
+            elif store.get('activeTaskId') != slot.get('taskId'):
+                continue
             if task and task.get('state') not in ('ended', 'interrupted', 'invalidated') and lease_live(task, path.parent):
                 result[key] = slot
         except (OSError, ValueError, KeyError, TypeError):
@@ -88,7 +112,7 @@ def claim_target(config, key, record, task_file):
             same_native_app = target.get('pid') == record.get('pid') and (
                 target.get('interactionMode') == 'desktop' or record.get('interactionMode') == 'desktop')
             if same_window or same_native_app:
-                raise ValueError('TARGET_IN_USE: 目标窗口或应用已由另一个会话操作；请选择独立目标')
+                raise TargetInUse(slot, 'application_process' if same_native_app else 'window')
         if key not in slots and len(slots) >= LIMIT:
             raise ValueError('SESSION_CAPACITY_FULL: 最多同时运行 3 个会话')
         slots[key] = {'taskFile': str(task_file), 'taskId': record['taskId'],

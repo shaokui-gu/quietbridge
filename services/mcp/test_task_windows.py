@@ -43,6 +43,7 @@ class TaskWindowTests(unittest.TestCase):
                         mock.patch.object(server, "TASK_BINDINGS", {}),
                         mock.patch.object(server, "TASK_DISPATCH", None),
                         mock.patch.object(server, "SHARE_SELECTION", None),
+                        mock.patch.object(server, "IDLE_RESUME", None),
                         mock.patch.object(server, "POWER_GUARD", {"active": False, "nextRenewAt": 0.0}),
                         mock.patch.object(server, "SESSION_PROTECTION", server.ProtectionSession()),
                         mock.patch.object(server, "STATE", self.state),
@@ -796,7 +797,7 @@ class TaskWindowTests(unittest.TestCase):
         source = tool["inputSchema"]["properties"]["source"]
         self.assertNotIn('default', source)
         self.assertIn('连续视频', tool['description'])
-        self.assertIn('绘制脉冲', tool['description'])
+        self.assertIn('不在动作或导航后自动截图', tool['description'])
         self.assertEqual(set(source["enum"]), {"application", "desktop", "window"})
         self.assertIn("跨应用", tool["description"])
 

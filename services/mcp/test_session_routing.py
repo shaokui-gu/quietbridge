@@ -9,8 +9,8 @@ from unittest import mock
 
 from adapters.workbuddy.lifecycle import handle_hook
 from lifecycle_store import store
-from session_routing import issue, consume, SessionRouter
-from session_registry import reserve, claim_target, release, session_key, session_directory, registry
+from session_routing import issue, consume, SessionRouter, failure
+from session_registry import reserve, claim_target, release, session_key, session_directory, registry, TargetInUse
 from task_lifecycle import TaskOwner
 
 
@@ -39,9 +39,21 @@ class RoutingTests(unittest.TestCase):
             result = server.handle({'id': 1, 'method': 'tools/call',
                 'params': {'name': 'quietbridge_click', 'arguments': {'index': 1}}})['result']
             self.assertEqual(result['structuredContent']['errorCode'], 'SESSION_ROUTING_REQUIRED')
+            self.assertEqual(result['structuredContent']['suggestedNext'], 'ask_user_choice')
+            self.assertEqual(result['structuredContent']['recovery']['userDecision']['presentation'], 'agent_dialog')
             tools = server.handle({'id': 2, 'method': 'tools/list'})['result']['tools']
             self.assertTrue(all('_quietbridgeRoute' in t['inputSchema']['properties'] for t in tools))
             self.assertNotIn('_quietbridgeRoute', server.TOOL_MAP['quietbridge_click']['inputSchema']['properties'])
+
+    def test_router_stop_and_unknown_result_use_the_same_recovery_contract(self):
+        stopped = failure('TASK_CANCELLED: host stopped')['structuredContent']
+        self.assertTrue(stopped['recovery']['taskMustEnd'])
+        self.assertNotIn('userDecision', stopped['recovery'])
+        unknown = failure('SESSION_TIMEOUT: missing result', 'unknown')['structuredContent']
+        self.assertEqual(unknown['execution']['status'], 'unknown')
+        self.assertTrue(unknown['recovery']['executionUncertain'])
+        self.assertFalse(unknown['recovery']['replaySideEffects'])
+        self.assertEqual(unknown['recovery']['onExhausted'], 'ask_user_choice')
 
     def test_alteration_expiry_and_wrong_tool_fail_before_dispatch(self):
         for mutate in ('arguments', 'tool', 'time'):
@@ -82,7 +94,10 @@ for line in sys.stdin:
         replies = {s: call(s, value=s) for s in ('a', 'b', 'c')}
         self.assertEqual(len({r['pid'] for r in replies.values()}), 3)
         self.assertEqual(call('d')['structuredContent']['errorCode'], 'SESSION_CAPACITY_FULL')
-        self.assertEqual(call('a', crash=True)['structuredContent']['errorCode'], 'SESSION_WORKER_EXITED')
+        crashed = call('a', crash=True)['structuredContent']
+        self.assertEqual(crashed['errorCode'], 'SESSION_WORKER_EXITED')
+        self.assertEqual(crashed['execution']['status'], 'unknown')
+        self.assertFalse(crashed['recovery']['taskMustEnd'])
         for s in ('b', 'c'):
             self.assertEqual(call(s, value='still-alive')['pid'], replies[s]['pid'])
         handle_hook({'hook_event_name': 'FinalStop', 'session_id': 'a'}, self.config, 'turn-1')
@@ -119,6 +134,54 @@ class RegistryTests(unittest.TestCase):
         with registry(self.config) as live:
             self.assertEqual(set(live), {slots[1][0], slots[2][0]})
         self.slot('d')
+
+    def test_conflict_identifies_exact_owner_without_titles_or_other_session_data(self):
+        key, path, record = self.slot('collector')
+        key_b, path_b, record_b = self.slot('test')
+        claim_target(self.config, key, dict(record, pid=10, windowId=274431, interactionMode='background_browser'), path)
+        with store(self.config) as data:
+            data['turns']['collector-run'] = {'sessionId': 'collector', 'requestId': 'run-a',
+                'tasks': {record['taskId']: record['lease']['ownerId']}, 'updatedAt': time.time(),
+                'private': 'must not be exposed'}
+        with self.assertRaises(TargetInUse) as caught:
+            claim_target(self.config, key_b, dict(record_b, pid=10, windowId=274431,
+                                                 interactionMode='background_browser'), path_b)
+        conflict = caught.exception.conflict
+        self.assertEqual(conflict, {'taskId': record['taskId'], 'scope': 'window', 'pid': 10,
+            'windowId': 274431, 'interactionMode': 'background_browser', 'hostSessionId': 'collector'})
+        self.assertIn('collector', str(caught.exception))
+        self.assertNotIn('must not be exposed', str(caught.exception))
+        # Chrome windows in the same process remain independent.
+        claim_target(self.config, key_b, dict(record_b, pid=10, windowId=275157,
+                                             interactionMode='background_browser'), path_b)
+        with self.assertRaises(TargetInUse) as caught:
+            claim_target(self.config, key_b, dict(record_b, pid=10, windowId=275157,
+                                                 interactionMode='desktop'), path_b)
+        self.assertEqual(caught.exception.conflict['scope'], 'application_process')
+
+    def test_historical_slot_cannot_keep_a_window_occupied(self):
+        key, path, record = self.slot('collector')
+        claim_target(self.config, key, dict(record, pid=10, windowId=274431, interactionMode='background_browser'), path)
+        data = json.loads(path.read_text())
+        data['activeTaskId'] = None
+        path.write_text(json.dumps(data))
+        with registry(self.config) as live:
+            self.assertNotIn(key, live)
+
+    def test_panel_stop_blocks_same_run_reacquisition_without_stopping_other_sessions(self):
+        key, path, record = self.slot('collector')
+        key_b, path_b, record_b = self.slot('test')
+        with store(self.config) as data:
+            data['turns']['collector-run'] = {'sessionId': 'collector', 'requestId': 'run-a',
+                'tasks': {record['taskId']: record['lease']['ownerId']},
+                'stoppedAt': time.time(), 'updatedAt': time.time(), 'reason': 'user_stopped_in_quietbridge'}
+        token = issue(self.config, 'quietbridge_task', {'action': 'begin'}, 'collector', 'run-a')
+        with self.assertRaisesRegex(ValueError, 'TASK_CANCELLED'):
+            consume(self.config, 'quietbridge_task', token)
+        token = issue(self.config, 'quietbridge_task', {'action': 'begin'}, 'test', 'run-a')
+        self.assertEqual(consume(self.config, 'quietbridge_task', token)[1]['sessionId'], 'test')
+        token = issue(self.config, 'quietbridge_task', {'action': 'begin'}, 'collector', 'new-user-turn')
+        self.assertEqual(consume(self.config, 'quietbridge_task', token)[1]['requestId'], 'new-user-turn')
 
 
 if __name__ == '__main__':

@@ -60,7 +60,6 @@ function noteLifecycleError(error) {
 let commandReport = null;
 let panelReport = null;
 let panelBridge = false;
-const navigationPulseDocuments = new Set();
 let applicationSession = null;
 let lastCommandId = null;
 let keepAlivePort = null;
@@ -136,6 +135,7 @@ async function runCommand(command, state) {
   } catch (error) {
     commandReport = { requestId: command.requestId, status: 'error',
       error: String(error?.message || '命令执行失败').slice(0, 200) };
+    if (error?.debuggerFailure) commandReport.debuggerFailure = error.debuggerFailure;
     connection = { ...connection, backgroundStatus: 'waiting', lastActionError: commandReport.error };
     await recordActivity(state, command.operation, 'failed').catch(() => {});
   }
@@ -247,7 +247,6 @@ async function stop(s) {
 }
 async function clearObservation(keepTask = false) {
   const s = await read();
-  navigationPulseDocuments.clear();
   assignmentTitle = null;
   observerStatus = null;
   await save(null);
@@ -328,16 +327,6 @@ async function navigation(type, d) {
   if (next.paused) await stop(old).catch(noteLifecycleError);
   await publish(next);
   if (['committed', 'dom', 'completed', 'history'].includes(type)) await inject(next);
-  if (['dom', 'completed'].includes(type)) await pulseNavigationDocument();
-}
-async function pulseNavigationDocument() {
-  const s = await read();
-  if (!s?.documentId || s.pending) return false;
-  const key = `${s.taskId}:${s.documentId}:${s.navigationEpoch}`;
-  if (navigationPulseDocuments.has(key)) return true;
-  if (!await background.pulse(s)) return false;
-  navigationPulseDocuments.add(key);
-  return true;
 }
 async function reconcileObservation() {
   const s = await read();
@@ -364,7 +353,6 @@ async function reconcileObservation() {
     await publish({ ...s, sequence: s.sequence + 1 });
   }
   await inject(await read());
-  await pulseNavigationDocument();
 }
 async function acceptAssignment(a) {
   if (!a || typeof a.taskId !== 'string' || !/^[0-9a-f]{64}$/.test(a.token) ||
@@ -495,8 +483,20 @@ async function windowEvidence() {
         /[\u0000-\u001f]/u.test(tab.title)) return null;
     const current = await read();
     if (current?.bindingId !== s.bindingId || current?.paused) return null;
-    return { bindingId: s.bindingId, browserWindowId: s.browserWindowId,
+    const evidence = { bindingId: s.bindingId, browserWindowId: s.browserWindowId,
       tabId: tab.id, title: tab.title.slice(0, 200) };
+    // Geometry is already available as metadata; it disambiguates equal page
+    // titles without navigating, retitling, moving or activating any window.
+    if (chrome.windows?.get) {
+      try {
+        const win = await background.lifecycle('window_evidence', () => chrome.windows.get(s.browserWindowId));
+        const bounds = { x: win.left, y: win.top, width: win.width, height: win.height };
+        if (win.id === s.browserWindowId && Object.values(bounds).every(Number.isFinite) &&
+            bounds.width > 0 && bounds.height > 0) evidence.bounds = bounds;
+      } catch {} // Title evidence remains usable when geometry is unavailable.
+    }
+    const final = await read();
+    return final?.bindingId === s.bindingId && !final.paused ? evidence : null;
   } catch (error) { noteLifecycleError(error); return null; }
 }
 
@@ -513,7 +513,7 @@ async function sync() {
       return { permission, on, revision: enableRevision };
     });
     keepAlive(on && permission);
-    const payload = { action: 'sync', enabled: on, permission, applicationSession, clientVersion: '0.4.11', capabilities: ['cdp_input', 'document_binding', 'background_popups', 'paged_read', 'render_probe'],
+    const payload = { action: 'sync', enabled: on, permission, applicationSession, clientVersion: '0.4.14', capabilities: ['cdp_input', 'document_binding', 'background_popups', 'paged_read', 'render_probe'],
       windowEvidence: on && permission ? await windowEvidence() : null,
       observerStatus, lifecycleError };
     if (panelBridge) {

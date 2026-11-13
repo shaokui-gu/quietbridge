@@ -124,8 +124,10 @@ def handle_hook(payload, config, request_id=None, now=None):
                 turn['lastActivityAt'] = now
         else:
             reason = str(payload.get('final_stop_reason', 'completed'))
-            turn.update(stoppedAt=now, reason='host_final_stop_' + (
-                reason if reason in ('completed', 'cancelled', 'interrupted', 'error') else 'ended'))
+            # A later completion hook cannot erase an earlier user revocation.
+            if turn.get('stoppedAt') is None:
+                turn.update(stoppedAt=now, reason='host_final_stop_' + (
+                    reason if reason in ('completed', 'cancelled', 'interrupted', 'error') else 'ended'))
 
 
 def main():

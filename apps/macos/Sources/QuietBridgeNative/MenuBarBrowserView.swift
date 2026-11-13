@@ -19,12 +19,16 @@ enum MenuBarExtensionSetup {
 }
 
 @MainActor final class MenuBarBrowserView: MenuBarCard {
-    private let heading = MenuBarPanelView.label("浏览器任务", size: 17, weight: .semibold)
+    private let heading = MenuBarPanelView.label("任务与窗口", size: 17, weight: .semibold)
     private let status = MenuBarPanelView.label("正在连接", size: 11, color: MenuBarTheme.secondary)
     private let tabs = NSSegmentedControl(labels: ["概览", "活动", "下载", "截图批注"], trackingMode: .selectOne, target: nil, action: nil)
     private let sessions = NSPopUpButton(frame: .zero, pullsDown: false)
     private var sessionChoices: [MenuBarBrowserStore.Session] = []
     private var selectedChannel: String?
+    private var selectedSession: MenuBarBrowserStore.Session? {
+        sessionChoices.first(where: { $0.channel == selectedChannel })
+    }
+    private var stopSubmitted = false
     let setupButton = NSButton(title: "安装扩展…", target: nil, action: nil)
     private let backButton = NSButton(title: "‹", target: nil, action: nil)
     private let setupDescription = MenuBarPanelView.label("按下方步骤在 Chrome 中完成安装与授权。", size: 11, color: MenuBarTheme.secondary)
@@ -60,7 +64,7 @@ enum MenuBarExtensionSetup {
         setupDescription.isHidden = true; addSubview(setupDescription)
         sessions.frame = NSRect(x: 24, y: 80, width: 352, height: 28)
         sessions.target = self; sessions.action = #selector(changeSession)
-        sessions.setAccessibilityLabel("选择浏览器会话")
+        sessions.setAccessibilityLabel("选择窗口占用会话")
         sessions.toolTip = "只改变控制面板显示；不改变 Agent 或预览的任务归属"
         addSubview(sessions)
         tabs.frame = NSRect(x: 24, y: 116, width: 352, height: 28)
@@ -78,12 +82,17 @@ enum MenuBarExtensionSetup {
     @objc private func goBack() { back?() }
     @objc private func changeTab() { lastSignature = ""; refresh() }
     @objc private func changeSession() {
-        selectedChannel = sessions.selectedItem?.representedObject as? String
-        state = [:]; lastSignature = ""; refresh()
+        selectSession(sessions.selectedItem?.representedObject as? String)
+        refresh()
+    }
+    func selectSession(_ channel: String?) {
+        selectedChannel = channel
+        stopSubmitted = false
+        state = [:]; lastSignature = ""
     }
     @objc private func toggleSetup() {
         showingSetup.toggle()
-        heading.stringValue = showingSetup ? "浏览器扩展" : "浏览器任务"
+        heading.stringValue = showingSetup ? "浏览器扩展" : "任务与窗口"
         setupButton.title = showingSetup ? "返回任务" : "安装扩展…"
         setupButton.frame = showingSetup ? NSRect(x: 288, y: 20, width: 88, height: 28)
                                         : NSRect(x: 270, y: 47, width: 106, height: 26)
@@ -96,9 +105,9 @@ enum MenuBarExtensionSetup {
         render()
     }
 
-    func refresh() {
+    func refresh(snapshot supplied: MenuBarBrowserStore.Snapshot? = nil) {
         do {
-            let snapshot = try MenuBarBrowserStore.snapshot()
+            let snapshot = try supplied ?? MenuBarBrowserStore.snapshot()
             sessionChoices = snapshot.sessions
             if !sessionChoices.contains(where: { $0.channel == selectedChannel }) { selectedChannel = nil }
             sessions.removeAllItems()
@@ -109,14 +118,28 @@ enum MenuBarExtensionSetup {
             }
             sessions.selectItem(at: sessionChoices.firstIndex(where: { $0.channel == selectedChannel }).map { $0 + 1 } ?? 0)
             sessions.isEnabled = !sessionChoices.isEmpty
-            let next = sessionChoices.first(where: { $0.channel == selectedChannel })?.peer ?? snapshot.rootPeer
+            let next = selectedSession?.peer ?? snapshot.rootPeer
             let now = Date().timeIntervalSince1970
             let heartbeatLimit: TimeInterval = next["enabled"] as? Bool == true ? 15 : 75
             let connected = (next["lastSeen"] as? TimeInterval).map { now - $0 < heartbeatLimit } ?? false
             peer = next
             state = connected && selectedChannel != nil ? (next["panelState"] as? [String: Any] ?? [:]) : [:]
+            if let selected = selectedSession {
+                if (state["taskSummary"] as? [String: Any])?["taskId"] as? String != selected.taskId { state = [:] }
+                var summary = state["taskSummary"] as? [String: Any] ?? [:]
+                summary["taskId"] = selected.taskId
+                summary["canStop"] = selected.canStop
+                summary["windowId"] = selected.windowId
+                summary["hostSessionId"] = selected.hostSessionId
+                summary["stopping"] = selected.stopping
+                state["taskSummary"] = summary
+            }
             status.stringValue = !connected ? "扩展未连接" : next["permission"] as? Bool != true ? "等待站点授权" : next["enabled"] as? Bool != true ? "观察已停用" : next["panelState"] == nil ? "等待任务状态，请确认原生宿主已更新" : "扩展已连接"
-            if let result = next["panelResult"] as? [String: Any], result["status"] as? String == "error" {
+            if selectedSession?.stopping == true {
+                message.stringValue = "已撤销本轮控制，正在停止并释放窗口…"
+            } else if stopSubmitted {
+                message.stringValue = "停止请求已提交，请确认对应共享已关闭。"
+            } else if let result = next["panelResult"] as? [String: Any], result["status"] as? String == "error" {
                 message.stringValue = result["error"] as? String ?? "操作失败"
             } else if next["panelCommand"] is [String: Any] { message.stringValue = "正在处理，请稍候…" }
             else { message.stringValue = "" }
@@ -152,13 +175,18 @@ enum MenuBarExtensionSetup {
         let summary = state["taskSummary"] as? [String: Any]
         switch tabs.selectedSegment {
         case 0:
-            addLabel("当前任务", y: 4, size: 13)
+            addLabel("当前窗口占用", y: 4, size: 13)
             addLabel(summary?["url"] as? String ?? "暂无任务页面", y: 36, size: 14, height: 42)
-            addLabel(taskId.map { "任务 ID：\($0)" } ?? "等待原生端分配浏览器任务", y: 84, color: MenuBarTheme.secondary, height: 38)
+            let target = (summary?["windowId"] as? Int).map { "窗口：\($0)" } ?? "等待绑定窗口"
+            let host = (summary?["hostSessionId"] as? String).map { "WorkBuddy 会话：\($0)" } ?? "宿主归属待确认"
+            addLabel("\(target)\n\(host)", y: 84, size: 11, color: MenuBarTheme.secondary, height: 48)
+            addLabel(taskId.map { "任务 ID：\($0)" } ?? "请先选择要查看的会话", y: 138, size: 11, color: MenuBarTheme.secondary, height: 38)
             if summary?["canStop"] as? Bool == true {
-                button("停止浏览器控制", y: 138, action: #selector(stopTask))
-                addLabel("已发出的操作可能已经执行；恢复需要重新分配目标。", y: 180, size: 11, color: MenuBarTheme.secondary, height: 36)
+                button("停止此会话控制", y: 190, action: #selector(stopTask), width: 180)
+                addLabel("停止此会话本轮的界面操作并释放窗口。已发出的操作可能已执行；定时计划需在 WorkBuddy 单独暂停。",
+                         y: 230, size: 11, color: MenuBarTheme.secondary, height: 60)
             }
+            height = max(height, 304)
         case 1:
             let items = state["activity"] as? [[String: Any]] ?? []
             if items.isEmpty { addLabel("暂无活动记录", y: 12, color: MenuBarTheme.secondary) }
@@ -266,7 +294,14 @@ enum MenuBarExtensionSetup {
         do { try MenuBarBrowserStore.submit(operation, channel: selectedChannel, taskId: taskId, arguments: arguments); message.stringValue = "正在处理，请稍候…" }
         catch { message.stringValue = error.localizedDescription }
     }
-    @objc private func stopTask() { submit("stop_task") }
+    @objc private func stopTask() {
+        guard let selectedSession else { message.stringValue = "请先选择要停止的会话"; return }
+        do {
+            try MenuBarBrowserStore.stop(selectedSession)
+            stopSubmitted = true
+            refresh()
+        } catch { message.stringValue = error.localizedDescription }
+    }
     @objc private func clearActivity() { submit("clear_activity") }
     @objc private func capture() { submit("capture_review") }
     @objc private func addAnnotation() {

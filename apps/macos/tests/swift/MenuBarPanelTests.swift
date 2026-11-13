@@ -196,6 +196,37 @@ import Testing
         #expect(browser.setupButton.title == "安装扩展…")
     }
 
+    @Test func offlineWindowHolderStillShowsExactIdentityAndStopControl() throws {
+        _ = NSApplication.shared
+        let browser = MenuBarBrowserView(frame: NSRect(x: 0, y: 0, width: 400, height: 540))
+        let window = NSPanel(contentRect: browser.bounds, styleMask: [.borderless, .nonactivatingPanel],
+                             backing: .buffered, defer: false)
+        window.contentView = browser; window.isReleasedWhenClosed = false
+        defer { window.close() }
+        let channel = String(repeating: "a", count: 64)
+        let taskId = "3fd9934a-30bc-4cf4-a205-0dddde898499"
+        let hostId = "21a8cc19-38cf-43aa-b659-3d0d8d44f057"
+        let session = MenuBarBrowserStore.Session(channel: channel, taskId: taskId, peer: [:],
+            task: ["windowId": 274431, "lease": ["ownerId": UUID().uuidString]],
+            host: ["sessionId": hostId, "requestId": "turn-a"])
+        browser.selectSession(channel)
+        browser.refresh(snapshot: .init(rootPeer: [:], sessions: [session]))
+        func descendants(_ view: NSView) -> [NSView] { view.subviews.flatMap { [$0] + descendants($0) } }
+        let controls = descendants(browser)
+        let labels = controls.compactMap { $0 as? NSTextField }.map(\.stringValue)
+        #expect(labels.contains { $0.contains(hostId) && $0.contains("274431") })
+        #expect(labels.contains { $0.contains(taskId) })
+        #expect(controls.compactMap { $0 as? NSButton }.contains { $0.title == "停止此会话控制" })
+        for (name, appearance) in [("light", NSAppearance.Name.aqua), ("dark", .darkAqua)] {
+            window.appearance = NSAppearance(named: appearance)
+            try saveSnapshot(browser, name: "window-owner-" + name)
+        }
+        let stopping = MenuBarBrowserStore.Session(channel: channel, taskId: taskId, peer: [:],
+            task: session.task, host: session.host.merging(["stoppedAt": Date().timeIntervalSince1970]) { _, value in value })
+        browser.refresh(snapshot: .init(rootPeer: [:], sessions: [stopping]))
+        #expect(!descendants(browser).compactMap { $0 as? NSButton }.contains { $0.title == "停止此会话控制" })
+    }
+
     @Test func hoverFeedbackWorksWithoutKeyboardFocus() throws {
         let target = PanelActionTarget()
         let view = makeView(target)
