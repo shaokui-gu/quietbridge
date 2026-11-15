@@ -131,6 +131,12 @@ store 未清理旧墓碑。新进程的 `turn/start` 命中 `_tombstone()`，被
   迁移来源，首次部署时复制任务状态到 QuietBridge 根（不覆盖已有文件）；
 - DSH bundle `configDir` 保持 QuietBridge 根，与原生宿主、任务状态共用同一目录。
 
+Workbuddy 与 DSH 共用这一扩展/宿主，所以统一也覆盖 Workbuddy：其 `.workbuddy/mcp.json`
+的 `quietbridge` 连接器 env 为空时会按新布局默认读 QuietBridge 运行态；旧
+`WorkbuddyExtension` 仅迁移、不再注册。本机仍存有历史遗留 hooks 指向
+`workbuddy-cua/connector/host_lifecycle.py --config-dir .../WorkbuddyExtension/cua-helper-config`，
+它们不再影响新宿主，但会继续写旧目录；Workbuddy 浏览器验收前建议清理这些旧 hooks。
+
 连接器级实测（使用 115 release bridge + 真实扩展，仅把 configDir 指向统一状态目录）：
 `browserChannel=True`、`clientVersion=0.4.14`、`globalPermission=true`，candidates 返回
 6 个真实 Chrome 标签（URL 可见），`browser_session list` 正常。完整页面操作
