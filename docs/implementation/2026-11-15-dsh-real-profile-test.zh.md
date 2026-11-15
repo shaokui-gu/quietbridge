@@ -104,7 +104,10 @@ store 未清理旧墓碑。新进程的 `turn/start` 命中 `_tombstone()`，被
 - 在真实宿主上重放清理后，`quietbridge_permissions`、`quietbridge_apps` 立即恢复；
 - 同一轮内再次 `begin→bind→share→end→begin→end` 两阶段全部成功，lifecycle store 的
   turn 中自动写入两个新 taskId 回执（已修复 JS+adapter，非手工回放），第二次 end
-  `captureStop.stopConfirmed=true`。
+  `captureStop.stopConfirmed=true`；
+- 115 包安装并再次重启后**无需任何手工修复**：`agent-created` 自动清理旧墓碑，
+  lifecycle store 中新 turn 直接为存活状态（`stoppedAt=null`、`sessionEnded=false`），
+  `permissions`/`apps` 与两阶段任务再次全部通过，回执自动落盘。
 
 ## 4. 浏览器通道（未验收）
 
