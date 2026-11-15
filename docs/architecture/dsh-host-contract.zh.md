@@ -427,6 +427,14 @@ agent.ctx.on('session/event', (session, event) => {
 `SESSION_ROUTING_REQUIRED` 拒绝）。bundle 必须用 `JSON.parse` 归一化后再上报；
 lifecycle CLI 同时接受字符串与对象两种形态作为防御。
 
+**宿主重启与墓碑（实机回归）**：DSH 重启（或 profile reload）会用**同一 session/agent
+id** 恢复会话，而 lifecycle store 里仍留着上一进程 `agent/disposed` 写下的
+`sessionEnded` 墓碑。若不处理，新进程的首个 `turn/start` 会被旧墓碑标记为已停止，
+该轮的工具调用全部 `TASK_CANCELLED`（本次由 114 升级重启实际触发）。修复约定：
+`agent/created` 证明该 session/agent 属于**新的宿主进程**，lifecycle 应删除该对的
+session-wide 墓碑并清除各 turn 的 `sessionEnded`；保留已停止 turn 的 `stoppedAt`，
+首个 `turn/start` 照常建立新 run 的存活轮次。`agent/created` 本身仍不授予 turn。
+
 ### 2.6 `ctx.tools.register` 原始 definition 的要求
 
 **硬要求（注册期强校验，违反直接 throw）**——`dsh-tools/lib/index.js` `register()`

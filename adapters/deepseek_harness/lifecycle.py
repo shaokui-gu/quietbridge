@@ -208,6 +208,40 @@ def _tool_result(payload, config, session, agent, now):
             current['lastActivityAt'] = now
 
 
+def _agent_created(config, session, agent, now):
+    """Retire the previous Host run's end state for a resumed session.
+
+    DSH restarts and profile reloads resume the same session/agent id in a new
+    Host process. The old process's ``agent-disposed`` tombstone must not mark
+    the resumed Agent as already ended: Agent creation precedes every turn of
+    the new run, so any end marker for this exact pair belongs to an earlier
+    run and is stale. The first turn of the new run then establishes presence.
+    """
+    state = read(Path(config) / 'host-lifecycle/state.json', {})
+    turns = state.get('turns') if isinstance(state, dict) else None
+    if not isinstance(turns, dict):
+        return
+
+    def matches(turn):
+        return turn.get('sessionId') == session and turn.get('agentId') == agent
+
+    stale = [turn for turn in turns.values() if matches(turn) and
+             (turn.get('requestId') is None or turn.get('sessionEnded'))]
+    if not stale:
+        return
+    with store(config, now) as data:
+        current = data['turns']
+        for key, turn in list(current.items()):
+            if not matches(turn):
+                continue
+            if turn.get('requestId') is None:
+                del current[key]
+                continue
+            if turn.get('sessionEnded'):
+                turn['sessionEnded'] = False
+                turn['updatedAt'] = now
+
+
 def handle_event(payload, config, now=None):
     """Apply one host lifecycle event; unknown or malformed hints are ignored."""
     if not isinstance(payload, dict):
@@ -227,8 +261,9 @@ def handle_event(payload, config, now=None):
         if _valid(turn):
             _end(config, session, agent, turn, payload.get('reason'), now)
     elif event == 'agent-created':
-        # Presence alone grants nothing; the first turn establishes the run.
-        return
+        # Creation does not grant a turn, but it does prove the pair belongs to
+        # a new Host run; stale end markers from the previous run are retired.
+        _agent_created(config, session, agent, now)
     elif event == 'agent-disposed':
         _dispose(config, session, agent, now)
     elif event == 'tool-result':

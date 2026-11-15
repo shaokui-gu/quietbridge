@@ -82,6 +82,30 @@ task receipt 证明“新阶段仍属于同一宿主轮次”。而真实 DSH se
 `retained: false` 变为 `retained: true, scope: host_run`，第二次 end 返回
 `captureStop.stopConfirmed=true`。证明修复不依赖重启，也能在既有宿主上即时生效。
 
+### 3.1 宿主重启后会话被旧墓碑误判（114 安装重启后实测）
+
+**症状**：安装 114 并重启 DSH 后，同一会话（`session-768f…`）恢复成功、连接器也已启动，
+但所有 QuietBridge 工具立即返回
+`TASK_CANCELLED: 宿主会话或 Agent 已结束`。
+
+**根因**：DSH 关闭时 bundle 为每个 Agent 写入 `agent-disposed` 墓碑（`sessionEnded=true`，
+session-wide `requestId=null`）；重启后 DSH 用**同一 session id** 恢复会话，lifecycle
+store 未清理旧墓碑。新进程的 `turn/start` 命中 `_tombstone()`，被标记为已停止
+（`stoppedAt` 甚至早于该 turn 的 `startedAt`），于是该轮全部调用被路由拒绝。
+
+**修复**：lifecycle 的 `agent-created` 不再只是忽略——它证明该 session/agent 已属于
+**新的宿主进程**，因此删除该对的 session-wide 墓碑并清除历史 turn 的 `sessionEnded`
+（保留已经停止 turn 的 `stoppedAt`）；首个 `turn/start` 随后正常建立新 run 的存活轮次。
+`agent/created` 仍不授予 turn，创建本身不能调用工具。
+
+**验证**：
+
+- Python adapter 新增“dispose → agent-created → 新 turn 存活”回归测试；
+- 在真实宿主上重放清理后，`quietbridge_permissions`、`quietbridge_apps` 立即恢复；
+- 同一轮内再次 `begin→bind→share→end→begin→end` 两阶段全部成功，lifecycle store 的
+  turn 中自动写入两个新 taskId 回执（已修复 JS+adapter，非手工回放），第二次 end
+  `captureStop.stopConfirmed=true`。
+
 ## 4. 浏览器通道（未验收）
 
 `quietbridge_permissions.browserChannel=False`；`quietbridge_browser_events` 的
@@ -96,12 +120,12 @@ status/candidates 返回 `nativeConnection: host_unavailable`、
 
 | 检查 | 结果 |
 | --- | --- |
-| MCP 全量 | 493 项通过（新增 2 项回执形态测试） |
+| MCP 全量 | 494 项通过（新增 3 项：回执参数形态 ×2、重启墓碑 ×1） |
 | DSH bundle Node | 44 项通过（新增 3 项） |
 | 打包回归 | 57 项通过 |
 | 浏览器扩展 | 117 项通过 |
 | DSH 隔离实机 | `--agents 3` passed（19 工具、turn、路由、容量） |
-| PKG | 0.6.29（114）重新打包并离线核验，见发布说明 |
+| PKG | 0.6.29（115）重新打包并离线核验，见发布说明 |
 
 验证证据：
 

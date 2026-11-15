@@ -44,6 +44,7 @@
     "guarded-input contract in the real host: type_text/key/paste reject with UNSAFE_WINDOW_DELIVERY for a desktop-bound task instead of silently stealing focus",
     "browser capability preflight in the real host: browser_session prepare/list work; browser_events returns BROWSER_HOST_UNAVAILABLE with a user-action recovery when the extension is not connected",
     "multi-phase session protection in one host run: begin/bind/share/end followed by a second begin/end succeeds after the task-receipt fix (previously SESSION_ROUTING_REQUIRED)",
+    "host restart resume: after a real DSH restart resumed the same session id, agent/created retires the previous run's disposal tombstone and the first turn of the new run is live again (previously every call returned TASK_CANCELLED)",
     "screenshot result verified on disk and by pixel inspection of the captured TextEdit window"
   ]
 }

@@ -649,6 +649,20 @@ class LifecycleTests(unittest.TestCase):
         self.assertIsNone(untouched.get('stoppedAt'))
         self.assertFalse(untouched['sessionEnded'])
 
+    def test_agent_created_retires_previous_run_end_state(self):
+        # A Host restart resumes the same session/agent id in a new process; the
+        # old process's disposed tombstone must not cancel the resumed session.
+        self.send('turn-start', now=1000, turnId=self.turn)
+        self.send('agent-disposed', now=1010)
+        self.assertIsNotNone(lifecycle.tombstone(self.config, self.session, self.agent))
+        self.send('agent-created', now=1020)
+        self.assertIsNone(lifecycle.tombstone(self.config, self.session, self.agent))
+        resumed = self.session + ':2'
+        self.send('turn-start', now=1030, turnId=resumed)
+        turn = self.turns()[lifecycle.turn_key(self.session, self.agent, resumed)]
+        self.assertIsNone(turn.get('stoppedAt'))
+        self.assertFalse(turn.get('sessionEnded'))
+
     def test_agent_disposed_before_late_start_keeps_the_turn_stopped(self):
         self.send('agent-disposed', now=1010)
         fresh = self.session + ':2'
