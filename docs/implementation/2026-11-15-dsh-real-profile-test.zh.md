@@ -135,7 +135,11 @@ Workbuddy 与 DSH 共用这一扩展/宿主，所以统一也覆盖 Workbuddy：
 的 `quietbridge` 连接器 env 为空时会按新布局默认读 QuietBridge 运行态；旧
 `WorkbuddyExtension` 仅迁移、不再注册。本机仍存有历史遗留 hooks 指向
 `workbuddy-cua/connector/host_lifecycle.py --config-dir .../WorkbuddyExtension/cua-helper-config`，
-它们不再影响新宿主，但会继续写旧目录；Workbuddy 浏览器验收前建议清理这些旧 hooks。
+它们不再影响新宿主，但会继续写旧目录。117 已把 Workbuddy 配置统一：部署会重写
+`.workbuddy/mcp.json` 的 `QUIETBRIDGE_CONFIG_DIR` 为 QuietBridge 运行态、删除旧
+`CUA_CONFIG_DIR`，并把 hooks 迁移为唯一一套 `adapters/workbuddy/lifecycle.py`（识别并移除
+旧 `host_lifecycle.py` hooks）。本机已实机应用同一规则（原文件备份 `.bak-20261116-002244`，
+移除 7 条旧 hooks）。
 
 连接器级实测（使用 115 release bridge + 真实扩展，仅把 configDir 指向统一状态目录）：
 `browserChannel=True`、`clientVersion=0.4.14`、`globalPermission=true`，candidates 返回

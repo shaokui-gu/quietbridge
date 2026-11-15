@@ -449,7 +449,8 @@ class DeploymentTests(unittest.TestCase):
         self.assertTrue(servers['workbuddy-cua']['disabled'])
         self.assertEqual(servers['workbuddy-cua']['args'][-1], str(connector))
         self.assertEqual(servers['workbuddy-cua']['env'],
-                         {'CUA_CONFIG_DIR': str(browser / 'cua-helper-config'), 'KEEP_ME': 'value'})
+                         {'KEEP_ME': 'value',
+                          'QUIETBRIDGE_CONFIG_DIR': str(browser_layout(self.home)[3])})
         hooks = json.loads(settings.read_bytes())['hooks']['FinalStop']
         self.assertEqual(len(hooks), 1)
         self.assertIn('adapters/workbuddy/lifecycle.py', hooks[0]['hooks'][0]['command'])
@@ -477,7 +478,8 @@ class DeploymentTests(unittest.TestCase):
         data = json.loads(self.config.read_bytes())
         self.assertEqual(data['mcpServers']['other'], self.original['mcpServers']['other'])
         entry = data['mcpServers']['quietbridge']
-        self.assertEqual(entry['env'], {'KEEP_ME': 'value'})
+        self.assertEqual(entry['env'], {'KEEP_ME': 'value',
+                                          'QUIETBRIDGE_CONFIG_DIR': str(browser_layout(self.home)[3])})
         self.assertEqual(entry['args'][-1], str(self.runtime / 'connector/connector.py'))
         manifest = json.loads((self.runtime / 'connector/active.json').read_bytes())
         self.assertEqual(manifest['helper'], str(self.helper))

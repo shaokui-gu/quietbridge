@@ -44,6 +44,11 @@ def mcp_plan(home, bridge, helper, stable=False, *, checked, read, owns):
     if not isinstance(entry.get('env', {}), dict):
         raise ValueError('现有连接 env 格式错误；未修改')
     env = dict(entry.get('env', {}))
+    # One runtime for Workbuddy and DeepSeek Harness: browser events, task state
+    # and lifecycle hooks all point at the QuietBridge runtime root.
+    for legacy_key in ('QUIETBRIDGE_CONFIG_DIR', 'CUA_CONFIG_DIR'):
+        env.pop(legacy_key, None)
+    env['QUIETBRIDGE_CONFIG_DIR'] = str(browser_layout(home)[3])
     if stable:
         # The active manifest owns the helper version; keep the transport hash
         # fixed across upgrades so the host retains trust and enabled state.
@@ -93,7 +98,13 @@ def lifecycle_plan(home, connector, config, *, checked, read):
                     parts = shlex.split(hook.get('command', ''))
                 except ValueError:
                     parts = []
-                ours = hook.get('type') == 'command' and len(parts) >= 3 and parts[1] == '-B' and parts[2] in (str(script), str(legacy_script))
+                ours = False
+                if hook.get('type') == 'command' and len(parts) >= 3 and parts[1] == '-B':
+                    target = Path(parts[2])
+                    runtime_parts = {part for part in target.parts if part in ('QuietBridge', 'workbuddy-cua')}
+                    ours = (target in (script, legacy_script) or
+                            (bool(runtime_parts) and target.name in ('host_lifecycle.py', 'lifecycle.py') and
+                             (target.name == 'host_lifecycle.py' or 'adapters' in target.parts)))
                 if not ours:
                     remaining.append(hook)
             if remaining:
