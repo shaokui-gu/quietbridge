@@ -34,3 +34,8 @@ def copy_bridge(root, destination):
         target = Path(destination) / relative
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(source, target)
+        # Source files may come from checkouts with a restrictive umask. The
+        # bridge is read by the desktop user (and by codesign verification), so
+        # never preserve a non-readable mode.
+        executable = bool(source.stat().st_mode & 0o111)
+        target.chmod(0o755 if executable else 0o644)

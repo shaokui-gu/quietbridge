@@ -9,6 +9,7 @@ import os
 from pathlib import Path
 import plistlib
 import shutil
+import stat
 import subprocess
 import sys
 import zipfile
@@ -32,6 +33,28 @@ def run(*args):
 def build_app_icon(resources):
     source = Path(__file__).with_name("assets") / "AppIcon.icns"
     shutil.copy2(source, resources / "AppIcon.icns")
+
+
+def normalize_tree_modes(root):
+    """Make packaged files readable by the desktop user.
+
+    Files created under a restrictive umask must not stay 0600 inside the
+    installed app and support payload: PackageKit preserves source modes, the
+    postinstall deploy runs as the desktop user, and codesign verification as
+    that user fails on unreadable bridge files. Directory and file modes are
+    normalized while executable files keep their execute bits.
+    """
+    root = Path(root)
+    for path in sorted(root.rglob('*'), reverse=True):
+        if path.is_symlink():
+            raise SystemExit("Package payload contains a symlink: " + str(path))
+        if path.is_dir():
+            path.chmod(0o755)
+        elif path.is_file():
+            executable = bool(path.stat().st_mode & 0o111)
+            path.chmod(0o755 if executable else 0o644)
+        else:
+            raise SystemExit("Package payload contains a non-regular entry: " + str(path))
 
 
 def write_distribution(destination, version):
@@ -237,6 +260,10 @@ def main():
     shutil.copytree(ROOT / 'adapters', scripts / 'adapters', ignore=shutil.ignore_patterns('__pycache__', 'tests', 'test', '*.pyc'))
     for name in ("preinstall", "postinstall", "launch-postinstall", "runtime.sh", "manage-plugin.command", "恢复安装.command"):
         run("/bin/bash", "-n", Path(__file__).with_name(name))
+    # Payload modes come from the working tree; normalize before sealing so the
+    # installed bridge stays readable by the desktop user.
+    normalize_tree_modes(payload)
+    normalize_tree_modes(scripts)
     run("/usr/bin/codesign", "--force", "--options", "runtime", "--timestamp=none",
         "--sign", args.identity, app)
     run("/usr/bin/codesign", "--verify", "--strict", app)

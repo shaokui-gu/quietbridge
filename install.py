@@ -182,6 +182,7 @@ def install(root, home, apply=False, verify_signature=True, with_extension=False
             target = stage / 'bridge' / next(relative for relative, source in bridge_sources(root).items() if source == path)
             target.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(path, target)
+            target.chmod(0o755 if path.stat().st_mode & 0o111 else 0o644)
         (stage / 'install-receipt.json').write_text(json.dumps({'digest': digest}), encoding='utf-8')
         stage.rename(destination)
     else:
