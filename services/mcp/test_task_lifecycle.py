@@ -23,6 +23,17 @@ class TaskLifecycleTests(unittest.TestCase):
         self.addCleanup(self.fixture.doCleanups)
         self.addCleanup(self.fixture.tearDown)
 
+    def test_lease_stays_live_when_monotonic_clocks_differ_by_process(self):
+        # The connector worker (system Python 3.9) and the native host (3.14)
+        # disagree about time.monotonic(); lease liveness must use the machine
+        # uptime clock instead of the process-relative value.
+        parent = Path(self.fixture.path).parent
+        owner = TaskOwner()
+        record = {}
+        owner.attach(record, parent)
+        with mock.patch.object(browser_events.time, 'monotonic', return_value=0.0):
+            self.assertTrue(browser_events.lease_live(record, parent))
+
     def test_idle_timeout_revokes_binding_share_and_guard_without_new_helper(self):
         bound = self.fixture.bind()
         with server.task_store() as data:

@@ -141,6 +141,26 @@ Workbuddy 与 DSH 共用这一扩展/宿主，所以统一也覆盖 Workbuddy：
 旧 `host_lifecycle.py` hooks）。本机已实机应用同一规则（原文件备份 `.bak-20261116-002244`，
 移除 7 条旧 hooks）。
 
+**进一步发现的会话通道缺陷（118）**：目录统一后扩展心跳正常、`browserChannel=True`，
+但 DSH 浏览器任务始终 `BROWSER_CHANNEL_STARTING`（扩展连上全局通道，任务私有通道未建立）。
+根因：macOS 系统 Python 3.9（Xcode）的 `time.monotonic()` 是**进程内相对值**
+（约 0.006s），而原生宿主用 Homebrew Python 3.14 的 `time.monotonic()` 是机器 uptime
+（约 813,000s）。连接器 worker 写入的 `lease.expiresAtUptime` 与原生宿主比较时必然过期，
+`session_registry` 的 `live_slots()` 立即把会话通道剪掉，扩展永远看不到可连接的通道。
+修复：新增 `browser_events.uptime()`，优先使用 `CLOCK_UPTIME_RAW`（机器级、跨进程一致），
+lease 时间戳与比较全部改用它；`TaskOwner` 同步。修复后 DSH 侧真实扩展任务通道建立，
+逐项跑通：
+
+`create_target` → `candidates` → `task bind` → `assign` → `verify_mapping`
+（`method=window_active_title`, `match=exact`）→ `windows share` → `snapshot`（
+`readyState=complete`、元素 ref）→ `read links/content`（example.com / IANA 页面文本）→
+`screenshot`（返回真实 JPEG）→ `diagnostics`（`errors=[]`、viewport 1800×840）→
+`scroll`（正确报告 `at_boundary`）→ `keypress`（CDP）→ `click`（经 snapshot 复核后点击
+“Learn more”，导航到 IANA 且 `navigationEpoch` 递增）→ `navigate https://example.org/`
+→ `tabs`、`select_tab`、`annotations` → `fill`（httpbin 表单，`verified=true, length=15`）。
+`select` 因测试页无 `<select>` 未覆盖；真实 Chrome 标签 `assign/mapping` 与网页输入已走通。
+空闲 120s 会按设计把任务挂起（`requires_revalidation`），需重新 bind/share 恢复。
+
 连接器级实测（使用 115 release bridge + 真实扩展，仅把 configDir 指向统一状态目录）：
 `browserChannel=True`、`clientVersion=0.4.14`、`globalPermission=true`，candidates 返回
 6 个真实 Chrome 标签（URL 可见），`browser_session list` 正常。完整页面操作

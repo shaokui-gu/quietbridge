@@ -11,7 +11,7 @@ IDLE_SECONDS = 120
 SESSION_IDLE_SECONDS = 1800
 
 
-from browser_events import lease_live
+from browser_events import lease_live, uptime
 
 
 class ProtectionSession:
@@ -91,12 +91,12 @@ class TaskOwner:
     def expired(self, record):
         lease = record.get('lease') or {}
         return (self.owns(record) and
-                (time.monotonic() >= lease.get('expiresAtUptime', 0) or
+                (uptime() >= lease.get('expiresAtUptime', 0) or
                  time.time() >= lease.get('expiresAt', 0)))
 
     def renew(self, record):
         record['lease'] = {'ownerId': self.id, 'expiresAt': time.time() + IDLE_SECONDS,
-                           'expiresAtUptime': time.monotonic() + IDLE_SECONDS,
+                           'expiresAtUptime': uptime() + IDLE_SECONDS,
                            'idleSeconds': IDLE_SECONDS}
 
     def close(self):

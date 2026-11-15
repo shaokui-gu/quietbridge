@@ -20,6 +20,23 @@ ROOT = Path(__file__).resolve().parents[2]
 RUNTIME = browser_runtime_root()
 
 
+def uptime():
+    """Monotonic seconds that stay comparable across interpreter processes.
+
+    macOS system Python 3.9 (Xcode) reports ``time.monotonic()`` relative to
+    process start, while Homebrew/other builds report uptime. Lease timestamps
+    are written by one process (connector worker) and checked by another
+    (native host / session registry), so use the machine clock directly.
+    """
+    clock = getattr(time, 'CLOCK_UPTIME_RAW', None)
+    if clock is not None:
+        try:
+            return time.clock_gettime(clock)
+        except (OSError, ValueError):
+            pass
+    return time.monotonic()
+
+
 def config_dir():
     override = environment('QUIETBRIDGE_CONFIG_DIR')
     if override:
@@ -539,7 +556,7 @@ def lease_live(record, parent, now=None):
         # cleanup; the kernel owner lock still releases on worker exit.
         if (str(uuid.UUID(token)) != token or (record.get('state') != 'stopping' and (
                 not 0 < lease['expiresAt'] - (time.time() if now is None else now) <= 125 or
-                not 0 < lease['expiresAtUptime'] - time.monotonic() <= 125))):
+                not 0 < lease['expiresAtUptime'] - uptime() <= 125))):
             return False
         path = Path(parent) / ('task-owner-' + token + '.lock')
         fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)

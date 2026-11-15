@@ -762,9 +762,11 @@ PKG 0.6.29（113）安装成功后，用官方 CLI 把部署的 bundle 加入用
   `WorkbuddyExtension` 旧目录，而 bundle `configDir` 在
   `~/Library/Application Support/QuietBridge`，扩展心跳与连接器读的不是同一目录。
   116 把原生宿主、bridge 副本与浏览器任务状态统一到 QuietBridge 运行态（旧目录仅作
-  一次性迁移来源，Chrome 只注册一个 host）；连接器级实测 `browserChannel=True`、
-  `clientVersion=0.4.14`、6 个真实候选标签。完整网页操作需安装 116 并重启 DSH/Chrome
-  后继续验收。
+  一次性迁移来源，Chrome 只注册一个 host）。118 进一步修复任务通道：系统 Python 3.9
+  的 `time.monotonic()` 是进程内相对值，与原生宿主时钟不可比，lease 被 session_registry
+  立即剪掉；改用机器级 `CLOCK_UPTIME_RAW` 后，DSH 侧真实 Chrome 已跑通
+  create_target/assign/verify_mapping/snapshot/read/screenshot/diagnostics/scroll/
+  keypress/click/navigate/tabs/select_tab/fill。
 - 发现并修复回执缺陷：真实 session 事件 `tool/call.data.arguments` 是 JSON 字符串，
   bundle 原样透传导致 lifecycle `toolInput` 非对象、begin/bind 回执被丢弃；同一宿主
   轮次内第一次 `end` 后再 `end` 第二个阶段即 `SESSION_ROUTING_REQUIRED`。修复为 bundle

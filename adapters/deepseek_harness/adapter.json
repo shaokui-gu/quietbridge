@@ -20,7 +20,7 @@
   ],
   "supportsConcurrentAgents": false,
   "blockingRequirements": [
-    "Full real-profile browser operations after 116 (assign, verify_mapping, snapshot/read/click/fill/select/navigate, tabs/select_tab) still need the 116 install and DSH/Chrome restart acceptance",
+    "Browser select operation and multi-tab assignment beyond one created target are not exercised yet; the test page had no <select> element",
     "Native DSH preview host window binding unimplemented; DSH preview support is not claimed",
     "Screenshot/image results reach the model only through the attachment admission path; the bridge currently returns text plus a saved PNG path",
     "Real-profile multi-Agent concurrency and long-running soak not verified; the connector capacity-3 behavior and isolation are proven only in the isolated host",
@@ -46,6 +46,8 @@
     "multi-phase session protection in one host run: begin/bind/share/end followed by a second begin/end succeeds after the task-receipt fix (previously SESSION_ROUTING_REQUIRED)",
     "host restart resume: after a real DSH restart resumed the same session id, agent/created retires the previous run's disposal tombstone and the first turn of the new run is live again (previously every call returned TASK_CANCELLED)",
     "screenshot result verified on disk and by pixel inspection of the captured TextEdit window",
-    "browser native host unified into the QuietBridge runtime: one Chrome host registration/state dir, legacy WorkbuddyExtension state migrated; connector-level real-extension probe returned browserChannel=True, clientVersion=0.4.14, globalPermission=true and 6 real candidate tabs"
+    "browser native host unified into the QuietBridge runtime: one Chrome host registration/state dir, legacy WorkbuddyExtension state migrated; connector-level real-extension probe returned browserChannel=True, clientVersion=0.4.14, globalPermission=true and 6 real candidate tabs",
+    "real-profile browser operations through the DSH host after the 118 cross-process clock fix: create_target, candidates(taskChannelReady), task bind, assign, verify_mapping (window_active_title exact), window share, snapshot, read links/content, screenshot, diagnostics, scroll (at_boundary), keypress, click that navigated to IANA, explicit navigate to example.org, tabs, select_tab, annotations and fill (verified=true, length=15)",
+    "cross-process lease clock: Xcode Python 3.9 per-process time.monotonic() versus Homebrew Python 3.14 machine uptime was the cause of the stuck private browser channel; browser_events.uptime() (CLOCK_UPTIME_RAW) fixes lease liveness and has a regression test"
   ]
 }
