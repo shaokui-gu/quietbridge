@@ -622,6 +622,28 @@ class DeploymentTests(unittest.TestCase):
         self.assertIsNotNone(match, text)
         return json.loads(match.group(1))
 
+    def test_new_release_digest_renders_a_new_bundle_and_keeps_the_old_release(self):
+        first = self.install(FakeService())
+        first_bundle = self.dsh_bundle(first)
+        first_config = self.dsh_config(first_bundle)
+        # Change packaged content so the content-addressed release digest changes.
+        bridge = self.app / 'Contents/Resources/bridge/server.py'
+        bridge.write_bytes(bridge.read_bytes() + b'\n# changed payload\n')
+        second = self.install(FakeService())
+        second_bundle = self.dsh_bundle(second)
+        self.assertNotEqual(second_bundle, first_bundle)
+        releases = sorted(path.name for path in (self.runtime / 'releases').iterdir()
+                          if path.is_dir() and not path.name.startswith('.'))
+        self.assertEqual(len(releases), 2, releases)
+        self.assertTrue(first_bundle.is_dir(), 'the previous release keeps its rendered bundle')
+        second_config = self.dsh_config(second_bundle)
+        self.assertEqual(second_config['connector'],
+                         str(second_bundle.parent / 'QuietBridge.app/Contents/Resources/bridge/server.py'))
+        self.assertEqual(second_config['helper'], str(self.helper))
+        self.assertEqual(second_config['configDir'], str(self.runtime))
+        self.assertNotEqual(second_config['connector'], first_config['connector'])
+        self.assertEqual(second['dshBundle']['files'], 7)
+
     def test_commit_failure_restores_all_user_components(self):
         original, agent = self.config.read_bytes(), self.agent.read_bytes()
         service = FakeService(running=True)

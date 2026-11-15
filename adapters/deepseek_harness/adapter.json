@@ -21,11 +21,11 @@
   "supportsConcurrentAgents": false,
   "blockingRequirements": [
     "Real user profile installation and acceptance (desktop or custom) not performed; only an isolated DSH_HOME profile was verified",
-    "Real helper execution and TCC attribution under the Harness process unverified; the isolated check used a deliberately missing helper path",
+    "Real helper execution and TCC attribution under the Harness process unverified; the isolated checks use a deliberately missing helper path",
     "Native DSH preview host window binding unimplemented; DSH preview support is not claimed",
-    "Concurrent DSH Agents not accepted as verified (capacity 3, extra agents refused by design)",
+    "Concurrent DSH Agents verified only in the isolated host (2-3 working agents, capacity-3 degradation); real-profile/real-helper concurrency and long-running soak still pending",
     "Screenshot/image tool results reach the model only through the attachment admission path; currently text-only fallback",
-    "Model-driven real tool-call turn not verified (the isolated profile has no model credentials; the turn ended with an error)"
+    "Model-driven real tool-call turn not verified (the isolated profile has no model credentials; turns end with an error)"
   ],
   "verificationEvidence": "docs/implementation/2026-11-15-dsh-isolated-verification.zh.md",
   "verifiedScope": [
@@ -36,6 +36,7 @@
     "real turn/start and turn/end session events bridged to the Python lifecycle store",
     "host-context routing allow (live turn) and deny (stopped turn)",
     "agent-disposed lifecycle tombstone and connector cleanup",
-    "PKG deployment renders the same bundle transactionally into releases/<digest>/dsh-bundle (packaging tests, not a real PKG install)"
+    "PKG deployment renders the same bundle transactionally into releases/<digest>/dsh-bundle (packaging tests, not a real PKG install)",
+    "isolated multi-Agent isolation: 2-3 agents get independent connectors/tools, stopping or disposing one leaves siblings working, and a 4th agent degrades by the capacity-3 connector limit"
   ]
 }

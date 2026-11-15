@@ -110,3 +110,25 @@ env -u DSH_HOME -u PYTHONPATH python3 tools/dsh_isolated_check.py
 `exitCode=0`、`timedOut=false`，lifecycle `turnCount=3`（含 `<session>:1`、`<session>:90`
 与 `host_session_end` 墓碑），总耗时约 11.6 秒。在 DSH 自己的 shell 中运行时需先
 `env -u DSH_HOME`（脚本拒绝继承的真实 home）。
+
+## 5. 多 Agent 并发隔离验证（补充）
+
+对同一隔离环境追加 `--agents 2/3/4` 运行，验证每 Agent 连接器与生命周期隔离；
+结果全部 passed、`failures=[]`：
+
+| 模式 | 耗时 | toolCounts | 关键证据 |
+| --- | --- | --- | --- |
+| N=1（基线） | 11.2s | [19] | 原有断言不变 |
+| N=2 | 6.7s | [19, 19] | 停 A 的 turn：A=`TASK_CANCELLED`、B 仍 `HELPER_MISSING`；dispose A 后 A 有墓碑，B 新 turn 可调用且 `sessionEnded=false/stoppedAt=null` 未被污染 |
+| N=3 | 7.4s | [19, 19, 19] | 三个 Agent 各自 live/stopped 断言通过 |
+| N=4 | 9.6s | [19, 19, 19, 0] | `capacity={maxConnectors:3, requested:4, degraded:true, workingAgents:3}`；第 4 个 Agent 预期降级为无工具 |
+
+补充结论：
+
+- 每 Agent 工具为独立的 agent 作用域注册（definition handle 不同）；
+- 路由按 session/agent 判定：A 的 turn 停止或 Agent 释放不会拒绝/停止 B；
+- lifecycle store 中每个 Agent 的 turn 记录独立，墓碑只影响自身；
+- 连接器数量预算 3 生效，第 4 个 Agent 不注册工具且不报错（预期容量降级）。
+
+仍未覆盖：真实 profile/真实 helper 下的并发与长时间运行、真实工具调用（本检查 helper
+故意缺失）、DSH 预览与图片。复现：`tools/dsh_isolated_check.py --agents 3`（或 2/4）。

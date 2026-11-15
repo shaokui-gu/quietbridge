@@ -50,6 +50,10 @@ node --test adapters/deepseek_harness/bundle/test/*.test.mjs
 # DSH_HOME/profile and never touches ~/.dsh. Inside a DSH shell (which exports
 # a real DSH_HOME) clear it first; the script refuses an inherited real home.
 env -u DSH_HOME -u PYTHONPATH python3 tools/dsh_isolated_check.py
+
+# Optional multi-Agent isolation / capacity runs (3 = all working, 4 = capacity
+# degradation expected):
+env -u DSH_HOME -u PYTHONPATH python3 tools/dsh_isolated_check.py --agents 3
 ```
 
 The executable is `apps/macos/.build/release/quietbridge-native`. Build the

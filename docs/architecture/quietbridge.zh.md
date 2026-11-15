@@ -5,8 +5,8 @@
 2026-11-15 补充：DeepSeek Harness 适配已在仓库内完成源码级实现（契约文档、
 每 Agent 连接器适配器、可渲染 bundle 与路由支持），并已在**隔离 DSH_HOME/profile**
 中完成实机验证（bundle 安装、真实宿主启动、每 Agent 19 个工具注册、turn 生命周期、
-宿主上下文路由放行/拒绝）；尚未安装进用户真实 profile，helper 权限/TCC、DSH 预览
-与并发验收仍未完成。证据见
+宿主上下文路由放行/拒绝）；尚未安装进用户真实 profile，helper 权限/TCC、DSH 预览与并发
+验收仍未完成（并发隔离已在隔离 DSH 宿主中验证 2-3 Agent 与容量降级）。证据见
 [DeepSeek Harness 宿主契约](dsh-host-contract.zh.md)、
 [隔离实机验证](../implementation/2026-11-15-dsh-isolated-verification.zh.md) 与
 [本轮实现记录](../implementation/2026-11-15-dsh-adaptation.zh.md)；PKG 部署会从已验证

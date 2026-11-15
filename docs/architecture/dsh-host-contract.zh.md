@@ -710,6 +710,10 @@ env 在插件激活时固定，无法自然做到“每次 agent/created 用该 
 - 反向约束：测试 helper 路径故意不存在，未触发真实 helper/TCC/UI；未验证模型驱动的真实
   工具调用、预览归属与并发。
 
+- 多 Agent：隔离环境用 `--agents 2/3/4` 验证——2-3 个 Agent 各自 19 工具与独立
+  连接器/路由；停止或释放一个不影响其它 Agent 的 live turn；第 4 个按容量上限降级
+  为无工具。真实 profile/真实 helper 下的并发与长跑仍未验收。
+
 - 安装路径：PKG 部署（`packaging/macos/deploy.py`）会从已验证 release 渲染同一 bundle
   到 `releases/<digest>/dsh-bundle` 并纳入用户文件事务；用户用 `dsh plugin add` 安装。
   见 [PKG deploy 记录](../implementation/2026-11-15-dsh-pkg-deploy.zh.md)。

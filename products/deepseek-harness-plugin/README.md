@@ -98,8 +98,12 @@ Not verified, and not claimed:
   Harness process is not verified; the isolated check used a missing helper path.
 - DSH preview host binding is not implemented yet; the native side still selects
   preview hosts from its historical host logic. Do not claim DSH preview support.
-- Multiple concurrent Harness Agents are not accepted as verified; the shared
-  capacity limit stays at three sessions and further sessions are refused.
+- Multi-Agent isolation is verified only in the isolated host: with 2-3 live
+  agents each had its own connector and tools, stopping/disposing one left the
+  others working, and a 4th agent degraded to no QuietBridge tools by the
+  capacity limit. Real user-profile/real-helper acceptance still is not
+  verified, so `supportsConcurrentAgents` remains `false` in the adapter
+  metadata.
 
 See `adapters/deepseek_harness/adapter.json` for the machine-readable status and
 remaining blocking requirements.

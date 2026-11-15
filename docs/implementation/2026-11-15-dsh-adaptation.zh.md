@@ -122,3 +122,5 @@ Agent 释放写入 `sessionEnded` 墓碑并清理连接器。完整证据、限�
 `packaging/macos/deploy.py` 现在会从已验证 release 内模板渲染 DSH bundle 到
 `releases/<digest>/dsh-bundle`，与其它用户文件同一事务提交/回滚；渲染失败只降级记录，
 不阻断主安装。验证与限制见 [DSH bundle 接入 PKG 用户部署](2026-11-15-dsh-pkg-deploy.zh.md)。
+多 Agent 并发隔离（2-4 Agent、容量降级）也已在该隔离环境中补验，见
+[隔离 profile 实机验证 §5](2026-11-15-dsh-isolated-verification.zh.md#5-多-agent-并发隔离验证补充)。
