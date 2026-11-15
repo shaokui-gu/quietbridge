@@ -29,6 +29,12 @@ dsh-cua-native.*
 *.mobileprovision
 *.p12
 *.cer
+*.p8
+*.pem
+*.key
+
+# 签名与密钥目录（整体排除，杜绝任何子文件被误提交）
+sign/
 
 # 测试证据与截图：体积大，且包含本机画面与路径
 verify-2/
