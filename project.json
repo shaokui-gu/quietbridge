@@ -6,7 +6,7 @@
   "browserExtension": {"name": "QuietBridge Browser", "source": "extensions/chromium"},
   "products": {
     "workbuddy": {"name": "QuietBridge for Workbuddy", "source": "products/workbuddy-connector", "status": "implemented"},
-    "deepseek-harness": {"name": "QuietBridge for DeepSeek Harness", "source": "products/deepseek-harness-plugin", "status": "implemented-isolated-verified"}
+    "deepseek-harness": {"name": "QuietBridge for DeepSeek Harness", "source": "products/deepseek-harness-plugin", "status": "implemented-real-profile-verified"}
   },
   "runtime": {"sharedApplication": true, "multiAgentIsolation": false, "simultaneousPreviews": false}
 }

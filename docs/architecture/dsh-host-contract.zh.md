@@ -419,6 +419,14 @@ agent.ctx.on('session/event', (session, event) => {
 见 `services/mcp/server.py` 第 2312、2470、2558 行）。生命周期 CLI 走 stdin JSON，
 必须只转发名称、参数摘要、turn、结果状态/文本摘要，禁止把整段 base64 塞入。
 
+**参数形态（实机回归）**：session 事件 `tool/call` 的 `data.arguments` 是**原始 JSON
+字符串**（如 `"{\"action\":\"begin\"}"`），不是对象；只有 `tools/result` 的
+`exec.arguments` 才是已解析对象。回执链路里若直接把 session 字符串透传给 lifecycle CLI，
+其 `toolInput` 不是对象，begin/bind 回执会被整条丢弃（任务工具本身仍可用，但会话保护
+拿不到归属证据，同一宿主轮次的第二次 `quietbridge_task end` 会以
+`SESSION_ROUTING_REQUIRED` 拒绝）。bundle 必须用 `JSON.parse` 归一化后再上报；
+lifecycle CLI 同时接受字符串与对象两种形态作为防御。
+
 ### 2.6 `ctx.tools.register` 原始 definition 的要求
 
 **硬要求（注册期强校验，违反直接 throw）**——`dsh-tools/lib/index.js` `register()`
@@ -661,7 +669,8 @@ env 在插件激活时固定，无法自然做到“每次 agent/created 用该 
 4. 工具名 `[A-Za-z0-9_-]{1,64}`、前缀 `mcp__quietbridge__`，避开 `run_code`。
 5. turn 事件订阅用 `session/event`，payload `{turn}`/`{turn, reason}`；turnId 自组复合键。
 6. 工具回执的 turn 取自 session 的 `tool/call`/`tool/result`，或自行跟踪打开的 turn；
-   `tools/result` 仅作补充观察。
+   `tools/result` 仅作补充观察。session `tool/call` 的 `arguments` 是 JSON **字符串**，
+   必须 `JSON.parse` 后再交给 lifecycle；`tools/result` 的 `exec.arguments` 已是对象。
 7. 身份只取 `agent.session.id`/`agent.id`，二者恒等；不解析 ID 前缀，不读宿主进程 env。
 8. 连接器失败一律降级（该 Agent 无工具 + warn），绝不阻断 Agent 创建或 turn。
 9. 生命周期 CLI 失败必须吞掉；turn/end 路径不得被它阻塞。
@@ -669,12 +678,14 @@ env 在插件激活时固定，无法自然做到“每次 agent/created 用该 
 
 ## 6. 与 `adapters/deepseek_harness/adapter.json` 的对应关系
 
-- `status: "implemented-isolated-verified"`：源码级适配完成（bundle、adapter、routing
-  与测试），并已在隔离 DSH_HOME/profile 完成实机验证（§7）；用户真实 profile、真实
-  helper 权限/TCC、模型驱动工具调用、并发与预览仍未验收。`project.json`、
-  `products/deepseek-harness-plugin/product.json` 使用同一状态词。
-- `verificationEvidence: "docs/implementation/2026-11-15-dsh-isolated-verification.zh.md"`
-  与 `verifiedScope`：记录隔离实机验证的范围与证据；`blockingRequirements` 保留未完成项。
+- `status: "implemented-real-profile-verified"`：源码级适配、隔离实机（§7）与用户真实
+  `desktop` profile 的桌面能力验收（§7.1）均完成；真实浏览器扩展通道、DSH 预览宿主绑定、
+  图片附件投影、真实 profile 并发/长跑、Workbuddy 预览视觉验收与 PKG 外层签名/公证仍
+  未完成。`project.json`、`products/deepseek-harness-plugin/product.json` 使用同一状态词。
+- `verificationEvidence: "docs/implementation/2026-11-15-dsh-real-profile-test.zh.md"`
+  与 `verifiedScope`：记录真实 profile 全能力测试的范围、回执缺陷修复与证据；
+  `blockingRequirements` 保留未完成项（隔离验证细节另见
+  `docs/implementation/2026-11-15-dsh-isolated-verification.zh.md`）。
 - `hostVersionVerified: "0.2.2-alpha.2"`：本文所有契约结论核对的 DSH 版本；升级 DSH 后
   需按附录 A 重新核对。
 - `contractEvidence: "docs/architecture/dsh-host-contract.zh.md"`：指向本文件。
@@ -721,6 +732,36 @@ env 在插件激活时固定，无法自然做到“每次 agent/created 用该 
 完整证据、限制与复现方式见
 [DSH 隔离 profile 实机验证](../implementation/2026-11-15-dsh-isolated-verification.zh.md)。
 仓库脚本 `tools/dsh_isolated_check.py` 可一键复现该检查。
+
+### 7.1 真实用户 profile 全能力测试（2026-11-15 晚）
+
+PKG 0.6.29（113）安装成功后，用官方 CLI 把部署的 bundle 加入用户真实 `desktop` profile
+（`package.json` 写入 `link:` 依赖、`dsh.profile.bundles` 追加 `@quietbridge/dsh`），
+运行中的宿主立即加载：插件列表出现 `include:quietbridge-dsh`（`enabled: true`,
+`fiberPhase: active`），并按现存 3 个 Agent 各自启动一个连接器进程（session 身份互不相同）。
+随后由真实模型驱动、经真实 helper 执行桌面工具，并与本地会话日志逐条核对：
+
+- 已通过：`quietbridge_apps`（list/find/get/launch）、`quietbridge_task`（begin/bind/status/end）、
+  `quietbridge_windows`（list/share/unshare）、`quietbridge_state`、`quietbridge_screenshot`、
+  `quietbridge_visual_state`、`quietbridge_situation`、`quietbridge_set_value`、
+  `quietbridge_click`（元素与窗口坐标两种）、`quietbridge_scroll`、`quietbridge_drag`、
+  `quietbridge_hover`；权限 `accessibility=true`、`screenRecording=true`、
+  `sessionLocked=false`、`responsibleApp=QuietBridge.app`。
+- 契约性拒绝（非故障）：`quietbridge_type_text`/`quietbridge_key`/`quietbridge_paste`
+  对 desktop 绑定任务返回 `UNSAFE_WINDOW_DELIVERY`，未发生焦点窃取；
+  `quietbridge_wait_ready` 在无 AXWebArea 的原生窗口返回 `needs_visual_review`。
+- 浏览器能力未验收：`browserChannel=false`，`quietbridge_browser_events` 返回
+  `BROWSER_HOST_UNAVAILABLE`（需用户在 Chrome 启用 QuietBridge Browser 扩展并授权站点）；
+  `quietbridge_browser_session` 的 prepare/list 正常。
+- 发现并修复回执缺陷：真实 session 事件 `tool/call.data.arguments` 是 JSON 字符串，
+  bundle 原样透传导致 lifecycle `toolInput` 非对象、begin/bind 回执被丢弃；同一宿主
+  轮次内第一次 `end` 后再 `end` 第二个阶段即 `SESSION_ROUTING_REQUIRED`。修复为 bundle
+  `parseToolArguments`（字符串解析为对象）+ lifecycle CLI 同时接受两种形态，并补 3 项
+  Node 测试与 2 项 Python 测试；修复后在真实宿主复验“begin→bind→share→end→begin→end”
+  全部通过，lifecycle store 写入两个阶段回执。
+
+证据与其余限制见
+[真实 profile 全能力测试](../implementation/2026-11-15-dsh-real-profile-test.zh.md)。
 
 ## 附录 A：引用文件索引
 

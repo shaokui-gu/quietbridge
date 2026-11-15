@@ -158,6 +158,14 @@ def _tool_result(payload, config, session, agent, now):
     if not _valid(turn):
         return
     arguments = payload.get('toolInput')
+    # Session events may hand tool arguments over as the raw JSON document while
+    # other paths pass an object; normalize before the begin/bind check so a
+    # valid task receipt is never dropped on shape alone.
+    if isinstance(arguments, str):
+        try:
+            arguments = json.loads(arguments)
+        except (UnicodeDecodeError, ValueError):
+            return
     if not isinstance(arguments, dict) or arguments.get('action') not in TASK_ACTIONS:
         return
     record = task_receipt(payload.get('toolResult'))

@@ -1,6 +1,6 @@
 {
   "id": "deepseek-harness",
-  "status": "implemented-isolated-verified",
+  "status": "implemented-real-profile-verified",
   "transport": "per-agent-stdio-jsonrpc",
   "serverName": "quietbridge",
   "configuration": "DSH profile bundle row; installed with `dsh plugin --profile <name> add <dir>` (link dependency + dsh.profile.bundles) or the host plugin_manager install_bundle flow",
@@ -20,14 +20,14 @@
   ],
   "supportsConcurrentAgents": false,
   "blockingRequirements": [
-    "Real user profile installation and acceptance (desktop or custom) not performed; only an isolated DSH_HOME profile was verified",
-    "Real helper execution and TCC attribution under the Harness process unverified; the isolated checks use a deliberately missing helper path",
+    "Real Chrome extension channel unverified: the installed extension was not connected in the user profile (BROWSER_HOST_UNAVAILABLE), so browser_events/browser_session page operations, tab assignment and mapping verification are untested in the real profile",
     "Native DSH preview host window binding unimplemented; DSH preview support is not claimed",
-    "Concurrent DSH Agents verified only in the isolated host (2-3 working agents, capacity-3 degradation); real-profile/real-helper concurrency and long-running soak still pending",
-    "Screenshot/image tool results reach the model only through the attachment admission path; currently text-only fallback",
-    "Model-driven real tool-call turn not verified (the isolated profile has no model credentials; turns end with an error)"
+    "Screenshot/image results reach the model only through the attachment admission path; the bridge currently returns text plus a saved PNG path",
+    "Real-profile multi-Agent concurrency and long-running soak not verified; the connector capacity-3 behavior and isolation are proven only in the isolated host",
+    "Real Workbuddy multi-session and preview visual acceptance still pending",
+    "PKG outer signature and notarization intentionally omitted"
   ],
-  "verificationEvidence": "docs/implementation/2026-11-15-dsh-isolated-verification.zh.md",
+  "verificationEvidence": "docs/implementation/2026-11-15-dsh-real-profile-test.zh.md",
   "verifiedScope": [
     "bundle install via official DSH CLI into an isolated DSH_HOME profile",
     "host plugin activation in a real Harness boot",
@@ -37,6 +37,13 @@
     "host-context routing allow (live turn) and deny (stopped turn)",
     "agent-disposed lifecycle tombstone and connector cleanup",
     "PKG deployment renders the same bundle transactionally into releases/<digest>/dsh-bundle (packaging tests, not a real PKG install)",
-    "isolated multi-Agent isolation: 2-3 agents get independent connectors/tools, stopping or disposing one leaves siblings working, and a 4th agent degrades by the capacity-3 connector limit"
+    "isolated multi-Agent isolation: 2-3 agents get independent connectors/tools, stopping or disposing one leaves siblings working, and a 4th agent degrades by the capacity-3 connector limit",
+    "real desktop profile: bundle added to the user's desktop profile with the official CLI, the host loaded it live (plugin list entry active) and spawned one connector per existing Agent",
+    "real model-driven tool calls through the live host: apps list/get/find/launch, task begin/bind/status/end, windows list/share/unshare, state, screenshot, visual_state, situation, set_value, click (element and window coordinates), scroll, drag, hover",
+    "real helper execution and TCC attribution under the Harness connector: accessibility=true, screenRecording=true, sessionLocked=false, responsibleApp=QuietBridge.app",
+    "guarded-input contract in the real host: type_text/key/paste reject with UNSAFE_WINDOW_DELIVERY for a desktop-bound task instead of silently stealing focus",
+    "browser capability preflight in the real host: browser_session prepare/list work; browser_events returns BROWSER_HOST_UNAVAILABLE with a user-action recovery when the extension is not connected",
+    "multi-phase session protection in one host run: begin/bind/share/end followed by a second begin/end succeeds after the task-receipt fix (previously SESSION_ROUTING_REQUIRED)",
+    "screenshot result verified on disk and by pixel inspection of the captured TextEdit window"
   ]
 }

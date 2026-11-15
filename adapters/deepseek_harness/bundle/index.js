@@ -282,6 +282,26 @@ function boundJson(value, options = {}) {
 	return bounded
 }
 
+/**
+ * Normalize one tool-call argument document.
+ *
+ * DSH session events carry `tool/call.data.arguments` as the raw JSON string
+ * while `tools/result.exec.arguments` is already parsed. Lifecycle receipts
+ * must always see an object so the Python store can recognize begin/bind.
+ */
+function parseToolArguments(value) {
+	if (isRecord(value)) return boundJson(value)
+	if (typeof value === 'string' && value.length <= 65536) {
+		try {
+			const parsed = JSON.parse(value)
+			if (isRecord(parsed)) return boundJson(parsed)
+		} catch {
+			/* not a JSON object: fall through to the empty record */
+		}
+	}
+	return {}
+}
+
 /** Resolve one local JSON-pointer `$ref` (only `#...` pointers are supported). */
 function resolveLocalRef(root, ref) {
 	if (typeof ref !== 'string' || !ref.startsWith('#')) return undefined
@@ -1440,7 +1460,7 @@ export function apply(ctx, config) {
 			event: 'tool-result',
 			turnId,
 			toolName,
-			toolInput: boundJson(receipt.arguments ?? {}),
+			toolInput: parseToolArguments(receipt.arguments),
 			toolResult: boundJson(receipt.toolResult),
 		})
 	}
@@ -1503,7 +1523,7 @@ export function apply(ctx, config) {
 				rememberCall(state, data.callId, {
 					turnId: turnIdOf(state.sessionId, data.turn),
 					name,
-					arguments: boundJson(data.arguments ?? {}),
+					arguments: parseToolArguments(data.arguments),
 				})
 				return
 			}
@@ -1548,7 +1568,11 @@ export function apply(ctx, config) {
 			if (!state.toolNames.has(toolName)) return
 			const callId = typeof exec.callId === 'string' ? exec.callId : undefined
 			const call = callId === undefined ? undefined : state.pendingCalls.get(callId)
-			const coreArguments = boundJson(call?.arguments ?? exec.arguments ?? {})
+			// `tools/result` exposes parsed arguments; prefer them over the raw
+			// string stored from the earlier session `tool/call` event.
+			const coreArguments = isRecord(exec.arguments) || typeof exec.arguments === 'string'
+				? parseToolArguments(exec.arguments)
+				: parseToolArguments(call?.arguments)
 			// The Python lifecycle store only needs the task receipt carried by
 			// `structuredContent` for a begin/bind call; that value is only visible
 			// here, so this observation is forwarded even after the session event
@@ -1989,6 +2013,7 @@ export const __internals = Object.freeze({
 	isValidToolName,
 	mapTurnReason,
 	normalizeMcpContent,
+	parseToolArguments,
 	renderToolResult,
 	resolveConfig,
 	sanitizeToolInputSchema,

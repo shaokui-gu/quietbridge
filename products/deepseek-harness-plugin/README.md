@@ -88,20 +88,37 @@ Verified in this repository round (source-level):
   a live-turn call and rejected a stopped-turn call, and Agent disposal wrote the
   tombstone. Evidence:
   [`2026-11-15-dsh-isolated-verification.zh.md`](../../docs/implementation/2026-11-15-dsh-isolated-verification.zh.md).
+- **Real `desktop` profile verification passed for desktop capabilities**: the
+  user installed the signed PKG, added the deployed bundle through the official
+  CLI, and the live host loaded it immediately (active plugin entry, one connector
+  per Agent). Model-driven calls through the real helper exercised apps,
+  task/window lifecycle, AX state, screenshot, visual_state, situation,
+  set_value, click (element and coordinates), scroll, drag and hover;
+  accessibility/screen-recording permissions and TCC attribution were verified.
+  Inputs without window-level delivery confirmation
+  (`type_text`/`key`/`paste`) correctly reject with `UNSAFE_WINDOW_DELIVERY`
+  instead of stealing focus. Evidence:
+  [`2026-11-15-dsh-real-profile-test.zh.md`](../../docs/implementation/2026-11-15-dsh-real-profile-test.zh.md).
+- The real-profile test found and fixed a task-receipt defect: DSH session
+  `tool/call` delivers tool arguments as a raw JSON string, which previously
+  dropped begin/bind lifecycle receipts and blocked the second task phase of one
+  host run with `SESSION_ROUTING_REQUIRED`. The bundle and lifecycle CLI now
+  normalize both shapes, with Node/Python regression tests.
 
 Not verified, and not claimed:
 
-- No installation into the user's real `desktop`/custom profile and no
-  model-driven end-to-end tool-call run were performed. Installation,
-  enablement and trust remain explicit user actions.
-- The signed helper's real execution and TCC attribution when launched by the
-  Harness process is not verified; the isolated check used a missing helper path.
+- The real Chrome extension channel was not connected in the user profile
+  (`BROWSER_HOST_UNAVAILABLE`). Browser tab assignment, mapping verification and
+  page operations in the real profile are not verified; enable QuietBridge
+  Browser in Chrome and grant the site permission to test them.
 - DSH preview host binding is not implemented yet; the native side still selects
   preview hosts from its historical host logic. Do not claim DSH preview support.
+- Screenshot/image tool results still reach the model as text plus a saved PNG
+  path, not through the attachment admission path.
 - Multi-Agent isolation is verified only in the isolated host: with 2-3 live
   agents each had its own connector and tools, stopping/disposing one left the
   others working, and a 4th agent degraded to no QuietBridge tools by the
-  capacity limit. Real user-profile/real-helper acceptance still is not
+  capacity limit. Real user-profile concurrency and long-running soak are not
   verified, so `supportsConcurrentAgents` remains `false` in the adapter
   metadata.
 

@@ -5,7 +5,7 @@ import assert from 'node:assert/strict'
 import path from 'node:path'
 import test from 'node:test'
 
-import { apply } from '../index.js'
+import { apply, __internals } from '../index.js'
 import {
 	makeAgent,
 	makeConfig,
@@ -225,6 +225,96 @@ test('tools/result forwards the structured task receipt with the matching turn',
 	assert.deepEqual(receipt.toolInput, { action: 'begin' })
 	assert.equal(receipt.toolResult.structuredContent.state, 'awaiting_window')
 	assert.equal(receipt.toolResult.structuredContent.taskId, 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee')
+})
+
+test('raw JSON string tool arguments still produce an object task receipt', async (t) => {
+	const { harness, agent, lifecycleLog } = await setup(t)
+	const sessionId = agent.agent.session.id
+	await waitFor(
+		() => readJsonLines(lifecycleLog).some((entry) => entry.event === 'agent-created'),
+		{ label: 'agent-created lifecycle event' },
+	)
+	emitSession(harness, agent, 'turn/start', { turn: 3 }, 1)
+	// DSH session events carry the raw JSON document, not a parsed object.
+	emitSession(
+		harness,
+		agent,
+		'tool/call',
+		{
+			turn: 3,
+			step: 1,
+			callId: 'call-string',
+			name: 'quietbridge_task',
+			arguments: '{"action":"begin","targetSurface":"desktop_app"}',
+		},
+		2,
+	)
+	emitSession(
+		harness,
+		agent,
+		'tool/result',
+		{
+			turn: 3,
+			step: 1,
+			message: {
+				source: { kind: 'tool', callId: 'call-string' },
+				content: [{ type: 'text', text: 'task begun' }],
+				isError: false,
+			},
+		},
+		3,
+	)
+	await waitFor(
+		() => readJsonLines(lifecycleLog).some((entry) => entry.event === 'tool-result'),
+		{ label: 'tool-result lifecycle event' },
+	)
+	const receipt = readJsonLines(lifecycleLog).find((entry) => entry.event === 'tool-result')
+	assert.equal(receipt.turnId, `${sessionId}:3`)
+	assert.deepEqual(receipt.toolInput, { action: 'begin', targetSurface: 'desktop_app' })
+})
+
+test('tools/result prefers parsed exec arguments over raw pending call arguments', async (t) => {
+	const { harness, agent, lifecycleLog } = await setup(t)
+	await waitFor(
+		() => readJsonLines(lifecycleLog).some((entry) => entry.event === 'agent-created'),
+		{ label: 'agent-created lifecycle event' },
+	)
+	emitSession(
+		harness,
+		agent,
+		'tool/call',
+		{ turn: 5, step: 1, callId: 'call-raw', name: 'quietbridge_task', arguments: '{"action":"bind"}' },
+		1,
+	)
+	harness.ctx.emit(
+		'tools/result',
+		{ agent: agent.agent, name: 'quietbridge_task', callId: 'call-raw', arguments: { action: 'bind' } },
+		{
+			isError: false,
+			content: [{ type: 'text', text: 'task bound' }],
+			value: {
+				content: [{ type: 'text', text: 'task bound' }],
+				structuredContent: {
+					state: 'bound',
+					taskId: 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee',
+					lease: { ownerId: 'ffffffff-0000-1111-2222-333333333333' },
+				},
+			},
+		},
+	)
+	await waitFor(
+		() => readJsonLines(lifecycleLog).some((entry) => entry.event === 'tool-result'),
+		{ label: 'task receipt lifecycle event' },
+	)
+	const receipt = readJsonLines(lifecycleLog).find((entry) => entry.event === 'tool-result')
+	assert.deepEqual(receipt.toolInput, { action: 'bind' })
+})
+
+test('parseToolArguments normalizes raw session JSON documents', () => {
+	assert.deepEqual(__internals.parseToolArguments('{"action":"begin","n":1}'), { action: 'begin', n: 1 })
+	assert.deepEqual(__internals.parseToolArguments({ action: 'begin' }), { action: 'begin' })
+	assert.deepEqual(__internals.parseToolArguments('not-json'), {})
+	assert.deepEqual(__internals.parseToolArguments(undefined), {})
 })
 
 test('agent/disposed writes the host session-end lifecycle event', async (t) => {

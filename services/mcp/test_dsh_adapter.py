@@ -670,6 +670,26 @@ class LifecycleTests(unittest.TestCase):
         self.assertEqual(turn['lastActivityAt'], 1001)
         self.assertEqual(lifecycle.binding(self.config, self.task), turn)
 
+    def test_tool_result_accepts_raw_json_string_arguments(self):
+        # DSH session events hand tool arguments over as one raw JSON document;
+        # the begin/bind receipt must survive that shape.
+        self.send('turn-start', now=1000, turnId=self.turn)
+        self.send('tool-result', now=1001, turnId=self.turn,
+                  toolName='quietbridge_task',
+                  toolInput=json.dumps({'action': 'begin', 'targetSurface': 'desktop_app'}),
+                  toolResult={'content': [{'type': 'text', 'text': json.dumps(self.task)}]})
+        turn = self.turns()[lifecycle.turn_key(self.session, self.agent, self.turn)]
+        self.assertEqual(turn['tasks'], {self.task['taskId']: self.task['lease']['ownerId']})
+
+    def test_tool_result_ignores_malformed_json_string_arguments(self):
+        self.send('turn-start', now=1000, turnId=self.turn)
+        self.send('tool-result', now=1001, turnId=self.turn,
+                  toolName='quietbridge_task', toolInput='{"action": ',
+                  toolResult={'content': [{'type': 'text', 'text': json.dumps(self.task)}]})
+        turn = self.turns()[lifecycle.turn_key(self.session, self.agent, self.turn)]
+        self.assertEqual(turn.get('tasks') or {}, {})
+        self.assertIsNone(turn.get('taskId'))
+
     def test_tool_result_without_usable_receipt_creates_nothing(self):
         receipts = [
             ('mcp__quietbridge__quietbridge_task', {'action': 'status'}, {'content': json.dumps(self.task)}),
