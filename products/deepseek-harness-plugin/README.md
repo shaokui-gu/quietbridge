@@ -49,6 +49,12 @@ the in-agent `plugin_manager install_bundle` flow:
 dsh plugin --profile <profile> add /path/to/quietbridge-dsh
 ```
 
+If the QuietBridge PKG is installed, the deployment step already rendered a
+ready-to-install bundle from the verified release:
+`~/Library/Application Support/QuietBridge/releases/<digest>/dsh-bundle`
+(recorded as `dshBundle.installCommand` in the deployment result; rendering
+failure never blocks the Workbuddy install). Install it with the same command.
+
 After the profile reloads, each new Harness Agent gets its own connector and the
 `quietbridge_*` tools. Start the helper/permissions, ask for a background window
 binding, and confirm the lifecycle store records that session's turns and task

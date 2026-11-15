@@ -35,6 +35,7 @@
     "19 quietbridge_* tools registered and visible on the agent scope",
     "real turn/start and turn/end session events bridged to the Python lifecycle store",
     "host-context routing allow (live turn) and deny (stopped turn)",
-    "agent-disposed lifecycle tombstone and connector cleanup"
+    "agent-disposed lifecycle tombstone and connector cleanup",
+    "PKG deployment renders the same bundle transactionally into releases/<digest>/dsh-bundle (packaging tests, not a real PKG install)"
   ]
 }

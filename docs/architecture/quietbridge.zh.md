@@ -9,7 +9,9 @@
 与并发验收仍未完成。证据见
 [DeepSeek Harness 宿主契约](dsh-host-contract.zh.md)、
 [隔离实机验证](../implementation/2026-11-15-dsh-isolated-verification.zh.md) 与
-[本轮实现记录](../implementation/2026-11-15-dsh-adaptation.zh.md)。
+[本轮实现记录](../implementation/2026-11-15-dsh-adaptation.zh.md)；PKG 部署会从已验证
+release 事务化渲染安装用的 DSH bundle（见
+[PKG deploy 记录](../implementation/2026-11-15-dsh-pkg-deploy.zh.md)）。
 
 ## 1. 产品与交付边界
 

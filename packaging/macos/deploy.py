@@ -111,6 +111,44 @@ def lifecycle_plan(home, connector, config):
     return workbuddy.lifecycle_plan(home, connector, config, checked=checked, read=read)
 
 
+def dsh_bundle_plan(release, bridge, helper, runtime, server_name='quietbridge'):
+    """Preview the DeepSeek Harness bundle derived from a verified release.
+
+    The bundle template ships inside the release bridge, so the plan is rendered
+    from the release copy and committed by the same user-file transaction as
+    every other deployed file. This host integration is optional: a missing or
+    malformed template returns an ``installed: False`` summary instead of
+    failing the Workbuddy package installation.
+    """
+    source = bridge.parent / 'adapters/deepseek_harness/bundle'
+    destination = release / 'dsh-bundle'
+    python = '/usr/bin/python3' if Path('/usr/bin/python3').is_file() else sys.executable
+    try:
+        # A rolled-back transaction removes its new files but leaves the derived
+        # directory tree behind. Clear only our own empty derived directory (a
+        # foreign bundle would carry a package.json) so a retry can render again.
+        if (destination.exists() and destination.is_dir()
+                and not (destination / 'package.json').is_file()):
+            if destination.name != 'dsh-bundle' or destination.parent != release:
+                raise ValueError('拒绝清理非派生的 bundle 目录：' + str(destination))
+            destination = checked(destination)
+            shutil.rmtree(destination)
+        from adapters.deepseek_harness import configuration as dsh
+        plan = dsh.bundle_render(source, destination, python=python, connector=bridge,
+                                 helper=helper, config_dir=runtime, server_name=server_name,
+                                 apply=False)
+        files = []
+        for relative in plan['files']:
+            target = destination / relative
+            data = (plan['patch'].encode('utf-8') if relative == dsh.PATCH_FILE
+                    else (source / relative).read_bytes())
+            files.append((target, read(target), data, 0o600))
+    except (ImportError, OSError, ValueError) as error:
+        return [], {'installed': False, 'reason': str(error)}
+    return files, {'installed': True, 'path': str(destination), 'files': len(plan['files']),
+                   'installCommand': 'dsh plugin --profile <profile> add ' + str(destination)}
+
+
 def preflight(home, upgrade=None):
     if sys.version_info < (3, 9):
         raise ValueError('需要 Python 3.9 或更高版本')
@@ -702,6 +740,11 @@ def deploy(home, helper, app=APP, support=SUPPORT, service=None, upgrade=None):
                                'RunAtLoad': False, 'KeepAlive': False, 'ProcessType': 'Interactive',
                                'LimitLoadToSessionType': 'Aqua'})
     files.append((agent, old_agent, agent_data, 0o644))
+    # Render the optional DeepSeek Harness bundle from the already verified
+    # release and add it to the same transaction. Failure here is recorded, not
+    # raised: the Workbuddy package install remains the primary contract.
+    dsh_files, dsh_summary = dsh_bundle_plan(release, bridge, helper, runtime)
+    files.extend(dsh_files)
     # Publish last: a running connector only sees a fully committed file set.
     files.append((manifest, read(manifest), active, 0o600))
     # Create the runtime state directory expected by the native host.
@@ -710,6 +753,7 @@ def deploy(home, helper, app=APP, support=SUPPORT, service=None, upgrade=None):
     transactions.mkdir(parents=True, exist_ok=True, mode=0o700)
     directory = Path(tempfile.mkdtemp(prefix=datetime.datetime.now().strftime('%Y%m%d-%H%M%S-'), dir=transactions))
     transaction = Transaction(directory, files, extension, release / 'extension')
+    transaction.values['dshBundle'] = dsh_summary
     service = service or MenuBarService(home)
     was_running = upgrade['wasRunning'] if upgrade is not None else service.is_running()
     transaction.values['wasRunning'] = was_running
@@ -804,7 +848,7 @@ def deploy(home, helper, app=APP, support=SUPPORT, service=None, upgrade=None):
     transaction.save()
     return {'installed': True, 'version': menu_info['CFBundleShortVersionString'],
             'helper': str(helper), 'journal': str(transaction.journal), 'startupVerified': was_running,
-            'connectorUpdate': connection}
+            'connectorUpdate': connection, 'dshBundle': dsh_summary}
 
 
 def main():

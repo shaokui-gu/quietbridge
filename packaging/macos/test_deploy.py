@@ -5,6 +5,8 @@ import os
 from pathlib import Path
 import plistlib
 import queue
+import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -489,6 +491,136 @@ class DeploymentTests(unittest.TestCase):
         self.assertEqual(self.config.read_bytes(), json.dumps(data, ensure_ascii=False, indent=2).encode() + b'\n')
         self.assertEqual(again['helper'], outcome['helper'])
         self.assertEqual(len(list((self.runtime / 'releases').glob('[!.]*'))), 1)
+
+    def test_deploy_renders_dsh_bundle_from_the_verified_release(self):
+        outcome = self.install(FakeService())
+        summary = outcome['dshBundle']
+        self.assertTrue(summary['installed'], summary)
+        self.assertEqual(summary['files'], 7)
+        bundle = self.dsh_bundle(outcome)
+        self.assertEqual(bundle.parent.parent, self.runtime / 'releases')
+        self.assertEqual(json.loads((bundle / 'package.json').read_bytes())['name'], '@quietbridge/dsh')
+        self.assertEqual({path.relative_to(bundle).as_posix() for path in bundle.rglob('*') if path.is_file()},
+                         {'README.md', 'cordis.patch.yml', 'icon.svg', 'index.js', 'locale/en.json',
+                          'locale/zh.json', 'package.json'})
+        connector = bundle.parent / 'QuietBridge.app/Contents/Resources/bridge/server.py'
+        self.assertTrue(connector.is_file())
+        config = self.dsh_config(bundle)
+        self.assertEqual(config['connector'], str(connector))
+        self.assertEqual(config['helper'], str(self.helper))
+        self.assertEqual(config['configDir'], str(self.runtime))
+        self.assertEqual(config['serverName'], 'quietbridge')
+        self.assertEqual(config['python'], self.dsh_python())
+        self.assertTrue(Path(config['python']).is_absolute())
+        self.assertEqual(summary['installCommand'], 'dsh plugin --profile <profile> add ' + str(bundle))
+        journal = json.loads(Path(outcome['journal']).read_bytes())
+        self.assertEqual(journal['phase'], 'committed')
+        self.assertEqual(journal['dshBundle'], summary)
+        tracked = {item['path'] for item in journal['files']}
+        self.assertIn(str(bundle / 'cordis.patch.yml'), tracked)
+        for path in bundle.rglob('*'):
+            if path.is_file():
+                self.assertEqual(path.stat().st_mode & 0o777, 0o600, path)
+
+    def test_repeated_deploy_keeps_the_rendered_dsh_bundle_idempotent(self):
+        first = self.install(FakeService())
+        bundle = self.dsh_bundle(first)
+        before = {path.relative_to(bundle).as_posix(): path.read_bytes()
+                  for path in bundle.rglob('*') if path.is_file()}
+        second = self.install(FakeService())
+        self.assertTrue(second['dshBundle']['installed'])
+        self.assertEqual(second['dshBundle']['path'], first['dshBundle']['path'])
+        after = {path.relative_to(bundle).as_posix(): path.read_bytes()
+                 for path in bundle.rglob('*') if path.is_file()}
+        self.assertEqual(after, before)
+        journal = json.loads(Path(second['journal']).read_bytes())
+        self.assertEqual(journal['phase'], 'committed')
+        self.assertEqual(journal['dshBundle'], second['dshBundle'])
+
+    def test_missing_dsh_template_reports_failure_without_blocking_install(self):
+        shutil.rmtree(self.app / 'Contents/Resources/bridge/adapters/deepseek_harness/bundle')
+        outcome = self.install(FakeService())
+        self.assertTrue(outcome['installed'])
+        summary = outcome['dshBundle']
+        self.assertFalse(summary['installed'])
+        self.assertTrue(summary['reason'])
+        self.assertNotIn('path', summary)
+        self.assertEqual(list((self.runtime / 'releases').glob('*/dsh-bundle')), [])
+        journal = json.loads(Path(outcome['journal']).read_bytes())
+        self.assertEqual(journal['phase'], 'committed')
+        self.assertEqual(journal['dshBundle'], summary)
+        entry = json.loads(self.config.read_bytes())['mcpServers']['quietbridge']
+        self.assertEqual(entry['args'][-1], str(self.runtime / 'connector/connector.py'))
+        self.assertTrue((self.extension / 'popup.html').is_file())
+
+    def test_broken_dsh_package_json_reports_failure_without_blocking_install(self):
+        (self.app / 'Contents/Resources/bridge/adapters/deepseek_harness/bundle/package.json'
+         ).write_text('{not json')
+        outcome = self.install(FakeService())
+        self.assertTrue(outcome['installed'])
+        self.assertFalse(outcome['dshBundle']['installed'])
+        self.assertIn('package.json', outcome['dshBundle']['reason'])
+        self.assertEqual(list((self.runtime / 'releases').glob('*/dsh-bundle')), [])
+
+    def test_rollback_removes_new_dsh_bundle_files_with_the_transaction(self):
+        original = self.config.read_bytes()
+        apply = deploy.Transaction.apply
+        def fail_after_apply(transaction):
+            apply(transaction)
+            raise RuntimeError('simulated dsh commit failure')
+        with patch.object(deploy.Transaction, 'apply', fail_after_apply):
+            with self.assertRaisesRegex(RuntimeError, 'simulated dsh commit failure'):
+                self.install(FakeService())
+        self.assertEqual(self.config.read_bytes(), original)
+        bundles = list((self.runtime / 'releases').glob('*/dsh-bundle'))
+        self.assertEqual(len(bundles), 1)
+        self.assertEqual([path for path in bundles[0].rglob('*') if path.is_file()], [],
+                         'the rolled-back derived bundle must not keep rendered files')
+        journal = next((self.runtime / 'transactions').glob('*/journal.json'))
+        self.assertEqual(json.loads(journal.read_bytes())['phase'], 'rolled-back')
+
+    def test_reinstall_after_a_rolled_back_commit_renders_the_dsh_bundle_again(self):
+        apply = deploy.Transaction.apply
+        def fail_after_apply(transaction):
+            apply(transaction)
+            raise RuntimeError('simulated interrupted commit')
+        with patch.object(deploy.Transaction, 'apply', fail_after_apply):
+            with self.assertRaisesRegex(RuntimeError, 'simulated interrupted commit'):
+                self.install(FakeService())
+        residue = list((self.runtime / 'releases').glob('*/dsh-bundle'))
+        self.assertEqual(len(residue), 1)
+        self.assertFalse((residue[0] / 'package.json').exists())
+        self.assertEqual([path for path in residue[0].rglob('*') if path.is_file()], [])
+        outcome = self.install(FakeService())
+        summary = outcome['dshBundle']
+        self.assertTrue(summary['installed'], summary)
+        self.assertEqual(summary['files'], 7)
+        bundle = self.dsh_bundle(outcome)
+        self.assertEqual(bundle, residue[0])
+        self.assertTrue((bundle / 'package.json').is_file())
+        self.assertEqual({path.relative_to(bundle).as_posix()
+                          for path in bundle.rglob('*') if path.is_file()},
+                         {'README.md', 'cordis.patch.yml', 'icon.svg', 'index.js', 'locale/en.json',
+                          'locale/zh.json', 'package.json'})
+
+    def dsh_bundle(self, outcome):
+        summary = outcome['dshBundle']
+        self.assertTrue(summary['installed'], summary)
+        bundle = Path(summary['path'])
+        self.assertEqual(bundle.name, 'dsh-bundle')
+        self.assertTrue(bundle.is_dir())
+        return bundle
+
+    @staticmethod
+    def dsh_python():
+        return '/usr/bin/python3' if Path('/usr/bin/python3').is_file() else sys.executable
+
+    def dsh_config(self, bundle):
+        text = (bundle / 'cordis.patch.yml').read_text()
+        self.assertNotIn('!!js process.env', text)
+        match = re.search(r'^[ \t]*config:[ \t]*(\{.*\})[ \t]*$', text, re.M)
+        self.assertIsNotNone(match, text)
+        return json.loads(match.group(1))
 
     def test_commit_failure_restores_all_user_components(self):
         original, agent = self.config.read_bytes(), self.agent.read_bytes()

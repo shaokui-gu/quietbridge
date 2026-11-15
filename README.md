@@ -71,7 +71,9 @@ python3 install.py --install --dsh-bundle /path/to/rendered-bundle \
   --dsh-helper '/Applications/QuietBridge.app/Contents/MacOS/quietbridge-native'
 ```
 
-Installing that directory into a Harness profile stays an explicit action
+A normal PKG installation also renders that bundle automatically from the
+verified release (see [PKG deploy record](docs/implementation/2026-11-15-dsh-pkg-deploy.zh.md)).
+Installing it into a Harness profile stays an explicit action
 (`dsh plugin --profile <profile> add <dir>` or the host's
 `plugin_manager install_bundle`). See
 [`products/deepseek-harness-plugin`](products/deepseek-harness-plugin/README.md),

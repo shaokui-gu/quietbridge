@@ -116,3 +116,9 @@ DSH Host 进程
 Agent 释放写入 `sessionEnded` 墓碑并清理连接器。完整证据、限制与复现方式见
 [DSH 隔离 profile 实机验证](2026-11-15-dsh-isolated-verification.zh.md)，
 仓库脚本 `env -u DSH_HOME -u PYTHONPATH python3 tools/dsh_isolated_check.py` 可一键复现（约 12 秒）。
+
+## 7. 补充（同日）：接入 PKG 部署
+
+`packaging/macos/deploy.py` 现在会从已验证 release 内模板渲染 DSH bundle 到
+`releases/<digest>/dsh-bundle`，与其它用户文件同一事务提交/回滚；渲染失败只降级记录，
+不阻断主安装。验证与限制见 [DSH bundle 接入 PKG 用户部署](2026-11-15-dsh-pkg-deploy.zh.md)。

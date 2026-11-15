@@ -19,7 +19,7 @@ def bridge_sources(root):
     # checkout. Runtime files only: tests, caches and editor droppings stay out.
     bundle = root / 'adapters/deepseek_harness/bundle'
     if bundle.is_dir():
-        for suffix in ('.js', '.json', '.yml', '.yaml', '.svg'):
+        for suffix in ('.js', '.json', '.yml', '.yaml', '.svg', '.md'):
             for path in sorted(bundle.rglob('*' + suffix)):
                 relative = path.relative_to(bundle)
                 if '__pycache__' in path.parts or any(part == 'test' or part == 'tests'
