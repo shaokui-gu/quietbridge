@@ -268,8 +268,9 @@ def dsh_bundle(root, home, destination, *, apply=False, connector=None, helper=N
                          apply=apply)
     plan['mode'] = 'install' if apply else 'preview'
     plan['profileChanged'] = False
-    plan['next'] = ('用 DeepSeek Harness 的 plugin_manager install_bundle 安装该目录，'
-                    '再按需启用/信任；本脚本不修改 ~/.dsh/profiles。')
+    plan['next'] = ('安装该目录：dsh plugin --profile <profile> add <目录>（官方 CLI，'
+                    '会写入 link 依赖与 dsh.profile.bundles）或用宿主 plugin_manager '
+                    'install_bundle；本脚本不修改 ~/.dsh。')
     plan['limitations'] = ['未写入或启用 DSH profile，安装与启用仍需用户显式操作',
                            'DSH 由签名 helper 承担的 TCC 归属尚未核实',
                            '本轮不宣称 DSH 预览可用；原生宿主窗口绑定是后续工作']

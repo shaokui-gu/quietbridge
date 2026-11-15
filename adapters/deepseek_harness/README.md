@@ -42,10 +42,14 @@ QuietBridge for DeepSeek Harness 的 Python 适配层。本轮只实现仓库内
   模板里的默认值经 `!!js` 读取 `QUIETBRIDGE_DSH_PYTHON`、`QUIETBRIDGE_DSH_CONNECTOR`、
   `QUIETBRIDGE_DSH_HELPER`、`QUIETBRIDGE_DSH_CONFIG_DIR`、`QUIETBRIDGE_DSH_SERVER_NAME`；
   `bundle_render` 会把它们替换为具体值。
-- 安装流程由部署侧决定（例如 `install.py --dsh-bundle <目录>`，默认预览、加 `--install` 才写盘）：先
-  `bundle_render(..., apply=True)` 写入目标
-  目录，再 `profile_plan(<profile>, <目标目录>)` 得到 profile 的待写入内容并自行事务化提交。
-- 本轮**不**把任何内容写入 `~/.dsh/profiles/*`；真实 profile 安装属于后续经过验收的发布步骤。
+- 仓库安装器负责渲染目录：`python3 install.py --install --dsh-bundle <目录> --dsh-helper <helper>`
+  （默认预览；`bundle_render(..., apply=True)` 才写目标目录）。写入 profile 由官方 CLI 完成：
+  `dsh plugin --profile <profile> add <目录>`（自动写 link 依赖、`dsh.profile.bundles` 与 patch）。
+  `profile_plan()` 只生成等价计划，供需要手工事务化时预览，本仓库不自动写 `~/.dsh`。
+- 2026-11-15 已在隔离 `DSH_HOME`/profile 中完成实机验证（bundle 安装、宿主启动、Agent 工具注册、
+  turn 生命周期与宿主上下文路由放行/拒绝），见
+  [隔离验证记录](../../docs/implementation/2026-11-15-dsh-isolated-verification.zh.md)；
+  真实用户 profile、helper 权限/TCC、预览与并发仍未验收。
 
 ## 与 services/mcp 的关系
 

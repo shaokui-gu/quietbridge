@@ -6,10 +6,12 @@ current Space. Native operations use an explicitly shared target window;
 browser operations use the extension and never fall back to desktop input.
 
 The product has one macOS application, one browser extension and separate host
-integrations. Workbuddy is implemented. DeepSeek Harness now has a source-level
-adapter and bundle (not installed or end-to-end verified); concurrent agent
-workers and DSH preview host binding are still planned. The current runtime
-still has one active task and preview.
+integrations. Workbuddy is implemented. DeepSeek Harness has a source-level
+adapter and bundle, verified in an isolated DSH profile (bundle installation,
+Agent tool registration, turn lifecycle and host-context routing). It is not
+installed into the user's profile; concurrent agent workers and DSH preview host
+binding are still planned. The current runtime still has one active task and
+preview.
 
 ## Repository
 
@@ -43,6 +45,11 @@ python3 -m unittest discover -s packaging/macos -p 'test_*.py' -q
 python3 -m unittest discover -s system/authorization-plugin/tests -p 'test_install.py' -q
 node --test extensions/chromium/*.test.mjs
 node --test adapters/deepseek_harness/bundle/test/*.test.mjs
+
+# Optional, requires the installed DeepSeek Harness app. Uses a temporary
+# DSH_HOME/profile and never touches ~/.dsh. Inside a DSH shell (which exports
+# a real DSH_HOME) clear it first; the script refuses an inherited real home.
+env -u DSH_HOME -u PYTHONPATH python3 tools/dsh_isolated_check.py
 ```
 
 The executable is `apps/macos/.build/release/quietbridge-native`. Build the
@@ -64,10 +71,12 @@ python3 install.py --install --dsh-bundle /path/to/rendered-bundle \
   --dsh-helper '/Applications/QuietBridge.app/Contents/MacOS/quietbridge-native'
 ```
 
-Installing that directory into a Harness profile stays an explicit
-`plugin_manager install_bundle` action. See
-[`products/deepseek-harness-plugin`](products/deepseek-harness-plugin/README.md)
-and [`dsh-host-contract.zh.md`](docs/architecture/dsh-host-contract.zh.md).
+Installing that directory into a Harness profile stays an explicit action
+(`dsh plugin --profile <profile> add <dir>` or the host's
+`plugin_manager install_bundle`). See
+[`products/deepseek-harness-plugin`](products/deepseek-harness-plugin/README.md),
+[`dsh-host-contract.zh.md`](docs/architecture/dsh-host-contract.zh.md) and the
+[isolated verification record](docs/implementation/2026-11-15-dsh-isolated-verification.zh.md).
 
 ## Architecture and compatibility
 

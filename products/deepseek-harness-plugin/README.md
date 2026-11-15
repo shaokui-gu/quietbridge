@@ -40,17 +40,31 @@ python3 install.py --dsh-bundle /path/to/quietbridge-dsh --dsh-helper '/Applicat
 python3 install.py --install --dsh-bundle /path/to/quietbridge-dsh --dsh-helper '/Applications/QuietBridge.app/Contents/MacOS/quietbridge-native'
 ```
 
-Then install the rendered directory through the Harness profile that should use
-it (this step is intentionally explicit; it changes the profile):
+Then install the rendered directory into the Harness profile that should use it.
+This step is intentionally explicit because it changes that profile; the official
+CLI performs the same link dependency, bundle selection and patch application as
+the in-agent `plugin_manager install_bundle` flow:
 
-```
-plugin_manager action=install_bundle target=/path/to/quietbridge-dsh
+```sh
+dsh plugin --profile <profile> add /path/to/quietbridge-dsh
 ```
 
 After the profile reloads, each new Harness Agent gets its own connector and the
-`quietbridge_*` tools. Verify a real session before claiming support: start the
-helper/permissions, ask for a background window binding, and confirm the
-lifecycle store records that session's turns and task receipts.
+`quietbridge_*` tools. Start the helper/permissions, ask for a background window
+binding, and confirm the lifecycle store records that session's turns and task
+receipts before claiming support.
+
+The repository also ships an isolated reproduction check that never touches the
+user's `~/.dsh`:
+
+```sh
+env -u DSH_HOME -u PYTHONPATH python3 tools/dsh_isolated_check.py
+```
+
+It creates a temporary `web` profile, installs the rendered bundle through
+`dsh plugin add`, boots the real host, and asserts 19 per-Agent tools, the turn
+lifecycle, routing allow/deny and the disposal tombstone. It skips cleanly when
+the Harness app is absent and never starts the real helper.
 
 ## Verified scope and current limits
 
@@ -61,13 +75,21 @@ Verified in this repository round (source-level):
   [`dsh-host-contract.zh.md`](../../docs/architecture/dsh-host-contract.zh.md).
 - Bundles render deterministically; Python adapter, per-Agent routing and the
   connector wire protocol have unit tests.
+- **Isolated real-host verification passed**: in a temporary `DSH_HOME`/profile,
+  `dsh plugin add` installed the rendered bundle, the host booted, the plugin
+  activated, one Agent got 19 `quietbridge_*` tools from its own connector, a
+  real turn's start/end reached the lifecycle store, host-context routing allowed
+  a live-turn call and rejected a stopped-turn call, and Agent disposal wrote the
+  tombstone. Evidence:
+  [`2026-11-15-dsh-isolated-verification.zh.md`](../../docs/implementation/2026-11-15-dsh-isolated-verification.zh.md).
 
 Not verified, and not claimed:
 
-- No live profile installation and no end-to-end Harness run were performed.
-  Installation, enablement and trust remain explicit user actions.
-- The signed helper's TCC attribution when launched by the Harness process is
-  not verified.
+- No installation into the user's real `desktop`/custom profile and no
+  model-driven end-to-end tool-call run were performed. Installation,
+  enablement and trust remain explicit user actions.
+- The signed helper's real execution and TCC attribution when launched by the
+  Harness process is not verified; the isolated check used a missing helper path.
 - DSH preview host binding is not implemented yet; the native side still selects
   preview hosts from its historical host logic. Do not claim DSH preview support.
 - Multiple concurrent Harness Agents are not accepted as verified; the shared

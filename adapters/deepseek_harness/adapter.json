@@ -1,19 +1,40 @@
 {
   "id": "deepseek-harness",
-  "status": "implemented-source-unverified-live",
+  "status": "implemented-isolated-verified",
   "transport": "per-agent-stdio-jsonrpc",
   "serverName": "quietbridge",
-  "configuration": "DSH profile cordis.patch.yml bundle row; installed only via plugin_manager install_bundle",
+  "configuration": "DSH profile bundle row; installed with `dsh plugin --profile <name> add <dir>` (link dependency + dsh.profile.bundles) or the host plugin_manager install_bundle flow",
   "hostVersionVerified": "0.2.2-alpha.2",
   "contractEvidence": "docs/architecture/dsh-host-contract.zh.md",
-  "lifecycleEvents": ["agent/created", "agent/disposed", "turn/start", "turn/end", "tool/result"],
-  "trustedContext": ["QUIETBRIDGE_HOST", "QUIETBRIDGE_HOST_SESSION_ID", "QUIETBRIDGE_HOST_AGENT_ID"],
+  "lifecycleEvents": [
+    "agent/created",
+    "agent/disposed",
+    "turn/start",
+    "turn/end",
+    "tool/result"
+  ],
+  "trustedContext": [
+    "QUIETBRIDGE_HOST",
+    "QUIETBRIDGE_HOST_SESSION_ID",
+    "QUIETBRIDGE_HOST_AGENT_ID"
+  ],
   "supportsConcurrentAgents": false,
   "blockingRequirements": [
-    "Live profile installation and end-to-end Harness Agent run not performed (install_bundle, first-turn tools/list, turn/end lifecycle, cancel propagation)",
-    "Native DSH preview host window binding unimplemented: no public Host API exposes the Harness window or preview anchor",
-    "Signed helper TCC attribution when the helper is launched by the Harness process is unverified",
-    "Concurrent DSH Agents (per-Agent connectors, isolation, capacity 3) not accepted as verified",
-    "Screenshot/image tool results reach the model only through the attachment admission path; currently text-only fallback"
+    "Real user profile installation and acceptance (desktop or custom) not performed; only an isolated DSH_HOME profile was verified",
+    "Real helper execution and TCC attribution under the Harness process unverified; the isolated check used a deliberately missing helper path",
+    "Native DSH preview host window binding unimplemented; DSH preview support is not claimed",
+    "Concurrent DSH Agents not accepted as verified (capacity 3, extra agents refused by design)",
+    "Screenshot/image tool results reach the model only through the attachment admission path; currently text-only fallback",
+    "Model-driven real tool-call turn not verified (the isolated profile has no model credentials; the turn ended with an error)"
+  ],
+  "verificationEvidence": "docs/implementation/2026-11-15-dsh-isolated-verification.zh.md",
+  "verifiedScope": [
+    "bundle install via official DSH CLI into an isolated DSH_HOME profile",
+    "host plugin activation in a real Harness boot",
+    "per-agent connector startup with host-injected trusted env identity",
+    "19 quietbridge_* tools registered and visible on the agent scope",
+    "real turn/start and turn/end session events bridged to the Python lifecycle store",
+    "host-context routing allow (live turn) and deny (stopped turn)",
+    "agent-disposed lifecycle tombstone and connector cleanup"
   ]
 }

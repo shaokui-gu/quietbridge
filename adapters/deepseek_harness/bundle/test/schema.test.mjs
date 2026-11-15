@@ -2,12 +2,17 @@
  * Unit tests for schema downgrade, config validation, and result normalization.
  */
 import assert from 'node:assert/strict'
-import { existsSync } from 'node:fs'
+import { existsSync, rmSync } from 'node:fs'
+import { randomUUID } from 'node:crypto'
+import os from 'node:os'
 import path from 'node:path'
 import test from 'node:test'
 
+import { makeConfig, makeHarness } from './helpers.mjs'
+
 import {
 	__internals,
+	apply,
 	isValidToolName,
 	mapTurnReason,
 	normalizeMcpContent,
@@ -160,4 +165,16 @@ test('renderToolResult falls back to structured content and bounds huge text', (
 	const huge = renderToolResult({ content: [{ type: 'text', text: 'x'.repeat(300000) }] }, 'quietbridge_task')
 	assert.ok(huge[0].text.length <= 256 * 1024 + 32)
 	assert.ok(huge[0].text.includes('[结果过长，已截断]'))
+})
+
+test('apply creates the config directory before connector or lifecycle writes', () => {
+	const configDir = path.join(os.tmpdir(), `qb-cfg-${randomUUID()}`)
+	assert.equal(existsSync(configDir), false)
+	const harness = makeHarness()
+	try {
+		apply(harness.ctx, makeConfig(configDir))
+		assert.equal(existsSync(configDir), true)
+	} finally {
+		rmSync(configDir, { recursive: true, force: true })
+	}
 })

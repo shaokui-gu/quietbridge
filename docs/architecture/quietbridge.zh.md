@@ -3,9 +3,12 @@
 更新日期：2026-11-15（北京时间）。本文件为项目整体方案入口。
 
 2026-11-15 补充：DeepSeek Harness 适配已在仓库内完成源码级实现（契约文档、
-每 Agent 连接器适配器、可渲染 bundle 与路由支持），尚未安装进任何 DSH profile，
-也未做真实宿主端到端验收；未验证范围见
-[DeepSeek Harness 宿主契约](dsh-host-contract.zh.md) 与
+每 Agent 连接器适配器、可渲染 bundle 与路由支持），并已在**隔离 DSH_HOME/profile**
+中完成实机验证（bundle 安装、真实宿主启动、每 Agent 19 个工具注册、turn 生命周期、
+宿主上下文路由放行/拒绝）；尚未安装进用户真实 profile，helper 权限/TCC、DSH 预览
+与并发验收仍未完成。证据见
+[DeepSeek Harness 宿主契约](dsh-host-contract.zh.md)、
+[隔离实机验证](../implementation/2026-11-15-dsh-isolated-verification.zh.md) 与
 [本轮实现记录](../implementation/2026-11-15-dsh-adaptation.zh.md)。
 
 ## 1. 产品与交付边界
@@ -17,7 +20,7 @@
 | 原生可执行文件 / Swift 模块 | `quietbridge-native` / `QuietBridgeNative` | 已迁移 |
 | 浏览器扩展 | **QuietBridge Browser** | 一份 Chromium MV3 扩展 |
 | Workbuddy 产品 | **QuietBridge for Workbuddy** | MCP 接入、升级入口和停止 hooks 已实现 |
-| DeepSeek Harness 产品 | **QuietBridge for DeepSeek Harness** | 源码级适配器与可渲染 bundle 已实现；未安装、未端到端验收，预览宿主绑定待原生侧 |
+| DeepSeek Harness 产品 | **QuietBridge for DeepSeek Harness** | 适配器与 bundle 已实现并在隔离 DSH profile 实机验证；未装入用户 profile，helper 权限/TCC、预览宿主绑定与并发待验收 |
 
 一台 Mac 共用一个应用、一套系统权限、一份浏览器扩展。两个市场包分别
 遵守各宿主规范，复用核心实现。市场元数据目录中的 `product.json` 为内部
@@ -98,9 +101,10 @@ connector 的宿主环境身份路由；不从模型参数、前台窗口或最�
 机制变成并行实现**；不同 Agent 同时执行、同时共享仍按下面阶段推进。
 
 DSH 侧已完成源码级适配：契约核验、每 Agent 独立 connector 的宿主环境身份
-路由、turn/Agent 停止事件联动和可渲染 bundle（2026-11-15）。它不改变上述
-核心限制：DSH profile 未被安装或启用，真实宿主端到端、签名 helper 的 TCC
-归属、DSH 预览宿主窗口绑定与多 Agent 并行仍未验收，不能据此宣称可发布。
+路由、turn/Agent 停止事件联动和可渲染 bundle，并已在隔离 DSH_HOME/profile
+实机验证安装、启动、工具注册与路由（2026-11-15）。它不改变上述核心限制：
+用户真实 profile 未被修改，签名 helper 的真实 TCC 归属、DSH 预览宿主窗口绑定、
+模型驱动的真实工具调用与多 Agent 并行仍未验收，不能据此宣称可发布。
 
 ## 5. 一个应用、多个宿主、每 Agent 隔离
 
@@ -203,7 +207,7 @@ PKG 装配先构建公共代码，再组装同一 App 和扩展。用户文件�
 | 阶段 | 交付 | 验收要求 |
 | --- | --- | --- |
 | 0：品牌与源码边界 | 本次目录迁移、名称、适配抽离、统一装配与文档 | 核心/安装/扩展测试、Swift 编译及符号检查通过 |
-| 1：宿主契约验证 | Workbuddy/DSH 真实 Agent 身份、取消和宿主窗口证据 | 并发主/子 Agent 每次调用可唯一归属；API 缺口明确记录（DSH 已完成源码级契约核验，真实宿主与窗口证据未完成） |
+| 1：宿主契约验证 | Workbuddy/DSH 真实 Agent 身份、取消和宿主窗口证据 | 并发主/子 Agent 每次调用可唯一归属；API 缺口明确记录（DSH 已完成契约核验与隔离 profile 实机验证；真实用户 profile、helper 权限与窗口证据未完成） |
 | 2：隔离运行时 | Broker、每 Agent Worker、私有状态、目标写租约和停止代次 | A 停止、AX 卡死或 Worker 崩溃不撤销 B；旧结果不能复活任务 |
 | 3：扩展分路 | 多任务协议、独立标签队列、结果与弹窗归属 | 并行网页任务不串页，结束一项不解除另一项 CDP |
 | 4：多共享界面 | 先 Figma 再实现会话面板、多预览、单项停止与全局退出 | 四路预览可辨认、不重叠，独立收起和停止 |

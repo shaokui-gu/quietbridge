@@ -7,6 +7,6 @@
   "serverName": "quietbridge",
   "entrypoint": "adapters/deepseek_harness/bundle",
   "distribution": "shared-macos-pkg",
-  "status": "implemented-source",
+  "status": "implemented-isolated-verified",
   "marketManifestStatus": "unverified"
 }

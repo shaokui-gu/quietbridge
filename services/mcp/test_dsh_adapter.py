@@ -27,6 +27,36 @@ TEMPLATE_PATCH = """\
         serverName: !!js process.env.QUIETBRIDGE_DSH_SERVER_NAME || 'quietbridge'
 """
 
+# Captured shape of a real desktop profile written by `dsh plugin add` (paths
+# anonymised): the CLI adds a dependency and selects the bundle in
+# dsh.profile.bundles while keeping every existing dependency and selection.
+# QuietBridge is not selected yet, so planning must append it last.
+CLI_PROFILE_PACKAGE_JSON = """\
+{
+  "name": "dsh-profile-desktop",
+  "private": true,
+  "dependencies": {
+    "@deepseek-ai/dsh-cua-bundle": "0.2.2-alpha.2",
+    "@local/cua-native-helper-config": "link:/opt/fixtures/cua-helper-config",
+    "dsh-figma-mcp": "file:/opt/fixtures/dsh-figma-mcp-0.1.0.tgz"
+  },
+  "dsh": {
+    "profile": {
+      "bundles": [
+        "@deepseek-ai/dsh-base",
+        "@deepseek-ai/dsh-web-app",
+        "@deepseek-ai/dsh-experimental-auto-review",
+        "@deepseek-ai/dsh-experimental-agent-team-profile",
+        "@deepseek-ai/dsh-experimental-tool-worktree",
+        "@deepseek-ai/dsh-experimental-cot-translation-bundle",
+        "@deepseek-ai/dsh-experimental-session-titles-bundle",
+        "@deepseek-ai/dsh-cua-bundle"
+      ]
+    }
+  }
+}
+"""
+
 
 def make_template(base):
     source = base / 'bundle'
@@ -250,7 +280,8 @@ class ProfilePlanTests(unittest.TestCase):
         self.assertEqual(data['dependencies'][PACKAGE_NAME],
                          'link:' + str(self.bundle.resolve()))
         self.assertEqual(data['dependencies']['left-pad'], '1.3.0')
-        self.assertEqual(data['dsh'], {'profile': {'bundles': ['@deepseek-ai/dsh-base']}})
+        self.assertEqual(data['dsh'], {'profile': {'bundles': [
+            '@deepseek-ai/dsh-base', PACKAGE_NAME]}})
         self.assertTrue(plan['packageJson'][2].endswith(b'\n'))
 
         rendered = plan['patch'][2].decode()
@@ -271,6 +302,120 @@ class ProfilePlanTests(unittest.TestCase):
         self.assertEqual(list(data['dependencies']), ['alpha', PACKAGE_NAME, 'omega'])
         self.assertEqual(data['dependencies'][PACKAGE_NAME],
                          'link:' + str(self.bundle.resolve()))
+
+    def test_missing_dsh_section_is_created(self):
+        self.write_package({'name': 'dsh-profile-desktop',
+                            'dependencies': {'left-pad': '1.3.0'}})
+        plan = configuration.profile_plan(self.profile, self.bundle)
+        data = json.loads(plan['packageJson'][2])
+        self.assertEqual(list(data['dependencies']), ['left-pad', PACKAGE_NAME])
+        self.assertEqual(data['dsh'], {'profile': {'bundles': [PACKAGE_NAME]}})
+
+    def test_missing_profile_section_keeps_other_dsh_keys(self):
+        self.write_package({
+            'name': 'dsh-profile-desktop', 'dependencies': {},
+            'dsh': {'bundle': {'patch': './cordis.patch.yml'}},
+        })
+        plan = configuration.profile_plan(self.profile, self.bundle)
+        data = json.loads(plan['packageJson'][2])
+        self.assertEqual(data['dsh'], {
+            'bundle': {'patch': './cordis.patch.yml'},
+            'profile': {'bundles': [PACKAGE_NAME]},
+        })
+
+    def test_missing_bundles_list_is_created_beside_other_profile_keys(self):
+        self.write_package({
+            'name': 'dsh-profile-desktop', 'dependencies': {},
+            'dsh': {'profile': {'theme': 'dark'}},
+        })
+        plan = configuration.profile_plan(self.profile, self.bundle)
+        data = json.loads(plan['packageJson'][2])
+        self.assertEqual(data['dsh']['profile']['theme'], 'dark')
+        self.assertEqual(data['dsh']['profile']['bundles'], [PACKAGE_NAME])
+
+    def test_cli_shaped_profile_appends_bundle_selection_last(self):
+        fixture_path = self.profile / 'package.json'
+        fixture_path.write_text(CLI_PROFILE_PACKAGE_JSON)
+        fixture = json.loads(CLI_PROFILE_PACKAGE_JSON)
+        plan = configuration.profile_plan(self.profile, self.bundle)
+        data = json.loads(plan['packageJson'][2])
+
+        self.assertEqual(list(data['dependencies']),
+                         list(fixture['dependencies']) + [PACKAGE_NAME])
+        for package, value in fixture['dependencies'].items():
+            self.assertEqual(data['dependencies'][package], value)
+        self.assertEqual(data['dependencies'][PACKAGE_NAME],
+                         'link:' + str(self.bundle.resolve()))
+
+        selected = data['dsh']['profile']['bundles']
+        self.assertEqual(selected, fixture['dsh']['profile']['bundles'] + [PACKAGE_NAME])
+        self.assertEqual(selected[:-1], fixture['dsh']['profile']['bundles'])
+        self.assertEqual(data['dsh']['profile']['bundles'].count(PACKAGE_NAME), 1)
+        self.assertEqual(data['dsh'], {'profile': {'bundles': selected}})
+        # Planning stays pure: the fixture on disk is untouched.
+        self.assertEqual(fixture_path.read_text(), CLI_PROFILE_PACKAGE_JSON)
+
+    def test_existing_selection_keeps_its_position(self):
+        self.write_package({
+            'name': 'dsh-profile-desktop', 'dependencies': {},
+            'dsh': {'profile': {'bundles': [
+                '@deepseek-ai/dsh-base', PACKAGE_NAME, '@deepseek-ai/dsh-web-app']}},
+        })
+        plan = configuration.profile_plan(self.profile, self.bundle)
+        data = json.loads(plan['packageJson'][2])
+        self.assertEqual(data['dsh']['profile']['bundles'],
+                         ['@deepseek-ai/dsh-base', PACKAGE_NAME,
+                          '@deepseek-ai/dsh-web-app'])
+
+    def test_other_dsh_profile_keys_are_preserved(self):
+        self.write_package({
+            'name': 'dsh-profile-desktop', 'dependencies': {},
+            'dsh': {'profile': {
+                'bundles': ['@deepseek-ai/dsh-base'],
+                'theme': 'dark',
+                'extra': {'nested': [1, 2]},
+            }},
+        })
+        plan = configuration.profile_plan(self.profile, self.bundle)
+        data = json.loads(plan['packageJson'][2])
+        self.assertEqual(data['dsh']['profile']['theme'], 'dark')
+        self.assertEqual(data['dsh']['profile']['extra'], {'nested': [1, 2]})
+        self.assertEqual(data['dsh']['profile']['bundles'],
+                         ['@deepseek-ai/dsh-base', PACKAGE_NAME])
+
+    def test_replanning_the_rendered_package_is_idempotent(self):
+        (self.profile / 'package.json').write_text(CLI_PROFILE_PACKAGE_JSON)
+        first = configuration.profile_plan(self.profile, self.bundle)
+        repeat = configuration.profile_plan(self.profile, self.bundle)
+        self.assertEqual(repeat['packageJson'][2], first['packageJson'][2])
+
+        # Simulate deployment of exactly the planned bytes, then plan again.
+        (self.profile / 'package.json').write_bytes(first['packageJson'][2])
+        second = configuration.profile_plan(self.profile, self.bundle)
+        self.assertEqual(second['packageJson'][1], first['packageJson'][2])
+        self.assertEqual(second['packageJson'][2], first['packageJson'][2])
+        data = json.loads(second['packageJson'][2])
+        self.assertEqual(data['dsh']['profile']['bundles'].count(PACKAGE_NAME), 1)
+
+    def test_invalid_dsh_selection_structures_are_refused(self):
+        cases = [
+            {'dsh': []},
+            {'dsh': None},
+            {'dsh': '@quietbridge/not-a-map'},
+            {'dsh': {'profile': []}},
+            {'dsh': {'profile': {'bundles': {}}}},
+            {'dsh': {'profile': {'bundles': PACKAGE_NAME}}},
+        ]
+        for case in cases:
+            with self.subTest(case=case):
+                self.write_package(dict({'name': 'dsh-profile-desktop',
+                                         'dependencies': {'left-pad': '1.3.0'}}, **case))
+                before = self.read_file('package.json')
+                with self.assertRaises(ValueError) as raised:
+                    configuration.profile_plan(self.profile, self.bundle)
+                self.assertIn('格式无法识别', str(raised.exception))
+                self.assertIn('未修改', str(raised.exception))
+                self.assertEqual(self.read_file('package.json'), before)
 
     def test_existing_owned_row_config_is_replaced_in_place(self):
         original = (

@@ -77,10 +77,19 @@ Agent 作用域工具的形式接入 DeepSeek Harness。插件只依赖 DSH 公�
 
 ## 安装
 
-本 bundle **不自行安装到 profile**，也不写 `~/.dsh`。由仓库安装器
-（`adapters/deepseek_harness/configuration.py` 的 `bundle_render` + `profile_plan`）渲染
-`cordis.patch.yml` 并写入 profile 依赖与 patch 行。开发期可直接把本目录作为
-`plugin_manager install_bundle` 的 target（需人工确认），但本轮未做真实安装验收。
+本 bundle **不自行安装到 profile**，也不写 `~/.dsh`。推荐流程：
+
+1. 仓库安装器渲染（把模板 `config` 换成具体路径）：
+   `python3 install.py --install --dsh-bundle <目录> --dsh-helper <helper>`
+2. 用 DSH 官方 CLI 安装到目标 profile（会写 link 依赖、`dsh.profile.bundles` 并应用本 patch）：
+   `dsh plugin --profile <profile> add <目录>`
+   等价于宿主内的 `plugin_manager install_bundle`。
+3. 重启/重载该 profile，新 Agent 获得 `quietbridge_*` 工具。
+
+2026-11-15 已在隔离 `DSH_HOME`/profile 中通过上述 CLI 完成实机验证（宿主启动、插件激活、
+19 个工具注册、turn 生命周期、路由放行/拒绝），见仓库
+`docs/implementation/2026-11-15-dsh-isolated-verification.zh.md`，复现脚本
+`tools/dsh_isolated_check.py`。真实用户 profile、helper 权限/TCC、预览与并发仍未验收。
 
 ## 测试
 

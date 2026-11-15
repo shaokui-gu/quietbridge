@@ -5,9 +5,11 @@
 
 本文记录 QuietBridge for DeepSeek Harness 适配所需的宿主契约：安装机制、插件 API、
 Agent/Session/Turn 身份与事件、工具注册约束、MCP 客户端可用性、依赖解析，以及
-本轮未能核实的范围。**结论全部来自本机安装包内代码/文档，或本机 profile 的只读
-观测**；未做真实 profile 安装（`plugin_manager install_bundle`）与真实 Agent 端到端
-运行，相关条目在“未核实”一节单独列出，不能把本文当作已上线验收。
+本轮未能核实的范围。**契约结论来自本机安装包内代码/文档与本机 profile 的只读观测**；
+2026-11-15 同日补充：已在**隔离 DSH_HOME/profile** 中用官方 CLI 安装渲染 bundle，并完成
+真实宿主启动、Agent 创建、工具注册、turn 生命周期与宿主上下文路由放行/拒绝的实机验证
+（见 §7）。仍未做真实用户 `desktop` profile 安装、真实 helper 权限/TCC、DSH 预览与并发
+验收，相关条目在“未核实”一节单独列出，不能把本文当作已上线发布验收。
 
 写入范围：本文件与 `adapters/deepseek_harness/adapter.json`。本轮**没有**修改
 `~/.dsh/profiles/desktop` 下任何文件，也没有安装 bundle。
@@ -570,9 +572,10 @@ env 在插件激活时固定，无法自然做到“每次 agent/created 用该 
 
 ## 3. 未核实 / 无法核实（本轮不宣称）
 
-1. **未做真实 profile 安装与真实 Agent 端到端运行**：`plugin_manager install_bundle`、
-   Profile 重载、tools/list → 首轮可见、turn/end 与 lifecycle store 时序、取消传播均
-   只有源码级证据，没有本机实测。验收前不得宣称“已适配可用”。
+1. **用户真实 profile 安装与模型驱动的真实工具调用未验证**：§7 已在隔离 DSH_HOME/profile
+   完成 `dsh plugin add` 安装、宿主启动、Agent 创建、19 个工具注册、真实 turn 生命周期
+   与宿主上下文路由放行/拒绝；但用户真实 profile、Profile 重载、模型驱动的 tool call、
+   取消传播与真实 helper 执行仍未实测。验收前不得宣称“已适配可用”。
 2. **原生预览宿主窗口证据缺失**：未找到任何公开 API 能让 Host 插件取得 DSH 自身
    （Electron 主窗口/Web UI）的原生窗口句柄、窗口号或预览锚点。证据：插件文档只描述
    Web Client slot 渲染（`ui-plugin.md`、`practices.md` 第 31–38 行）；`/lib/main.js`
@@ -590,15 +593,16 @@ env 在插件激活时固定，无法自然做到“每次 agent/created 用该 
    每 Agent 工具、容量 3 上限、A 停止不影响 B 等行为**没有真实验收**。`supportsConcurrentAgents`
    保持 `false`。
 5. **Agent/连接器进程数量与资源**：每次 `agent/created` 一个连接器进程（外加 helper 连接），
-   子 Agent 可能很多；本轮未定义/实测上限与回收。建议 bundle 侧对连接器数量设上限并在
-   上限时降级为“该 Agent 无 QuietBridge 工具 + 日志”，而不是让宿主 OOM。
+   子 Agent 可能很多。bundle 已实现 `maxConnectors`（默认 3，上限 32），超限时该 Agent 不
+   注册工具并记日志；真实多 Agent 下的上限与回收未实测。
 6. **HMR / 升级路径未实测**：bundle 重载、连接器旧进程清理、profile 包替换后的
    `restart-required` 行为未验证。
-7. **Python 解释器解析**：Electron 从 Finder 启动时 PATH 往往不含 `/usr/local/bin`；本轮
-   建议配置项默认绝对路径 `/usr/bin/python3`（本仓库要求 Python 3.9+ 且无第三方依赖），
-   但未在真实 Host 进程里实测 PATH 与 TCC。
-8. **`agent/created` 期间 await 连接器就绪的耗时/首轮延迟未实测**：串行监听器会推迟
-   Agent 首次可用；需要真实测量再决定是否改为“先注册静态 schema、连接器异步补齐”。
+7. **Python 解释器解析**：bundle 使用配置的 `python`，缺省优先 `/usr/bin/python3`；安装器
+   渲染成绝对路径（隔离验证用 `/opt/homebrew/.../python3.14` 成功）。Electron 真实 Host
+   进程下未配置绝对路径时的 PATH 行为与 TCC 未实测。
+8. **`agent/created` 期间 await 连接器就绪的耗时/首轮延迟**：串行监听器会推迟 Agent 首次
+   可用；隔离验证中 Agent 创建后 2.5 秒内工具已可见（含 Python 连接器启动与 tools/list），
+   尚未精确测量首轮延迟分布。
 
 ## 4. API 缺口与风险清单
 
@@ -665,17 +669,20 @@ env 在插件激活时固定，无法自然做到“每次 agent/created 用该 
 
 ## 6. 与 `adapters/deepseek_harness/adapter.json` 的对应关系
 
-- `status: "implemented-source-unverified-live"`：源码级适配完成（bundle、adapter、
-  routing 与测试），但第 3 节的宿主验收项（真实安装、真实 Agent、并发、预览、TCC）
-  均未完成。仓库其它元数据（`project.json`、`products/deepseek-harness-plugin/product.json`）
-  使用较短状态词 `implemented-source`，语义一致；本文件用更长的词明确“未做真实宿主验收”。
+- `status: "implemented-isolated-verified"`：源码级适配完成（bundle、adapter、routing
+  与测试），并已在隔离 DSH_HOME/profile 完成实机验证（§7）；用户真实 profile、真实
+  helper 权限/TCC、模型驱动工具调用、并发与预览仍未验收。`project.json`、
+  `products/deepseek-harness-plugin/product.json` 使用同一状态词。
+- `verificationEvidence: "docs/implementation/2026-11-15-dsh-isolated-verification.zh.md"`
+  与 `verifiedScope`：记录隔离实机验证的范围与证据；`blockingRequirements` 保留未完成项。
 - `hostVersionVerified: "0.2.2-alpha.2"`：本文所有契约结论核对的 DSH 版本；升级 DSH 后
   需按附录 A 重新核对。
 - `contractEvidence: "docs/architecture/dsh-host-contract.zh.md"`：指向本文件。
-- `serverName: "quietbridge"`：连接器的 MCP server 名与工具命名空间（工具名
-  `mcp__quietbridge__<raw>`）。
-- `configuration: "DSH profile cordis.patch.yml bundle row; installed only via plugin_manager install_bundle"`
-  ：配置落在 profile 的 patch 行（bundle 渲染/安装器生成），不手写 profile 文件。
+- `serverName: "quietbridge"`：连接器的 MCP server 名；bundle 以 **Agent 作用域**注册
+  原始 `quietbridge_*` 工具（不经 MCP 客户端时没有 `mcp__` 前缀）。
+- `configuration`：配置落在 profile 的 patch 行（安装器渲染）；安装由官方 CLI
+  `dsh plugin --profile <name> add <dir>`（写 link 依赖、`dsh.profile.bundles` 并应用 patch）
+  或宿主 `plugin_manager install_bundle` 完成，不手写 profile 文件。
 - `transport: "per-agent-stdio-jsonrpc"`：每 Agent 一个 `python3 -B server.py` 子进程，
   stdio 上跑 JSON-RPC 2.0（非 Workbuddy 的静态 MCP row，也不是 profile 级 MCP 客户端）。
 - `trustedContext: ["QUIETBRIDGE_HOST", "QUIETBRIDGE_HOST_SESSION_ID", "QUIETBRIDGE_HOST_AGENT_ID"]`
@@ -683,7 +690,29 @@ env 在插件激活时固定，无法自然做到“每次 agent/created 用该 
 - `lifecycleEvents` 对应 2.4/2.5 的事件：`agent/created`、`agent/disposed`、
   `turn/start`、`turn/end`、`tool/result`（后者指 session 持久事件或同名观测事件，
   bundle 内部须按 2.5 的推荐方式取 turn）。
-- `supportsConcurrentAgents: false`、`blockingRequirements` 覆盖 G5/G6/G12/3.1–3.4。
+- `supportsConcurrentAgents: false`、`blockingRequirements` 覆盖 G5/G6/G12 与 §3 剩余项。
+
+## 7. 隔离 profile 实机验证（2026-11-15 补充）
+
+上文 §3 的“未做真实消费”仅剩**真实用户 profile/权限/预览/并发**；bundle 安装、宿主插件
+激活、连接器与工具注册、turn 生命周期和宿主上下文路由已在隔离环境实机跑通：
+
+- 环境：`DSH_HOME=/private/tmp/dsh-qb-home`，profile `qb-test` 由官方 web 模板创建；
+  `dsh plugin --profile qb-test add <渲染目录>` 完成 link 依赖 + `dsh.profile.bundles` +
+  patch 应用；`--dump-config` 可看到 `quietbridge-dsh` 行与具体 config。
+- 启动：`dsh --profile qb-test --patch <probe> --no-open --port 0` 正常监听，退出码 0。
+- Agent：测试探针 `ctx.agents.create()` 创建 Agent 后，19 个 `quietbridge_*` 工具注册到该
+  Agent 作用域并可见；每 Agent connector 以宿主注入的 session/agent 身份启动。
+- 生命周期：真实 `turn/start`/`turn/end` 事件写入 lifecycle store（`requestId=<session>:1`，
+  无模型凭据所以 `reason=error`）；Agent 释放写入 `sessionEnded` 墓碑。
+- 路由：活动 turn 内调用工具得到 `HELPER_MISSING`（证明已放行并进入 worker），turn 结束后
+  调用得到 `TASK_CANCELLED`（证明停止后拒绝新输入）。
+- 反向约束：测试 helper 路径故意不存在，未触发真实 helper/TCC/UI；未验证模型驱动的真实
+  工具调用、预览归属与并发。
+
+完整证据、限制与复现方式见
+[DSH 隔离 profile 实机验证](../implementation/2026-11-15-dsh-isolated-verification.zh.md)。
+仓库脚本 `tools/dsh_isolated_check.py` 可一键复现该检查。
 
 ## 附录 A：引用文件索引
 

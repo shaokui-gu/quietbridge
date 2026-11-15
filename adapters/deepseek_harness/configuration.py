@@ -361,6 +361,27 @@ def _owned_dependency(dependencies, bundle, name):
     return None
 
 
+def _select_bundle(data, name):
+    """Record this bundle in ``dsh.profile.bundles`` without reordering entries.
+
+    ``dsh plugin add`` writes both the ``link:`` dependency and the profile's
+    bundle selection; a plan that only did the former leaves the bundle
+    unloaded. Keep every existing selection and append ours only when absent,
+    and refuse shapes we cannot merge rather than writing a guess.
+    """
+    dsh = data.setdefault('dsh', {})
+    if not isinstance(dsh, dict):
+        raise ValueError('package.json dsh 格式无法识别；未修改')
+    profile = dsh.setdefault('profile', {})
+    if not isinstance(profile, dict):
+        raise ValueError('package.json dsh.profile 格式无法识别；未修改')
+    bundles = profile.setdefault('bundles', [])
+    if not isinstance(bundles, list):
+        raise ValueError('package.json dsh.profile.bundles 格式无法识别；未修改')
+    if name not in bundles:
+        bundles.append(name)
+
+
 def _package_plan(profile, bundle, name):
     path = Path(profile) / PACKAGE_JSON
     original = _read_bytes(path)
@@ -376,6 +397,7 @@ def _package_plan(profile, bundle, name):
     if key is None:
         key = name
     dependencies[key] = 'link:' + str(bundle.resolve())
+    _select_bundle(data, name)
     return path, original, _json_bytes(data)
 
 
@@ -436,9 +458,12 @@ def _profile_patch_plan(profile, bundle, name, config):
 def profile_plan(profile, bundle_path, server_name=SERVER_NAME, config=None):
     """Return the profile package.json and cordis.patch.yml merge plan.
 
-    Pure planning: nothing is written and no package manager runs. The bundle
-    must already contain its rendered ``cordis.patch.yml`` (see
-    :func:`bundle_render`) unless an explicit ``config`` mapping is passed.
+    The package plan records the ``link:`` dependency *and* selects the bundle
+    in ``dsh.profile.bundles``, so applying it has the same effect as
+    ``dsh plugin add`` rather than leaving the bundle unloaded. Pure planning:
+    nothing is written and no package manager runs. The bundle must already
+    contain its rendered ``cordis.patch.yml`` (see :func:`bundle_render`)
+    unless an explicit ``config`` mapping is passed.
     """
     profile = Path(profile)
     bundle = Path(bundle_path)

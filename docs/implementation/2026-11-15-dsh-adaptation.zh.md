@@ -80,9 +80,11 @@ DSH Host 进程
 
 ## 4. 未验证范围与阻塞项
 
-- **未做真实 profile 安装**：没有执行 `plugin_manager install_bundle`，没有修改
-  `~/.dsh/profiles/*`。`adapter.json` 的 `blockingRequirements` 保留真实安装、
-  `tools/list` 首轮可见性、`turn/end` 时序、取消传播的端到端验收。
+- **用户真实 profile 未安装**：没有修改 `~/.dsh/profiles/*`。同日已在隔离
+  `DSH_HOME/profile` 完成 bundle 安装、宿主启动、Agent 工具注册、turn 生命周期与
+  宿主上下文路由放行/拒绝的真实验证，见
+  [隔离 profile 实机验证](2026-11-15-dsh-isolated-verification.zh.md)；真实 helper
+  权限/TCC、模型驱动的工具调用、预览、并发与升级路径仍未验收。
 - **原生 DSH 预览宿主绑定未实现**：不宣称 DSH 预览可用；原生侧仍是历史宿主选择逻辑。
 - **签名 helper 的 TCC 归属未核实**：`helperPath` 只是配置透传；DSH 进程拉起 helper 时
   辅助功能/屏幕录制授权归属需实测。
@@ -104,3 +106,13 @@ DSH Host 进程
 3. 真实 DSH 并发主/子 Agent 验收（两路起步），确认连接器容量、目标租约与停止隔离。
 4. 视需要把 lifecycle 写入改为常驻进程或批量合并，减少每事件进程启动开销。
 5. 评估 `attachment` 投影以恢复截图等图片型工具结果。
+
+## 6. 补充（同日）：隔离 profile 实机验证
+
+在隔离 `DSH_HOME` 中用官方 `dsh plugin add` 安装渲染 bundle，并真实启动宿主：
+每 Agent 独立连接器按宿主身份启动，19 个 `quietbridge_*` 工具注册到 Agent 作用域；
+真实 `turn/start`/`turn/end` 事件写入 lifecycle store；活动 turn 内工具调用被放行并
+返回 `HELPER_MISSING`（测试 helper 故意缺失），turn 结束后调用返回 `TASK_CANCELLED`；
+Agent 释放写入 `sessionEnded` 墓碑并清理连接器。完整证据、限制与复现方式见
+[DSH 隔离 profile 实机验证](2026-11-15-dsh-isolated-verification.zh.md)，
+仓库脚本 `env -u DSH_HOME -u PYTHONPATH python3 tools/dsh_isolated_check.py` 可一键复现（约 12 秒）。

@@ -22,7 +22,7 @@
  */
 
 import { spawn } from 'node:child_process'
-import { existsSync } from 'node:fs'
+import { existsSync, mkdirSync } from 'node:fs'
 import path from 'node:path'
 import process from 'node:process'
 
@@ -1353,6 +1353,14 @@ function isSessionEvent(event) {
  */
 export function apply(ctx, config) {
 	const settings = resolveConfig(config)
+	// The lifecycle CLI and the connector both write bookkeeping below
+	// configDir. A fresh installation may not have created it yet, so create the
+	// private directory once here instead of failing every lifecycle hint.
+	try {
+		mkdirSync(settings.configDir, { recursive: true, mode: 0o700 })
+	} catch (cause) {
+		warn(ctx.logger, `configDir 创建失败：${cause instanceof Error ? cause.message : String(cause)}`)
+	}
 	const logger = ctx.logger
 	const states = new Map()
 	const byAgentId = new Map()
