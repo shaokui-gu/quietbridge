@@ -20,7 +20,6 @@
   ],
   "supportsConcurrentAgents": false,
   "blockingRequirements": [
-    "Browser select operation and multi-tab assignment beyond one created target are not exercised yet; the test page had no <select> element",
     "Native DSH preview host window binding unimplemented; DSH preview support is not claimed",
     "Screenshot/image results reach the model only through the attachment admission path; the bridge currently returns text plus a saved PNG path",
     "Real-profile multi-Agent concurrency and long-running soak not verified; the connector capacity-3 behavior and isolation are proven only in the isolated host",
@@ -48,6 +47,7 @@
     "screenshot result verified on disk and by pixel inspection of the captured TextEdit window",
     "browser native host unified into the QuietBridge runtime: one Chrome host registration/state dir, legacy WorkbuddyExtension state migrated; connector-level real-extension probe returned browserChannel=True, clientVersion=0.4.14, globalPermission=true and 6 real candidate tabs",
     "real-profile browser operations through the DSH host after the 118 cross-process clock fix: create_target, candidates(taskChannelReady), task bind, assign, verify_mapping (window_active_title exact), window share, snapshot, read links/content, screenshot, diagnostics, scroll (at_boundary), keypress, click that navigated to IANA, explicit navigate to example.org, tabs, select_tab, annotations and fill (verified=true, length=15)",
-    "cross-process lease clock: Xcode Python 3.9 per-process time.monotonic() versus Homebrew Python 3.14 machine uptime was the cause of the stuck private browser channel; browser_events.uptime() (CLOCK_UPTIME_RAW) fixes lease liveness and has a regression test"
+    "cross-process lease clock: Xcode Python 3.9 per-process time.monotonic() versus Homebrew Python 3.14 machine uptime was the cause of the stuck private browser channel; browser_events.uptime() (CLOCK_UPTIME_RAW) fixes lease liveness and has a regression test",
+    "after the 118 package install: local HTTP form page exercised fill (input/textarea), select (combobox, verified=true), click submit, and the page result text 'submitted:QuietBridge|beta' confirmed fill+select+click; annotate/annotations and tabs/select_tab also passed"
   ]
 }
