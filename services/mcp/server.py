@@ -62,7 +62,27 @@ WAIT_DEADLINE = None
 TASK_FILE = str(SESSION_TASK_FILE)
 SESSION_KEY = os.environ.get('QUIETBRIDGE_SESSION_KEY', '')
 SESSION_ROUTER = None
-ROUTING_ENABLED = not bool(SESSION_KEY)
+
+
+def startup_host_routing(session_key=None, environ=None):
+    """Resolve the trusted DSH host identity once, before serving any call.
+
+    A partial or invalid host environment fails connector startup (the host's
+    failOnStartupError) instead of silently degrading to token routing. A
+    per-session worker is spawned with QUIETBRIDGE_SESSION_KEY and never routes,
+    so it keeps executing tools directly.
+    """
+    session_key = SESSION_KEY if session_key is None else session_key
+    if session_key:
+        return None
+    from session_routing import host_context
+    return host_context(environ)
+
+
+HOST_ROUTING = startup_host_routing()
+# Host mode (DSH) and token mode both enter SessionRouter; only a per-session
+# worker executes a tool directly.
+ROUTING_ENABLED = not bool(SESSION_KEY) or HOST_ROUTING is not None
 CONNECTOR_REVALIDATE = os.environ.pop('QUIETBRIDGE_CONNECTOR_REEXEC', '') == '1'
 
 def task_root():
@@ -3482,6 +3502,15 @@ def routed_schema(schema):
     return value
 
 
+def public_schema(schema):
+    """Advertise the one-use envelope only to token-routed hosts.
+
+    A host-identity connection (DSH) rejects that field with
+    SESSION_ROUTING_INVALID, so advertising it there would only invite errors.
+    """
+    return routed_schema(schema) if ROUTING_ENABLED and HOST_ROUTING is None else schema
+
+
 def handle(msg, cancel_event=None):
     global REQUEST_CANCELLED, SESSION_ROUTER, CONNECTOR_REVALIDATE
     method = msg.get("method")
@@ -3523,7 +3552,8 @@ def handle(msg, cancel_event=None):
 
     if method == "tools/list":
         public = [
-            dict({"name": t["name"], "description": t["description"], "inputSchema": routed_schema(t["inputSchema"]) if ROUTING_ENABLED else t["inputSchema"]},
+            dict({"name": t["name"], "description": t["description"],
+                  "inputSchema": public_schema(t["inputSchema"])},
                  icons=TOOL_ICONS,
                  **({"annotations": t["annotations"]} if "annotations" in t else {}))
             for t in TOOLS
@@ -3553,7 +3583,11 @@ def handle(msg, cancel_event=None):
         try:
             result = call_tool(params.get("name"), params.get("arguments") or {})
             context = params.get('_quietbridgeContext')
-            if SESSION_KEY and isinstance(context, dict) and not result.get('isError'):
+            # Host-context workers never write WorkBuddy hook receipts: the DSH
+            # adapter owns those through turn events, and a second receipt would
+            # add an agent-less duplicate turn to the same lifecycle store.
+            if SESSION_KEY and isinstance(context, dict) and not context.get('host') \
+                    and not result.get('isError'):
                 from adapters.workbuddy.lifecycle import handle_hook
                 handle_hook({'hook_event_name': 'PostToolUse', 'session_id': context['sessionId'],
                     'tool_name': params.get('name'), 'tool_input': params.get('arguments') or {},

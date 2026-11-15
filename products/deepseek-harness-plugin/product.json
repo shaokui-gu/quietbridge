@@ -3,7 +3,10 @@
   "id": "quietbridge-deepseek-harness",
   "name": "QuietBridge for DeepSeek Harness",
   "adapter": "deepseek-harness",
+  "transport": "host-plugin-per-agent-stdio",
+  "serverName": "quietbridge",
+  "entrypoint": "adapters/deepseek_harness/bundle",
   "distribution": "shared-macos-pkg",
-  "status": "planned",
+  "status": "implemented-source",
   "marketManifestStatus": "unverified"
 }

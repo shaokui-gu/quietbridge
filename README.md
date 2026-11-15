@@ -6,8 +6,10 @@ current Space. Native operations use an explicitly shared target window;
 browser operations use the extension and never fall back to desktop input.
 
 The product has one macOS application, one browser extension and separate host
-integrations. Workbuddy is implemented. DeepSeek Harness and concurrent agent
-workers are planned; the current runtime still has one active task and preview.
+integrations. Workbuddy is implemented. DeepSeek Harness now has a source-level
+adapter and bundle (not installed or end-to-end verified); concurrent agent
+workers and DSH preview host binding are still planned. The current runtime
+still has one active task and preview.
 
 ## Repository
 
@@ -18,7 +20,7 @@ workers are planned; the current runtime still has one active task and preview.
 | `extensions/chromium` | QuietBridge Browser: fixed-tab CDP operations and observation |
 | `system/authorization-plugin` | Optional signed authorization plugin for Locked use |
 | `adapters/workbuddy` | Workbuddy configuration and trusted lifecycle hooks |
-| `adapters/deepseek_harness` | Unimplemented adapter contract and prerequisites |
+| `adapters/deepseek_harness` | DSH contract, per-Agent connector adapter and installable Harness bundle |
 | `products` | Separate host product metadata and publication boundaries |
 | `packaging/macos` | Shared application PKG assembly, upgrade and recovery |
 | `tools` | Shared release layout and developer checks |
@@ -40,6 +42,7 @@ python3 -m unittest discover -s services/mcp -p 'test_*.py' -q
 python3 -m unittest discover -s packaging/macos -p 'test_*.py' -q
 python3 -m unittest discover -s system/authorization-plugin/tests -p 'test_install.py' -q
 node --test extensions/chromium/*.test.mjs
+node --test adapters/deepseek_harness/bundle/test/*.test.mjs
 ```
 
 The executable is `apps/macos/.build/release/quietbridge-native`. Build the
@@ -53,6 +56,18 @@ python3 packaging/macos/build.py --version VERSION --build BUILD --identity 'Dev
 The result is `dist/quietbridge-VERSION.pkg`, containing `QuietBridge.app`.
 Application signing and installer signing/notarization are separate release
 steps; building this archive does not claim that its outer PKG is signed.
+
+Render an installable DeepSeek Harness bundle without touching the DSH profile:
+
+```sh
+python3 install.py --install --dsh-bundle /path/to/rendered-bundle \
+  --dsh-helper '/Applications/QuietBridge.app/Contents/MacOS/quietbridge-native'
+```
+
+Installing that directory into a Harness profile stays an explicit
+`plugin_manager install_bundle` action. See
+[`products/deepseek-harness-plugin`](products/deepseek-harness-plugin/README.md)
+and [`dsh-host-contract.zh.md`](docs/architecture/dsh-host-contract.zh.md).
 
 ## Architecture and compatibility
 

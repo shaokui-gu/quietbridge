@@ -14,6 +14,18 @@ def bridge_sources(root):
     for path in sorted((root / 'adapters').rglob('*.py')):
         if '__pycache__' not in path.parts and not any(part.startswith('test') for part in path.relative_to(root / 'adapters').parts):
             files[path.relative_to(root)] = path
+    # Host bundle payloads (DeepSeek Harness) ship next to the adapter modules so
+    # an installed bridge can render an installable bundle without the source
+    # checkout. Runtime files only: tests, caches and editor droppings stay out.
+    bundle = root / 'adapters/deepseek_harness/bundle'
+    if bundle.is_dir():
+        for suffix in ('.js', '.json', '.yml', '.yaml', '.svg'):
+            for path in sorted(bundle.rglob('*' + suffix)):
+                relative = path.relative_to(bundle)
+                if '__pycache__' in path.parts or any(part == 'test' or part == 'tests'
+                                                      for part in relative.parts):
+                    continue
+                files[path.relative_to(root)] = path
     return files
 
 

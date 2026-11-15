@@ -372,7 +372,7 @@ def stage_upgrade_recovery(home, value):
     shutil.copy2(Path(__file__), directory / 'deploy.py')
     shutil.copy2(Path(sys.modules['compatibility'].__file__), directory / 'compatibility.py')
     shutil.copytree(Path(workbuddy.__file__).parents[1], directory / 'adapters',
-                    ignore=shutil.ignore_patterns('__pycache__', '*.pyc', 'tests'))
+                    ignore=shutil.ignore_patterns('__pycache__', '*.pyc', 'tests', 'test'))
     text = '#!/bin/bash\nset -euo pipefail\n' + shlex.quote(sys.executable) + ' -B ' + \
            shlex.quote(str(directory / 'deploy.py')) + ' --recover-latest\n' + \
            "read -r -p '按回车关闭。' ignored\n"

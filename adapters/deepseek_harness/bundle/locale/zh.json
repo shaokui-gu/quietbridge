@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "QuietBridge 桌面桥接",
+    "description": "为每个 DeepSeek Harness 智能体启动独立的 QuietBridge 桌面连接器，注入该智能体可信的会话身份，并把轮次与任务回执写入本地生命周期存储。"
+  }
+}

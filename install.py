@@ -3,6 +3,9 @@
 
 加 --with-extension 可一并部署浏览器扩展的原生宿主并拉起本机安装页；
 扩展本体仍需在 chrome://extensions 手动加载（Chrome 137 起无程序化入口）。
+
+加 --dsh-bundle DIR 可生成可安装的 DeepSeek Harness bundle；它只写目标目录，
+不修改 ~/.dsh profile，安装/启用仍走 DSH 的 install_bundle 流程。
 """
 import argparse
 import datetime
@@ -224,6 +227,55 @@ def install(root, home, apply=False, verify_signature=True, with_extension=False
     return plan
 
 
+def dsh_helper_path(root, helper=None, public_helper=None):
+    """Resolve the helper executable embedded in a rendered DSH bundle."""
+    if helper is not None:
+        return checked_path(helper)
+    if public_helper is not None:
+        return checked_path(public_helper) / 'Contents/MacOS/quietbridge-native'
+    for candidate in (root / 'apps/macos/QuietBridge.app/Contents/MacOS/quietbridge-native',
+                      Path('/Applications/QuietBridge.app/Contents/MacOS/quietbridge-native')):
+        if candidate.is_file():
+            return checked_path(candidate)
+    raise ValueError('缺少 helper 可执行文件；请用 --dsh-helper 指定')
+
+
+def dsh_bundle(root, home, destination, *, apply=False, connector=None, helper=None,
+               public_helper=None, server_name='quietbridge'):
+    """Render an installable DeepSeek Harness bundle; never writes the DSH profile.
+
+    The rendered directory is the input for the host's own ``install_bundle``
+    flow. This installer does not edit ``~/.dsh``: installing, enabling and
+    trusting a bundle stay explicit user actions.
+    """
+    from adapters.deepseek_harness.configuration import bundle_render
+    root, home = checked_path(root), checked_path(home)
+    source = checked_path(root / 'adapters/deepseek_harness/bundle')
+    if not (source / 'package.json').is_file():
+        raise ValueError('缺少 DSH bundle 模板：' + str(source))
+    bridge = checked_path(connector or root / 'services/mcp/server.py')
+    if not bridge.is_file():
+        raise ValueError('缺少 DSH connector 入口：' + str(bridge))
+    resolved_helper = dsh_helper_path(root, helper, public_helper)
+    target = Path(destination).expanduser()
+    if not target.is_absolute():
+        raise ValueError('--dsh-bundle 必须是绝对路径')
+    # The destination is a new output directory chosen by the caller; only the
+    # setup inputs and the helper stay under the strict symlink-free resolver.
+    plan = bundle_render(source, target, python=sys.executable,
+                         connector=bridge, helper=resolved_helper,
+                         config_dir=checked_path(runtime_root(home)), server_name=server_name,
+                         apply=apply)
+    plan['mode'] = 'install' if apply else 'preview'
+    plan['profileChanged'] = False
+    plan['next'] = ('用 DeepSeek Harness 的 plugin_manager install_bundle 安装该目录，'
+                    '再按需启用/信任；本脚本不修改 ~/.dsh/profiles。')
+    plan['limitations'] = ['未写入或启用 DSH profile，安装与启用仍需用户显式操作',
+                           'DSH 由签名 helper 承担的 TCC 归属尚未核实',
+                           '本轮不宣称 DSH 预览可用；原生宿主窗口绑定是后续工作']
+    return plan
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--install', action='store_true', help='实际部署；默认只预览')
@@ -231,14 +283,24 @@ def main():
                         help='同时部署浏览器扩展的原生宿主，并拉起本机安装页')
     parser.add_argument('--public-helper', type=Path, help='使用已发布并验签的系统可读 helper .app')
     parser.add_argument('--no-open', action='store_true', help='配合 --with-extension：不自动打开安装页')
+    parser.add_argument('--dsh-bundle', type=Path, metavar='DIR',
+                        help='生成可安装的 DeepSeek Harness bundle 到 DIR（配合 --install 才写盘）')
+    parser.add_argument('--dsh-connector', type=Path, help='DSH bundle 使用的 connector 入口')
+    parser.add_argument('--dsh-helper', type=Path, help='DSH bundle 使用的 helper 可执行文件')
     args = parser.parse_args()
     if sys.platform != 'darwin':
         parser.error('仅支持 macOS')
     try:
-        print(json.dumps(install(ROOT, Path.home(), args.install,
-                                 with_extension=args.with_extension,
-                                 launch_installer=not args.no_open,
-                                 public_helper=args.public_helper), ensure_ascii=False, indent=2))
+        if args.dsh_bundle is not None:
+            result = dsh_bundle(ROOT, Path.home(), args.dsh_bundle, apply=args.install,
+                                connector=args.dsh_connector, helper=args.dsh_helper,
+                                public_helper=args.public_helper)
+        else:
+            result = install(ROOT, Path.home(), args.install,
+                             with_extension=args.with_extension,
+                             launch_installer=not args.no_open,
+                             public_helper=args.public_helper)
+        print(json.dumps(result, ensure_ascii=False, indent=2))
     except Exception as error:
         print('安装未完成: ' + str(error), file=sys.stderr)
         return 1

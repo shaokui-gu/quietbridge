@@ -85,6 +85,52 @@ class InstallerTests(unittest.TestCase):
                 self.run_install()
         self.assertFalse((self.home / '.workbuddy/mcp.json').exists())
 
+    def render_dsh(self, destination, apply=False, helper=None):
+        helper = helper or self.base / 'helper'
+        helper.write_bytes(b'test-only-helper')
+        return installer.dsh_bundle(installer.ROOT, self.home, destination,
+                                    apply=apply, helper=helper)
+
+    def test_dsh_bundle_preview_writes_nothing(self):
+        destination = self.base / 'rendered'
+        plan = self.render_dsh(destination)
+        self.assertEqual(plan['mode'], 'preview')
+        self.assertFalse(destination.exists())
+        self.assertFalse((self.home / '.dsh').exists())
+        self.assertFalse(plan['profileChanged'])
+        self.assertIn('@quietbridge/dsh', plan['patch'])
+        self.assertIn('id: quietbridge-dsh', plan['patch'])
+        self.assertNotIn('!!js process.env', plan['patch'])
+        self.assertFalse((self.home / '.workbuddy').exists())
+
+    def test_dsh_bundle_applied_is_installable_and_idempotent(self):
+        destination = self.base / 'rendered'
+        plan = self.render_dsh(destination, apply=True)
+        self.assertTrue(plan['applied'])
+        manifest = json.loads((destination / 'package.json').read_text())
+        self.assertEqual(manifest['name'], '@quietbridge/dsh')
+        self.assertIn('patch', manifest['dsh']['bundle'])
+        self.assertEqual(manifest['exports']['./icon'], './icon.svg')
+        patch = (destination / 'cordis.patch.yml').read_text()
+        self.assertIn('config: {"python"', patch)
+        self.assertIn(str(self.base / 'helper'), patch)
+        self.assertNotIn('!!js process.env', patch)
+        # Template tests and caches must not become part of the installed bundle.
+        self.assertFalse((destination / 'test').exists())
+        before = {path.name for path in destination.iterdir()}
+        again = self.render_dsh(destination, apply=True)
+        self.assertTrue(again['applied'])
+        self.assertEqual({path.name for path in destination.iterdir()}, before)
+        self.assertFalse((self.home / '.dsh').exists())
+
+    def test_dsh_bundle_refuses_foreign_destination(self):
+        destination = self.base / 'foreign'
+        destination.mkdir()
+        (destination / 'package.json').write_text(json.dumps({'name': 'other'}))
+        with self.assertRaises(ValueError):
+            self.render_dsh(destination, apply=True)
+        self.assertEqual(json.loads((destination / 'package.json').read_text())['name'], 'other')
+
 
 if __name__ == '__main__':
     unittest.main()

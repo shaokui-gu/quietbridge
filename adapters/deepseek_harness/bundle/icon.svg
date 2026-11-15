@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="QuietBridge">
+  <rect width="64" height="64" rx="14" fill="#12212e"/>
+  <path d="M10 42h44" stroke="#4dd6c1" stroke-width="4" stroke-linecap="round"/>
+  <path d="M16 42V28a16 16 0 0 1 32 0v14" fill="none" stroke="#8fb6c9" stroke-width="4" stroke-linecap="round"/>
+  <path d="M26 23a6 6 0 0 1 12 0" fill="none" stroke="#4dd6c1" stroke-width="3" stroke-linecap="round"/>
+  <circle cx="32" cy="49" r="3.5" fill="#4dd6c1"/>
+</svg>

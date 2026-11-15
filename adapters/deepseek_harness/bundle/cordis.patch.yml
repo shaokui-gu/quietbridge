@@ -1,0 +1,18 @@
+# QuietBridge × DeepSeek Harness bundle patch template.
+#
+# The installer (adapters/deepseek_harness/configuration.py) copies this file
+# and replaces the config block below with concrete JSON values for the local
+# installation. The `!!js` defaults keep a hand-written profile row usable
+# before the installer runs: every value is an absolute path or a short name.
+#
+# Row id and package name are read by the installer; keep the block shape
+# (`insert:` list with one `- id:` / `name:` / `config:` line per row).
+- insert:
+    - id: quietbridge-dsh
+      name: '@quietbridge/dsh'
+      config:
+        python: !!js process.env.QUIETBRIDGE_DSH_PYTHON || 'python3'
+        connector: !!js process.env.QUIETBRIDGE_DSH_CONNECTOR
+        helper: !!js process.env.QUIETBRIDGE_DSH_HELPER
+        configDir: !!js process.env.QUIETBRIDGE_DSH_CONFIG_DIR
+        serverName: !!js process.env.QUIETBRIDGE_DSH_SERVER_NAME || 'quietbridge'

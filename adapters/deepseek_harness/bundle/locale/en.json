@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "QuietBridge host bridge",
+    "description": "Gives each DeepSeek Harness agent its own QuietBridge desktop connector with the agent's trusted session identity, and forwards turn and task receipts to the local lifecycle store."
+  }
+}

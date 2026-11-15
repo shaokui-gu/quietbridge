@@ -1,0 +1,41 @@
+{
+  "name": "@quietbridge/dsh",
+  "version": "0.1.0",
+  "private": true,
+  "description": "QuietBridge host bridge for DeepSeek Harness: one MCP connector per Agent with trusted session identity and agent-scoped desktop tools.",
+  "type": "module",
+  "main": "index.js",
+  "exports": {
+    ".": "./index.js",
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "index.js",
+    "cordis.patch.yml",
+    "locale/*.json",
+    "icon.svg",
+    "README.md"
+  ],
+  "license": "UNLICENSED",
+  "engines": {
+    "node": ">=20"
+  },
+  "keywords": [
+    "dsh",
+    "dsh-bundle",
+    "quietbridge",
+    "computer-use",
+    "mcp"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml",
+      "platforms": [
+        "darwin"
+      ]
+    }
+  }
+}

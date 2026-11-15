@@ -107,7 +107,10 @@ Workbuddy 适配器通过 `adapters/workbuddy/configuration.py` 合并
 
 新工具使用 `quietbridge_*`，旧 `cua_*` 调用映射到同一实现。环境变量优先使用
 `QUIETBRIDGE_*`，未配置时兼容旧 `CUA_*`。首次连接仍由用户在宿主中确认信任。
-其他宿主尚未接入；DSH 的接口及并行能力要求见[整体方案](../../docs/architecture/quietbridge.zh.md)。
+DSH 已接入源码级适配：`adapters/deepseek_harness` 渲染 Host bundle，每 Agent 一个连接器并注入可信
+环境身份，宿主上下文路由按 lifecycle store 的 turn 记录放行/拒绝；详见
+[DSH 宿主契约](../../docs/architecture/dsh-host-contract.zh.md)。未经真实 profile 安装与端到端验收前
+不宣称 DSH 可用或支持多 Agent 并行。整体方案见[整体方案](../../docs/architecture/quietbridge.zh.md)。
 
 ## 环境变量
 

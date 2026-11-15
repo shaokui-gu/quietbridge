@@ -159,7 +159,7 @@ def main():
     support = payload / "Library/Application Support/QuietBridge"
     support.mkdir(parents=True)
     shutil.copy2(ROOT / 'services/mcp/compatibility.py', support / 'compatibility.py')
-    shutil.copytree(ROOT / 'adapters', support / 'adapters', ignore=shutil.ignore_patterns('__pycache__', 'tests', '*.pyc'))
+    shutil.copytree(ROOT / 'adapters', support / 'adapters', ignore=shutil.ignore_patterns('__pycache__', 'tests', 'test', '*.pyc'))
     # Same executable, separate signing identities. The authorization plug-in
     # trusts only the helper; the menu app must never become its server.
     helper_stage = work / "helper/QuietBridge.app"
@@ -233,7 +233,7 @@ def main():
         shutil.copy2(Path(__file__).with_name(name), scripts / name)
     (scripts / 'upgrade.plist').write_bytes(plistlib.dumps({'version': args.version, 'build': args.build}))
     shutil.copy2(ROOT / 'services/mcp/compatibility.py', scripts / 'compatibility.py')
-    shutil.copytree(ROOT / 'adapters', scripts / 'adapters', ignore=shutil.ignore_patterns('__pycache__', 'tests', '*.pyc'))
+    shutil.copytree(ROOT / 'adapters', scripts / 'adapters', ignore=shutil.ignore_patterns('__pycache__', 'tests', 'test', '*.pyc'))
     for name in ("preinstall", "postinstall", "launch-postinstall", "runtime.sh", "manage-plugin.command", "恢复安装.command"):
         run("/bin/bash", "-n", Path(__file__).with_name(name))
     run("/usr/bin/codesign", "--force", "--options", "runtime", "--timestamp=none",

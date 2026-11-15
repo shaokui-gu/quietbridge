@@ -36,8 +36,22 @@ class TargetInUse(ValueError):
                          (slot['taskId'], target.get('windowId'), owner))
 
 
-def session_key(session):
-    return hashlib.sha256(('workbuddy\0' + session).encode()).hexdigest()
+def session_key(host, session=None, agent=''):
+    """Stable private session channel, scoped to the trusted host identity.
+
+    New hosts pass the host, session and agent explicitly so a sub-agent can
+    never share another agent's channel. The historical single-argument call
+    (WorkBuddy hooks) keeps the exact published key: existing session
+    directories, running workers and adapter receipts stay valid.
+    """
+    if session is None:
+        return hashlib.sha256(('workbuddy\0' + host).encode()).hexdigest()
+    if not isinstance(host, str) or not isinstance(session, str) or not session or \
+            not isinstance(agent, str) or not agent:
+        # A host connection always names both the session and its agent; an
+        # empty agent must not silently degrade to a session-wide channel.
+        raise ValueError('SESSION_ROUTING_REQUIRED: host session/agent context missing')
+    return hashlib.sha256((host + '\0' + session + '\0' + agent).encode()).hexdigest()
 
 
 def session_directory(config, key, create=False):

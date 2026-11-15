@@ -1,6 +1,12 @@
 # QuietBridge 整体架构与实施方案
 
-更新日期：2026-11-07（北京时间）。本文件为项目整体方案入口。
+更新日期：2026-11-15（北京时间）。本文件为项目整体方案入口。
+
+2026-11-15 补充：DeepSeek Harness 适配已在仓库内完成源码级实现（契约文档、
+每 Agent 连接器适配器、可渲染 bundle 与路由支持），尚未安装进任何 DSH profile，
+也未做真实宿主端到端验收；未验证范围见
+[DeepSeek Harness 宿主契约](dsh-host-contract.zh.md) 与
+[本轮实现记录](../implementation/2026-11-15-dsh-adaptation.zh.md)。
 
 ## 1. 产品与交付边界
 
@@ -11,7 +17,7 @@
 | 原生可执行文件 / Swift 模块 | `quietbridge-native` / `QuietBridgeNative` | 已迁移 |
 | 浏览器扩展 | **QuietBridge Browser** | 一份 Chromium MV3 扩展 |
 | Workbuddy 产品 | **QuietBridge for Workbuddy** | MCP 接入、升级入口和停止 hooks 已实现 |
-| DeepSeek Harness 产品 | **QuietBridge for DeepSeek Harness** | 仅建立适配和产品边界，尚不可安装或发布 |
+| DeepSeek Harness 产品 | **QuietBridge for DeepSeek Harness** | 源码级适配器与可渲染 bundle 已实现；未安装、未端到端验收，预览宿主绑定待原生侧 |
 
 一台 Mac 共用一个应用、一套系统权限、一份浏览器扩展。两个市场包分别
 遵守各宿主规范，复用核心实现。市场元数据目录中的 `product.json` 为内部
@@ -50,7 +56,7 @@ quietbridge/
 ├── system/authorization-plugin/     可选系统授权组件
 ├── adapters/
 │   ├── workbuddy/                   MCP 配置合并与生命周期事件适配
-│   └── deepseek_harness/            接口待核验、实现待完成
+│   └── deepseek_harness/            DSH 契约、每 Agent 连接器适配与可安装 bundle
 ├── products/
 │   ├── workbuddy-connector/          独立产品元数据及市场边界
 │   └── deepseek-harness-plugin/      独立产品元数据及市场边界
@@ -62,6 +68,8 @@ quietbridge/
 `adapters` 处理宿主上下文、配置、停止和工具注册差异；不实现第二套 AX、鼠标、
 截图或标签绑定。`products` 组合适配器和公共服务，记录版本范围与发布入口。
 `services/mcp` 不直接解析 Workbuddy hook payload；它读取公共撤销存储。
+DSH 适配器把宿主 Agent/turn 事件写入同一撤销存储，并通过每 Agent 独立
+connector 的宿主环境身份路由；不从模型参数、前台窗口或最近 hook 猜测归属。
 
 打包与源码安装通过 `tools/release_layout.py` 复制相同的核心模块和适配代码。
 安装后的桥接资源内保留 `adapters` 包结构；稳定连接目录同时携带 hook 所需
@@ -87,8 +95,12 @@ quietbridge/
 
 当前核心仍使用单一 `activeTaskId`、原生资源 owner、全局调度槽和
 `SpacePreview.shared`。浏览器也未具备完整多会话分路。**整理目录没有将这些
-机制变成并行实现**；不同 Agent 同时执行、同时共享，以及 DSH 正式适配均
-需完成下面阶段后交付。
+机制变成并行实现**；不同 Agent 同时执行、同时共享仍按下面阶段推进。
+
+DSH 侧已完成源码级适配：契约核验、每 Agent 独立 connector 的宿主环境身份
+路由、turn/Agent 停止事件联动和可渲染 bundle（2026-11-15）。它不改变上述
+核心限制：DSH profile 未被安装或启用，真实宿主端到端、签名 helper 的 TCC
+归属、DSH 预览宿主窗口绑定与多 Agent 并行仍未验收，不能据此宣称可发布。
 
 ## 5. 一个应用、多个宿主、每 Agent 隔离
 
@@ -113,8 +125,12 @@ agentInstanceId / executionSessionId / turnId / taskId / leaseId / generation`�
 前台窗口、最后一个 hook 写入者或“最近的任务”猜测归属。
 
 首选每 Agent 独立连接；共享 MCP 连接时，必须核验宿主是否提供可信调用上下文。
-Workbuddy 已有停止 hook 不证明其每次并发调用都有足够身份信息；DSH 的 API、
-传输与市场格式需对照实际支持的规范验证。有缺口时显式报告不支持的范围。
+Workbuddy 已有停止 hook 不证明其每次并发调用都有足够身份信息。DSH 已按本机
+0.2.2-alpha.2 安装包核对插件、身份与生命周期契约（见
+[DeepSeek Harness 宿主契约](dsh-host-contract.zh.md)）：支持每 Agent 独立连接和
+turn/Agent 停止事件，但 `tools/pre-execute` 不能改写工具参数、也缺少可用的宿主
+窗口证据；这两个缺口分别由“每 Agent connector + 环境身份”和“暂不宣称预览支持”
+显式处理，不静默绕过。
 
 ## 6. 并行执行、共享与资源冲突
 
@@ -187,7 +203,7 @@ PKG 装配先构建公共代码，再组装同一 App 和扩展。用户文件�
 | 阶段 | 交付 | 验收要求 |
 | --- | --- | --- |
 | 0：品牌与源码边界 | 本次目录迁移、名称、适配抽离、统一装配与文档 | 核心/安装/扩展测试、Swift 编译及符号检查通过 |
-| 1：宿主契约验证 | Workbuddy/DSH 真实 Agent 身份、取消和宿主窗口证据 | 并发主/子 Agent 每次调用可唯一归属；API 缺口明确记录 |
+| 1：宿主契约验证 | Workbuddy/DSH 真实 Agent 身份、取消和宿主窗口证据 | 并发主/子 Agent 每次调用可唯一归属；API 缺口明确记录（DSH 已完成源码级契约核验，真实宿主与窗口证据未完成） |
 | 2：隔离运行时 | Broker、每 Agent Worker、私有状态、目标写租约和停止代次 | A 停止、AX 卡死或 Worker 崩溃不撤销 B；旧结果不能复活任务 |
 | 3：扩展分路 | 多任务协议、独立标签队列、结果与弹窗归属 | 并行网页任务不串页，结束一项不解除另一项 CDP |
 | 4：多共享界面 | 先 Figma 再实现会话面板、多预览、单项停止与全局退出 | 四路预览可辨认、不重叠，独立收起和停止 |

@@ -21,6 +21,92 @@ from session_registry import session_key, session_directory
 
 ROUTE_FIELD = '_quietbridgeRoute'
 TOKEN_TTL = 90
+HOST_NAME = 'deepseek-harness'
+
+
+def host_context(environ=None):
+    """Trusted host identity injected into this connection's environment.
+
+    Returns None for hosts that route through one-use tokens (WorkBuddy). A
+    host that declares itself but leaves a partial or invalid identity raises
+    instead of degrading: a failed startup is safer than a guessed attribution.
+    """
+    environ = os.environ if environ is None else environ
+    declared = environ.get('QUIETBRIDGE_HOST')
+    session = environ.get('QUIETBRIDGE_HOST_SESSION_ID')
+    agent = environ.get('QUIETBRIDGE_HOST_AGENT_ID')
+    if not declared:
+        if session or agent:
+            raise ValueError('HOST_ROUTING_INVALID: 宿主标识不完整；连接器未启动')
+        return None
+    if declared != HOST_NAME:
+        raise ValueError('HOST_ROUTING_INVALID: 不支持的宿主标识；连接器未启动')
+    if not all(isinstance(v, str) and ID.fullmatch(v) for v in (session, agent)):
+        raise ValueError('HOST_ROUTING_INVALID: 宿主会话或 Agent 标识缺失/非法；连接器未启动')
+    return {'host': declared, 'sessionId': session, 'agentId': agent}
+
+
+def host_probe(environ=None):
+    """Non-throwing detection for adapters that must keep legacy modes intact."""
+    try:
+        return host_context(environ)
+    except ValueError:
+        return None
+
+
+def _timestamp(value):
+    return value if isinstance(value, (int, float)) and not isinstance(value, bool) else 0
+
+
+def _turn_matches(turn, session, agent):
+    return (isinstance(turn, dict) and turn.get('sessionId') == session and
+            turn.get('agentId') == agent)
+
+
+def _latest_turn(turns, session, agent):
+    """Newest turn this exact host session+agent actually started.
+
+    The request ID is the host's opaque turn identity ("<sessionId>:<turn>" in
+    DSH); it is validated as ID text and never parsed or compared numerically.
+    """
+    latest, order = None, None
+    for turn in turns.values():
+        if not _turn_matches(turn, session, agent):
+            continue
+        request = turn.get('requestId')
+        if not isinstance(request, str) or not ID.fullmatch(request):
+            continue
+        current = (_timestamp(turn.get('startedAt')), _timestamp(turn.get('updatedAt')))
+        if latest is None or current > order:
+            latest, order = turn, current
+    return latest
+
+
+def _session_ended(turns, session, agent):
+    return any(_turn_matches(turn, session, agent) and turn.get('sessionEnded') is True
+               for turn in turns.values())
+
+
+def _consume_host(config, host, arguments):
+    """Accept the host-injected identity only while its current turn is live."""
+    if not isinstance(arguments, dict):
+        raise ValueError('SESSION_ROUTING_REQUIRED: 缺少宿主调用上下文；本次调用未执行')
+    if ROUTE_FIELD in arguments:
+        raise ValueError('SESSION_ROUTING_INVALID: 宿主上下文路由不接受调用凭据；本次调用未执行')
+    state = read(Path(config) / 'host-lifecycle/state.json', {})
+    turns = state.get('turns', {}) if isinstance(state, dict) else {}
+    if not isinstance(turns, dict):
+        turns = {}
+    session, agent = host['sessionId'], host['agentId']
+    if _session_ended(turns, session, agent):
+        raise ValueError('TASK_CANCELLED: 宿主会话或 Agent 已结束；本次调用未执行')
+    turn = _latest_turn(turns, session, agent)
+    if turn is None:
+        raise ValueError('SESSION_ROUTING_REQUIRED: 未找到宿主当前轮次；本次调用未执行，请等待宿主记录本轮后再调用')
+    if turn.get('stoppedAt') is not None or turn.get('sessionEnded'):
+        raise ValueError('TASK_CANCELLED: 宿主轮次已停止；本次调用未执行')
+    return dict(arguments), {'host': host['host'], 'sessionId': session,
+                             'agentId': agent, 'requestId': turn['requestId']}
 
 
 def digest(name, arguments):
@@ -48,6 +134,11 @@ def issue(config, name, arguments, session, request='', call=''):
 
 
 def consume(config, name, arguments):
+    host = host_context()
+    if host is not None:
+        # Host mode never inspects a call token; the environment identity and
+        # the lifecycle store alone decide whether this turn may call.
+        return _consume_host(config, host, arguments)
     if not isinstance(arguments, dict):
         raise ValueError('SESSION_ROUTING_REQUIRED: 缺少宿主调用上下文，请更新连接器及 hooks')
     clean = dict(arguments)
@@ -170,7 +261,11 @@ class SessionRouter:
         try:
             params = message.get('params') or {}
             clean, context = consume(self.config, params.get('name'), params.get('arguments', {}))
-            key = session_key(context['sessionId'])
+            if context.get('host'):
+                # Per-agent channel: sub-agents of one session never share a worker.
+                key = session_key(context['host'], context['sessionId'], context['agentId'])
+            else:
+                key = session_key(context['sessionId'])
             with self.lock:
                 worker = self.workers.get(key)
                 if worker and worker.process.poll() is not None:
@@ -200,7 +295,12 @@ class SessionRouter:
         with self.lock:
             for key, worker in list(self.workers.items()):
                 context = getattr(worker, 'context', {})
-                stopped = any(t.get('sessionId') == context.get('sessionId') and t.get('stoppedAt') is not None and
+                context = context if isinstance(context, dict) else {}
+                # A host worker is stopped by its own agent's stop tombstone;
+                # one sub-agent's stop must not reap a sibling's live worker.
+                stopped = any(t.get('sessionId') == context.get('sessionId') and
+                    (context.get('agentId') is None or t.get('agentId') == context.get('agentId')) and
+                    t.get('stoppedAt') is not None and
                     (t.get('sessionEnded') or t.get('requestId') == context.get('requestId')) for t in turns.values())
                 idle_without_resources = not worker.retained and time.monotonic() - worker.last_used >= 120
                 if (stopped or idle_without_resources) and not worker.lock.locked():
