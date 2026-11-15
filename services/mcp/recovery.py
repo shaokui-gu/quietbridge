@@ -42,7 +42,11 @@ USER_ACTIONS = {
     'APP_NOT_ALLOWED': ('approve_target', '当前目标不在允许列表中。请确认并配置该应用的访问范围，完成后告诉我继续。'),
     'FOREGROUND_REQUIRED': ('resolve_background_limit', '此操作无法在保持用户焦点的条件下完成，任务已暂停，请确认可用的后台操作方式。'),
     'FOCUS_STATE_UNKNOWN': ('check_focus_state', '无法核实用户焦点，已暂停输入。请检查目标与共享窗口状态，完成后告诉我继续。'),
-    'UNSAFE_WINDOW_DELIVERY': ('resolve_background_limit', '无法确认输入只送往目标窗口，已暂停。请检查目标是否支持后台操作，完成后告诉我继续。'),
+    'UNSAFE_WINDOW_DELIVERY': ('resolve_background_limit', '当前接口缺少窗口级输入投递确认，已拒绝本次输入；这是该输入通道的能力限制，不是辅助功能或输入监控授权失败。'
+        '只使用原窗口已核实可写的 AX 元素并读回，或已确认可用的原通道。'
+        '飞书等 Electron 桌面应用的内嵌网页不是 Chrome 扩展可分配的标签，不能直接用扩展 fill。'
+        '无法继续时让用户选择可支持的处理路径、保持暂停或结束；不能结束绑定后调用应用级键盘、激活窗口、'
+        '切 Space，或改用 AppleScript/System Events/全局 CGEvent 绕过。增加权限或切到当前桌面不保证后台输入可用。'),
     'SESSION_ROUTING_REQUIRED': ('resolve_session_routing', '新阶段尚未核实属于当前保护会话。保留原会话，等待宿主 begin 回执后只读复查；不同会话需要独立连接或宿主提供可靠调用上下文。若仍阻塞，请通知用户；不能结束原会话、猜测归属或换工具绕过。'),
     'SESSION_ROUTING_INVALID': ('refresh_host_context', '宿主调用凭据失效或已经使用。请确认 QuietBridge hooks 已更新；不能猜测会话身份、重用凭据或换工具绕过。'),
     'SESSION_CAPACITY_FULL': ('wait_for_session_capacity', '当前已达到三会话上限。请用户结束自己的一项后再开始；不能抢占或结束其他会话。'),

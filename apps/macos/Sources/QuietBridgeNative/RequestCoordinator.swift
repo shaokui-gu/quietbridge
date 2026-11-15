@@ -432,6 +432,10 @@ import Darwin
             "panelOnCurrentSpace": (values["panelOnCurrentSpace"] as? Bool).map(JSONValue.bool) ?? .null,
             "panelSpaceVerified": .bool(values["panelSpaceVerified"] as? Bool ?? false),
             "panelPlacementError": (values["panelPlacementError"] as? String).map(JSONValue.string) ?? .null,
+            "panelOrderVerified": .bool(values["panelOrderVerified"] as? Bool ?? false),
+            "panelOrderError": (values["panelOrderError"] as? String).map(JSONValue.string) ?? .null,
+            "panelOrderState": (values["panelOrderState"] as? String).map(JSONValue.string) ?? .null,
+            "panelArtworkVisible": .bool(values["panelArtworkVisible"] as? Bool ?? false),
         ]
         // These dictionaries originate in the fixed content-free diagnostics producers.
         for key in ["frameProgress", "captureLifecycle", "captureStop"] {

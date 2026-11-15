@@ -58,6 +58,35 @@ struct CursorState: Codable {
     }
 }
 
+/// Input targets and preview hosts are independent, even when both overlays use the same level.
+struct CursorWindowTarget: Equatable {
+    let windowID: UInt32
+    let pid: Int32
+    let bounds: CGRect
+    let isOnScreen: Bool
+
+    var orderingTarget: WindowOverlayOrdering.Target { .init(windowID: windowID, pid: pid) }
+
+    /// Clip all artwork, including glows, to the actual target's current bounds.
+    func artworkClip(overlayFrame: CGRect, mainDisplayHeight: CGFloat) -> CGRect? {
+        guard bounds.width > 0, bounds.height > 0,
+              overlayFrame.width > 0, overlayFrame.height > 0,
+              [bounds.minX, bounds.minY, bounds.width, bounds.height, overlayFrame.minX, overlayFrame.minY,
+               overlayFrame.width, overlayFrame.height, mainDisplayHeight].allSatisfy(\.isFinite) else { return nil }
+        let target = CGRect(x: bounds.minX, y: mainDisplayHeight - bounds.maxY,
+                            width: bounds.width, height: bounds.height)
+        let clipped = overlayFrame.intersection(target)
+        guard !clipped.isNull, clipped.width > 0, clipped.height > 0 else { return nil }
+        return clipped.offsetBy(dx: -overlayFrame.minX, dy: -overlayFrame.minY)
+    }
+
+    static func select(_ candidate: Self?, windowID: UInt32, previous: Self?) -> Self? {
+        guard let candidate, candidate.windowID == windowID, candidate.pid > 0,
+              previous == nil || previous?.windowID != windowID || previous?.pid == candidate.pid else { return nil }
+        return candidate
+    }
+}
+
 final class AgentCursor: @unchecked Sendable {
     static let shared = AgentCursor()
 
@@ -70,6 +99,7 @@ final class AgentCursor: @unchecked Sendable {
     @MainActor private var timer: Timer?
     @MainActor private var spaces: WindowSpaces?
     @MainActor private var assigned: [UInt64] = []
+    @MainActor private var targetWindow: CursorWindowTarget?
     @MainActor private var lastValidation: TimeInterval = 0
     @MainActor private var failure: String?
 
@@ -112,9 +142,12 @@ final class AgentCursor: @unchecked Sendable {
         }
         render(at: now)
         if timer == nil {
-            timer = Timer.scheduledTimer(withTimeInterval: 1.0 / 60.0, repeats: true) { [weak self] _ in
-                Task { @MainActor in self?.tick() }
+            let timer = Timer(timeInterval: 1.0 / 60.0, repeats: true) { [weak self] _ in
+                MainActor.assumeIsolated { self?.tick() }
             }
+            RunLoop.main.add(timer, forMode: .common)
+            RunLoop.main.add(timer, forMode: .eventTracking)
+            self.timer = timer
         }
     }
 
@@ -123,16 +156,18 @@ final class AgentCursor: @unchecked Sendable {
         guard let spaces else { return false }
         let before = spaces.memberships(windowIDs: [windowID])[windowID]
         guard case .target(let destination) = CursorSpaceRoute.decide(windowID: windowID, membership: before),
-              NativePlatform.windows().contains(where: { $0.windowID == windowID }) else {
+              let current = readTarget(windowID: windowID) else {
             hide(reason: "目标 Space 归属未知或窗口已关闭，已隐藏光标")
             return false
         }
+        targetWindow = current
         ensureWindow()
         guard let window else { return false }
         let overlayID = UInt32(exactly: window.windowNumber) ?? 0
         let actual = spaces.memberships(windowIDs: [overlayID])[overlayID]?.spaceIDs
         if assigned != destination || !CursorSpaceRoute.matches(actual, target: destination) || !window.isVisible {
             // alpha=0 时登记窗口并迁移，绝不在用户当前桌面闪出旧光标。
+            maskArtwork()
             window.alphaValue = 0
             place(at: point)
             window.orderFrontRegardless()
@@ -165,22 +200,63 @@ final class AgentCursor: @unchecked Sendable {
 
     @MainActor private func render(at now: TimeInterval) {
         guard let frame = state.frame(at: now) else { hide(); return }
+        guard let target = readTarget(windowID: frame.windowID),
+              let window, let view else { hide(reason: "原目标窗口或进程归属已变化，已隐藏光标"); return }
+        targetWindow = target
         place(at: frame.point)
-        view?.rippleProgress = frame.rippleProgress
-        view?.hoverPhase = frame.hoverPhase
-        window?.alphaValue = 1
+        guard target.bounds.contains(frame.point),
+              let clip = target.artworkClip(overlayFrame: window.frame,
+                  mainDisplayHeight: NSScreen.screens.first?.frame.maxY ?? 0) else {
+            maskArtwork()
+            SpacePreview.shared.mirrorCursor(nil)
+            return
+        }
+        view.artworkClip = clip
+        view.rippleProgress = frame.rippleProgress
+        view.hoverPhase = frame.hoverPhase
+        // Keep the device registered for an honest on-screen order read. Artwork
+        // stays masked across asynchronous ordering and inactive Spaces.
+        window.alphaValue = 1
+        let verified = target.isOnScreen && WindowOverlayOrdering.restore(panels: [window], target: target.orderingTarget)
+        setArtworkVisible(verified)
+        // The mirror belongs to this target's captured content, with its own host ordering.
         SpacePreview.shared.mirrorCursor(frame)
+    }
+
+    @MainActor private func readTarget(windowID: UInt32) -> CursorWindowTarget? {
+        guard let rows = CGWindowListCopyWindowInfo(.optionIncludingWindow, windowID) as? [[String: Any]],
+              let row = rows.first(where: { ($0[kCGWindowNumber as String] as? UInt32) == windowID }),
+              let pid = row[kCGWindowOwnerPID as String] as? Int32,
+              (row[kCGWindowLayer as String] as? Int) == NSWindow.Level.normal.rawValue,
+              let rawBounds = row[kCGWindowBounds as String] as? [String: Any],
+              let bounds = CGRect(dictionaryRepresentation: rawBounds as CFDictionary) else { return nil }
+        let candidate = CursorWindowTarget(windowID: windowID, pid: pid, bounds: bounds,
+            isOnScreen: (row[kCGWindowIsOnscreen as String] as? Bool) == true)
+        return CursorWindowTarget.select(candidate, windowID: windowID, previous: targetWindow)
+    }
+
+    @MainActor private func maskArtwork() {
+        setArtworkVisible(false)
+    }
+
+    @MainActor private func setArtworkVisible(_ visible: Bool) {
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        view?.layer?.opacity = visible ? 1 : 0
+        CATransaction.commit()
     }
 
     @MainActor private func hide(reason: String? = nil) {
         window?.alphaValue = 0
         window?.orderOut(nil)
+        maskArtwork()
         view?.rippleProgress = nil
         view?.hoverPhase = 0
         timer?.invalidate()
         timer = nil
         state = CursorState()
         assigned = []
+        targetWindow = nil
         SpacePreview.shared.mirrorCursor(nil)
         if let reason, failure != reason {
             // 不依赖调试开关；失败必须可见，不能把预览镜像冒充真实浮层。
@@ -201,9 +277,9 @@ final class AgentCursor: @unchecked Sendable {
         panel.isOpaque = false
         panel.backgroundColor = .clear
         panel.hasShadow = false
-        panel.isFloatingPanel = true
+        panel.isFloatingPanel = false
         panel.becomesKeyOnlyIfNeeded = false
-        panel.level = NSWindow.Level(rawValue: Int(CGWindowLevelForKey(.screenSaverWindow)))
+        panel.level = .normal
         panel.ignoresMouseEvents = true
         panel.isMovable = false
         panel.hidesOnDeactivate = false
@@ -211,6 +287,8 @@ final class AgentCursor: @unchecked Sendable {
         // person switched to is worse than no pointer at all.
         panel.collectionBehavior = [.stationary, .fullScreenAuxiliary, .ignoresCycle]
         let content = AgentCursorView(frame: NSRect(origin: .zero, size: size))
+        content.wantsLayer = true
+        content.layer?.opacity = 0
         panel.contentView = content
         window = panel
         view = content
@@ -232,6 +310,7 @@ private final class CursorPanel: NSPanel {
 
 @MainActor
 final class AgentCursorView: NSView {
+    var artworkClip: CGRect? { didSet { needsDisplay = true } }
     var rippleProgress: Double? { didSet { needsDisplay = true } }
     /// 0..1 呼吸相位，驱动定位光晕与悬停环。
     var hoverPhase: Double = 0 { didSet { needsDisplay = true } }
@@ -242,6 +321,9 @@ final class AgentCursorView: NSView {
 
     override func draw(_ dirtyRect: NSRect) {
         guard let context = NSGraphicsContext.current?.cgContext else { return }
+        context.saveGState()
+        defer { context.restoreGState() }
+        if let artworkClip { context.clip(to: artworkClip) }
         let tip = CGPoint(x: 30, y: bounds.height - 30)
         let phase = hoverPhase.truncatingRemainder(dividingBy: 1)
         let accent = NSColor.controlAccentColor

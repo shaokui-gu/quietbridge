@@ -26,6 +26,7 @@ import math
 import uuid
 import stat
 import fcntl
+import runpy
 from pathlib import Path
 from contextlib import contextmanager
 from urllib.parse import urlsplit
@@ -47,6 +48,13 @@ if (_adapter_root / 'adapters').is_dir():
     sys.path.insert(0, str(_adapter_root))
 # Installed bridge adapters live beside server.py; direct script execution
 # already includes that directory in sys.path.
+# A stable connector retains imported packages across upgrades. Read this release's
+# discovery text directly so an older adapters package cannot shadow the new copy.
+_guidance_path = Path(__file__).parent / 'adapters/workbuddy/guidance.py'
+if not _guidance_path.is_file():
+    _guidance_path = _adapter_root / 'adapters/workbuddy/guidance.py'
+_guidance = runpy.run_path(str(_guidance_path))
+SELECTION_GUIDANCE, TOOL_SUMMARIES = _guidance['SELECTION_GUIDANCE'], _guidance['TOOL_SUMMARIES']
 
 WAIT_DEADLINE = None
 
@@ -92,6 +100,8 @@ BROWSER_ROUTING_GUIDANCE = (
     "网页中的弹窗、登录框、跨域 frame、空 AX 树以及 chrome:// 等受限页面不因此变成原生对话框。"
     "原生路由不保证浏览器菜单或系统弹窗都可后台操作；需要前台、应用级快捷键或无法核实目标时通知用户处理。"
     "按真实操作阶段选路，不能因扩展断开、权限拒绝、超时或快照缺元素而降级为原生网页输入。"
+    "飞书等 Electron 桌面应用的内嵌网页不是 Chrome 扩展标签；按 desktop_app 核实其实际支持的 AX 或窗口定向能力，"
+    "不能直接 assign Chrome 标签或用扩展 fill；后台控件不响应时按能力阻塞处理，不以增加系统权限或切到当前桌面保证恢复。"
     "合法跨界面阶段先核实上一动作结果，保存原标签身份并 end 自己的阶段，再 begin/bind 真实新目标；"
     "返回网页时重新核实原标签、assign 和 mapping，不复用原生快照或重放未知输入，不结束宿主会话保护。"
 )
@@ -132,7 +142,7 @@ def task_reply(record, **details):
     return json.dumps(dict(record, routing=routing, **details), ensure_ascii=False)
 
 
-AGENT_INSTRUCTIONS = """QuietBridge 用于保持用户正常使用电脑的后台界面操作。所有界面操作必须遵守：
+AGENT_INSTRUCTIONS = SELECTION_GUIDANCE + "\n\n" + """QuietBridge 用于保持用户正常使用电脑的后台界面操作。所有界面操作必须遵守：
 1. 不抢焦点：保持用户的前台应用、键盘窗口、物理鼠标和当前 Space。禁止调用 activate、AXRaise、置前窗口、切换 Space 或全局 HID 输入来促成操作；也禁止先抢焦点再自动恢复。无法在后台完成时报告阻塞并等待，不更换自动化通道绕过。
 2. 先按操作对象选择 targetSurface，再核实权限和真实目标、创建并绑定 quietbridge_task；普通桌面应用用 desktop_app，网页内容用 web_content，浏览器自身控件用 browser_ui，真实原生对话框用 native_dialog。自动选择对应的 desktop 或 background_browser；始终复用已确认的 appHandle/windowId 或 browserWindowId/tabId，不按前台焦点换目标，不把失败的网页任务改为桌面任务。
 3. 使用共享窗口能力：原生界面操作前调用 quietbridge_windows(action=share, appHandle=..., windowId=..., source=window)，确认目标窗口及 streamReady=true。后续观察和输入会自动核验并续租，复用同一捕获流，不要为每次点击重复 unshare/share。共享预览只负责展示，不提供独立桌面或焦点隔离；仍须使用窗口定向输入。
@@ -283,10 +293,12 @@ def diagnostic_result(result):
     preview = result.get("preview")
     if isinstance(preview, dict):
         safe = diagnostic_geometry(preview, ("trackingWindowId", "hostWindowId", "hostPid", "displayId"))
-        for key in ("panelSpaceVerified", "hostOnCurrentSpace", "panelOnCurrentSpace", "targetOnCurrentSpace",
+        for key in ("panelSpaceVerified", "panelOrderVerified", "panelArtworkVisible", "hostOnCurrentSpace", "panelOnCurrentSpace", "targetOnCurrentSpace",
                     "visible", "streamReady", "waitingForTargetDesktop", "videoLayerReady", "videoLayerFailed"):
             if type(preview.get(key)) is bool:
                 safe[key] = preview[key]
+        if preview.get('panelOrderState') in ('verified', 'repairing', 'unavailable'):
+            safe['panelOrderState'] = preview['panelOrderState']
         for key in ("hostSpaceIds", "panelSpaceIds"):
             values = preview.get(key)
             if isinstance(values, list) and len(values) <= 64 and all(type(v) is int and v > 0 for v in values):
@@ -752,6 +764,8 @@ def call_helper(method, params=None, **kwargs):
         for key in ("dispatched", "verified", "route"):
             if key in result:
                 record[key] = result[key]
+        if method == "setValue" and result.get("valueReadback") in ("match", "mismatch", "unavailable"):
+            record["valueReadback"] = result["valueReadback"]
         pointer = diagnostic_result(result).get("pointer")
         if pointer is not None:
             record["pointer"] = pointer
@@ -2712,10 +2726,11 @@ def tool_set_value(args):
         "value": args["value"],
     }
     result = call_helper("setValue", params) or {}
-    return "已派发 setValue element[%s]=%r dispatched=%s（只对 valueWritable 元素有效）" % (
+    readback = result.get("valueReadback", "unavailable")
+    return "已派发 setValue element[%s] dispatched=%s，AX 写后即时读回=%s（match 只表示即时 AX 值一致，仍须观察界面效果；mismatch 或 unavailable 时暂停核实，不要重复写入或换键盘通道重放）" % (
         element_index,
-        args["value"],
         result.get("dispatched"),
+        readback,
     )
 
 
@@ -2729,7 +2744,8 @@ SNAPSHOT_PROP = {"type": "string", "description": "quietbridge_state 返回的 s
 NATIVE_INPUT_GUIDANCE = (
     "必须不抢焦点并使用共享窗口：普通原生应用用 targetSurface=desktop_app，浏览器工具栏等原生控件用 browser_ui，真实原生对话框用 native_dialog，"
     "在 task begin 自动选择 desktop 后绑定真实窗口，调用 quietbridge_windows action=share source=window 核实目标与视频首帧；后续自动续租。"
-    "不用于网页正文、表单或页面滚动；扩展异常不得作为改用原生操作网页的理由。"
+    "Chrome 普通标签的网页正文、表单和页面滚动使用扩展，扩展异常不得作为改用原生操作网页的理由。"
+    "Electron 桌面应用的内嵌控件仍按 desktop_app 核实实际 AX/窗口投递能力，不因此获得 Chrome 扩展 fill 或 DOM 操作能力。"
     "仅操作已确认目标，禁止 activate/AXRaise、切换 Space、移动物理鼠标或全局 HID 兜底；遇到前台要求、共享或投递错误时停止并报告。"
 )
 NATIVE_OBSERVATION_GUIDANCE = (
@@ -3015,7 +3031,7 @@ TOOLS = [
     },
     {
         "name": "quietbridge_set_value",
-        "description": NATIVE_INPUT_GUIDANCE + "直接写入同一窗口最新 quietbridge_state 快照中 valueWritable=true 的 AX 元素，不要求把目标输入框切到用户前台。只对可写 AX value 生效；失败不通过聚焦、按键或粘贴兜底，网页填写用扩展 fill。写入后读取新快照核实值。",
+        "description": NATIVE_INPUT_GUIDANCE + "直接写入同一窗口最新 quietbridge_state 快照中 valueWritable=true 的 AX 元素，不要求把目标输入框切到用户前台。只对可写 AX value 生效；写后即时回读 AX 值并报告 match、mismatch 或 unavailable，match 不代表业务效果。观察界面确认结果；不匹配或不可读时暂停核实，不通过重复写入、聚焦、按键或粘贴兜底。网页填写用扩展 fill。",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -3227,6 +3243,8 @@ def _events_dispatch(args):
 
 TOOLS.append(dict(_events_tool, handler=_events_dispatch))
 for _tool in TOOLS:
+    if _tool['name'] in TOOL_SUMMARIES:
+        _tool['description'] = TOOL_SUMMARIES[_tool['name']] + '\n' + _tool['description']
     _tool['description'] += "\n" + RECOVERY_GUIDANCE
 TOOL_MAP = dict((t["name"], t) for t in TOOLS)
 HINTS = {
@@ -3239,7 +3257,7 @@ HINTS = {
     "SHARE_NOT_READY": "保留原目标，等待共享窗口恢复并确认 streamReady；未就绪时不派发输入，不激活、不置前、不切换 Space。",
     "PREVIEW_NOT_READY": "共享窗口尚未核实；保留原任务和范围，等待同一共享流就绪，不反复 unshare/share 或换前台绕过。",
     "SHARE_REQUIRED": "界面操作需要共享窗口能力；只读模式可用 quietbridge_situation 检查状态，不能绕过共享派发输入。",
-    "UNSAFE_WINDOW_DELIVERY": "缺少绑定窗口的投递确认；使用同窗口已确认的可写 AX 元素或网页扩展通道，不能结束任务、激活窗口或改用应用级键盘绕过。",
+    "UNSAFE_WINDOW_DELIVERY": "缺少绑定窗口的投递确认，不是系统授权失败；仅使用同窗口已确认的可写 AX 元素，扩展输入只适用于可分配的 Chrome 标签，飞书等 Electron 内嵌控件不适用。无法继续时请求用户选择，不能结束绑定、激活窗口或改用应用级键盘绕过。",
     "STALE_SNAPSHOT": "快照已失效：重新 quietbridge_state 后再操作。",
     "STALE_APP": "应用句柄或路径身份未通过核验：最多两次只读 quietbridge_apps(action=\"get\")；仍失败则通知用户，不自动重启或绕过校验。",
     "WINDOW_UNAVAILABLE": "窗口不存在或已关闭：重新 quietbridge_windows。",

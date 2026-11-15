@@ -4,6 +4,7 @@ from pathlib import Path
 import shlex
 import sys
 from compatibility import LEGACY_SERVER_NAMES, browser_layout, runtime_root
+from adapters.workbuddy.guidance import CONNECTOR_DESCRIPTION
 
 def owned(entry, home, *, read, app_paths):
     if not isinstance(entry, dict) or not isinstance(entry.get('args'), list):
@@ -51,6 +52,9 @@ def mcp_plan(home, bridge, helper, stable=False, *, checked, read, owns):
     else:
         env['QUIETBRIDGE_HELPER_PATH'] = str(helper)
     entry.update(command=sys.executable, args=['-B', str(bridge)], env=env)
+    # Supply discovery text only when absent; custom host descriptions remain the person's choice.
+    if 'description' not in entry:
+        entry['description'] = CONNECTOR_DESCRIPTION
     servers[key] = entry
     return config, original, (json.dumps(data, ensure_ascii=False, indent=2) + '\n').encode()
 

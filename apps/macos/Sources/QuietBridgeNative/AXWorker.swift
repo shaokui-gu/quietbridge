@@ -206,6 +206,16 @@ actor AXWorker {
         return action
     }
     static var actionResult: JSONValue { .object(["dispatched": .bool(true), "verified": .bool(false)]) }
+    static func setValueResult(expected: String, observed: String?) -> JSONValue {
+        let status: String
+        if let observed {
+            status = expected.utf8.elementsEqual(observed.utf8) ? "match" : "mismatch"
+        } else {
+            status = "unavailable"
+        }
+        return .object(["dispatched": .bool(true), "verified": .bool(false),
+                        "valueReadback": .string(status)])
+    }
     static func clickResult(route: String, action: String? = nil, frontBefore: Int32? = nil,
                             frontAfterAction: Int32? = nil, restorationAttempted: Bool = false,
                             restorationAccepted: Bool? = nil, frontWindowBefore: UInt32? = nil,
@@ -392,7 +402,13 @@ actor AXWorker {
             try NativePlatform.verify(recipient)
             if method == "typeText" { try inputs().0.typeText(params.string("text"), to: recipient.pid) }
             else { try inputs().0.pressKey(params.string("key"), modifiers: params.modifiers(), to: recipient.pid) }
-        case "setValue": try ax().setValue(element(handle, params), params.string("value"))
+        case "setValue":
+            let target = try element(handle, params)
+            let value = try params.string("value")
+            let access = ax()
+            try access.setValue(target, value)
+            let observed = try? access.string(target, "AXValue")
+            return .result(Self.setValueResult(expected: value, observed: observed))
         case "selectText":
             try ax().selectText(element(handle, params), text: params.string("text"), prefix: params.optionalString("prefix"),
                                 suffix: params.optionalString("suffix"), mode: params.optionalString("selectionType") ?? "text")

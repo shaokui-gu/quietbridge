@@ -18,6 +18,8 @@ WorkBuddy ⇄ MCP(stdio/JSON-RPC) ⇄ server.py ⇄ quietbridge-native ⇄ 共�
 
 ## Agent 调用约定
 
+需要后台操作 macOS 应用界面或 Chrome 已登录标签时，初始化指引优先提示发现并选用 QuietBridge；七项主要入口把适用场景放在工具描述开头。默认连接简介在安装时补齐，已有用户自定义简介保留。工具描述是选择线索，不是宿主的数值优先级或授权依据。可直接使用的宿主偏好文本与选用率验收见 [WorkBuddy 工具偏好](../../products/workbuddy-connector/tool-preference.zh.md)。
+
 MCP `initialize` 返回全局 `instructions`，`tools/list` 的各项描述也包含对应操作要求；错误回执会继续给出相同的恢复方向。桥接版本为 `1.1.0`。PKG 使用固定连接入口，后续覆盖安装或升级保持 stdio，完成当前调用后加载新版并发送工具列表更新通知。旧版直连入口首次迁移仍需要宿主刷新与信任确认。
 
 工具回执的 `structuredContent.recovery` 区分 `user_action_required`、`revalidate_required`、`wait_required`、`outcome_unknown`、`blocked` 和明确停止的 `task_stopped`。可恢复错误不结束业务：快照过期、候选变化和通道启动先按回执对原目标作有界恢复；共享暂未就绪最多两次只读复查；输入回执超时先查询原 commandId 和观察，绝不重放副作用。正常 queued 命令继续查询原结果，不因两次普通轮询未结束就弹框。成功的状态读取也可能附带实际权限或连接阻塞；空候选本身不等于权限故障。

@@ -110,13 +110,17 @@ final class SpacePreview {
     private var lastFrameTime: TimeInterval?
     private var nextProgressLog: TimeInterval = 0
     private var frameCount = 0
-    private var visible = false
+    fileprivate var visible = false
     private var lastActivity: TimeInterval = 0
     fileprivate var hostWindow: PreviewHostWindow?
     private var hostSpaceIDs: [UInt64] = []
     private var panelSpaceIDs: [UInt64] = []
-    private var panelSpaceVerified = false
+    fileprivate var panelSpaceVerified = false
     private var panelPlacementError: String?
+    private var panelOrderVerified = false
+    private var panelOrderError: String?
+    private var panelOrderState: WindowOverlayOrdering.Status = .unavailable
+    private var orderingPresentation = OverlayOrderingPresentation()
     private var workspaceObserver: NSObjectProtocol?
     private var displayObserver: NSObjectProtocol?
     private var lastRouteRecord: JSONValue?
@@ -277,6 +281,10 @@ final class SpacePreview {
         panelSpaceIDs = []
         panelSpaceVerified = false
         panelPlacementError = nil
+        panelOrderVerified = false
+        panelOrderError = nil
+        panelOrderState = .unavailable
+        orderingPresentation.reset()
         resetCapture(reason: "release_or_target_change")
         panel?.alphaValue = 0
         panel?.orderOut(nil)
@@ -397,16 +405,22 @@ final class SpacePreview {
         tick()
     }
 
-    /// Lightweight geometry-only updates; capture/Space validation stays on tick().
+    /// Follow geometry and stacking even when the host stays still; capture/Space checks stay on tick().
     private func followHostFrame() {
         guard visible, panelSpaceVerified, let panel, let bound = hostWindow else { return }
         guard let updated = Self.readHostWindow(bound), updated.isOnScreen else {
             setVisible(false)
             return
         }
-        guard updated.bounds != bound.bounds || temporaryPlacement.isActive else { return }
         hostWindow = updated
-        if !syncAnchor(panel: panel, host: updated) { setVisible(false) }
+        if updated.bounds != bound.bounds || temporaryPlacement.isActive {
+            if !syncAnchor(panel: panel, host: updated) { setVisible(false); return }
+        }
+        if let deckID {
+            PreviewDeck.shared.followOrdering(from: deckID, host: updated)
+        } else {
+            _ = syncHostOrdering()
+        }
     }
 
     private func tick() {
@@ -464,7 +478,14 @@ final class SpacePreview {
                 held: leased, source: source, targetOnCurrentSpace: membership?.onCurrentSpace) {
             let panelID = UInt32(exactly: panel.windowNumber)
             let actual = panelID.flatMap { spaces.memberships(windowIDs: [$0])[$0]?.spaceIDs }
-            if !CursorSpaceRoute.matches(actual, target: destination) { panel.alphaValue = 0 }
+            if !CursorSpaceRoute.matches(actual, target: destination) {
+                panel.alphaValue = 0
+                setArtworkVisible(false)
+                panelSpaceVerified = false
+                panelOrderVerified = false
+                panelOrderState = .unavailable
+                orderingPresentation.reset()
+            }
             if syncAnchor(panel: panel, host: host) {
                 shouldShow = assignPanel(panel, to: destination, host: host)
             } else { panelSpaceVerified = false }
@@ -629,7 +650,9 @@ final class SpacePreview {
         // The panel is never key: mouse-moved tracking is what turns the pointer into
         // a resize arrow at the card edges.
         panel.acceptsMouseMovedEvents = true
-        panel.level = NSWindow.Level(rawValue: Int(CGWindowLevelForKey(.floatingWindow)))
+        panel.level = .normal
+        panel.isFloatingPanel = false
+        panel.hidesOnDeactivate = false
         // Membership is explicitly kept equal to the bound WorkBuddy window below.
         // Never join every Space or activate the host to bring the preview along.
         panel.collectionBehavior = [.stationary, .fullScreenAuxiliary, .ignoresCycle]
@@ -642,17 +665,70 @@ final class SpacePreview {
 
     private func setVisible(_ next: Bool) {
         guard let panel else { return }
-        if next {
-            if !panel.isVisible { panel.orderFrontRegardless() }
+        if next, let host = hostWindow, panelSpaceVerified {
+            if !visible {
+                setArtworkVisible(false)
+                panel.hasShadow = false
+                panel.ignoresMouseEvents = true
+            }
+            // A zero-alpha window has no reliable on-screen order. Keep its content
+            // and shadow hidden while AppKit commits the relative ordering request.
             panel.alphaValue = 1
+            if !panel.isVisible { panel.orderFrontRegardless() }
+            if !visible { panel.order(.above, relativeTo: Int(host.windowID)) }
+            visible = true
+            if deckID != nil { PreviewDeck.shared.refresh() }
+            _ = syncHostOrdering()
         } else {
             temporaryPlacement.reset()
             view?.cancelInteraction()
             panel.alphaValue = 0
             if panel.isVisible { panel.orderOut(nil) }
+            visible = false
+            panelOrderVerified = false
+            panelOrderState = .unavailable
+            orderingPresentation.reset()
         }
-        visible = next
-        if next, deckID != nil { PreviewDeck.shared.refresh() }
+    }
+
+    @discardableResult private func syncHostOrdering() -> Bool {
+        guard visible, panelSpaceVerified, let panel, let host = hostWindow else { return false }
+        if deckID != nil { return PreviewDeck.shared.restoreOrdering(host: host) }
+        let status = PreviewHostOrdering.restoreStatus(panels: [panel], host: host)
+        acceptHostOrdering(status)
+        return status == .verified
+    }
+
+    fileprivate func acceptHostOrdering(_ status: WindowOverlayOrdering.Status) {
+        guard let host = hostWindow else { return }
+        panelOrderState = status
+        panelOrderVerified = status == .verified
+        panelOrderError = status == .verified ? nil : status == .repairing
+            ? "预览层级正在更新，等待相邻顺序回读" : "预览或宿主层级不可核实，已隐藏画面"
+        let display = orderingPresentation.update(status, target: .init(windowID: host.windowID, pid: host.pid),
+                                                  now: ProcessInfo.processInfo.systemUptime)
+        if display {
+            panel?.alphaValue = 1
+            setArtworkVisible(true)
+            if panel?.hasShadow == false { panel?.hasShadow = true }
+            panel?.ignoresMouseEvents = false
+        } else {
+            // Ordering may commit on the next run-loop turn. Leave the clear
+            // device registered so the 30Hz follower can verify, without hit testing.
+            setArtworkVisible(false)
+            if panel?.hasShadow == true { panel?.hasShadow = false }
+            panel?.ignoresMouseEvents = true
+            view?.cancelInteraction()
+        }
+        recordPanelRoute()
+    }
+
+    private func setArtworkVisible(_ visible: Bool) {
+        guard view?.layer?.opacity != (visible ? 1 : 0) else { return }
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        view?.layer?.opacity = visible ? 1 : 0
+        CATransaction.commit()
     }
 
     /// Move only the transparent, helper-owned panel, then verify both memberships again.
@@ -667,6 +743,7 @@ final class SpacePreview {
         if !CursorSpaceRoute.matches(panelSpaceIDs, target: destination) || !panel.isVisible {
             panel.alphaValue = 0
             panel.orderFrontRegardless()
+            panel.order(.above, relativeTo: Int(host.windowID))
             guard spaces.assignOverlay(panel, to: destination) else {
                 panelSpaceVerified = false
                 panelPlacementError = "预览面板迁移未通过 Space 回读验证"
@@ -723,6 +800,10 @@ final class SpacePreview {
             "hostSpaceIds": .array(hostSpaceIDs.map { .number(Double($0)) }),
             "panelSpaceIds": .array(panelSpaceIDs.map { .number(Double($0)) }),
             "panelSpaceVerified": .bool(panelSpaceVerified),
+            "panelOrderVerified": .bool(panelOrderVerified),
+            "panelOrderState": .string(panelOrderState.rawValue),
+            "panelArtworkVisible": .bool(orderingPresentation.artworkVisible),
+            "panelOrderError": panelOrderError.map(JSONValue.string) ?? .null,
             "placementError": panelPlacementError.map(JSONValue.string) ?? .null,
         ]
         let record = JSONValue.object(fields)
@@ -763,7 +844,7 @@ final class SpacePreview {
         let hostMembership = hostWindow.flatMap { spaces.memberships(windowIDs: [$0.windowID])[$0.windowID] }
         let panelMembership = panel.flatMap { UInt32(exactly: $0.windowNumber) }
             .flatMap { spaces.memberships(windowIDs: [$0])[$0] }
-        var result: [String: Any] = ["videoFrames": frameCount, "visible": visible && panelMembership?.onCurrentSpace == true, "status": view?.status ?? "",
+        var result: [String: Any] = ["videoFrames": frameCount, "visible": visible && orderingPresentation.artworkVisible && panelMembership?.onCurrentSpace == true, "status": view?.status ?? "",
          "streamGeneration": generation.uuidString, "preferredFPS": Int(preferredFPS),
          "scope": captureSource?.scope ?? source.scope,
          "targetOnCurrentSpace": membership?.onCurrentSpace as Any? ?? NSNull(),
@@ -788,6 +869,10 @@ final class SpacePreview {
          "panelOnCurrentSpace": panelMembership?.onCurrentSpace as Any? ?? NSNull(),
          "panelSpaceVerified": panelSpaceVerified,
          "panelPlacementError": panelPlacementError as Any? ?? NSNull(),
+         "panelOrderVerified": panelOrderVerified,
+         "panelOrderState": panelOrderState.rawValue,
+         "panelArtworkVisible": orderingPresentation.artworkVisible,
+         "panelOrderError": panelOrderError as Any? ?? NSNull(),
          "trackingWindowId": target.map { Int($0.windowID) } ?? 0]
         result["frameProgress"] = streamOutput?.progress.snapshot(now: now) ?? PreviewFrameProgress().snapshot(now: now)
         if let streamLifecycle { result["captureLifecycle"] = streamLifecycle.snapshot() }
@@ -1058,7 +1143,6 @@ final class SpacePreview {
         let scale = min(envelope.width / desired.width, envelope.height / desired.height)
         groups[groupKey] = group
         let width = group.width * scale, height = group.width * front.canvasAspect * scale
-        var previous: Int = 0
         for (rank, key) in ranked.enumerated().reversed() {
             guard let p = previews[key], let panel = p.panel else { continue }
             let frame = CGRect(x: envelope.maxX - width - CGFloat(rank) * 24 * scale,
@@ -1068,12 +1152,35 @@ final class SpacePreview {
             let app = p.target.flatMap { NSRunningApplication(processIdentifier: $0.pid)?.localizedName } ?? "共享窗口"
             let ordinal = (active.firstIndex(of: key) ?? 0) + 1
             p.setFront(rank == 0, label: "● \(app) · 会话 \(ordinal)  ↗", count: ranked.count)
-            if panel.isVisible {
-                if previous > 0 { panel.order(.above, relativeTo: previous) }
-                previous = panel.windowNumber
-            }
         }
+        _ = restoreOrdering(host: host)
         return true
+    }
+
+    /// One 30Hz follower per host group is enough; selection and showing also restore immediately.
+    fileprivate func followOrdering(from client: UUID, host: PreviewHostWindow) {
+        let members = visiblePreviews(host: host)
+        guard members.first?.deckID == client else { return }
+        _ = restoreOrdering(host: host)
+    }
+
+    private func visiblePreviews(host: PreviewHostWindow) -> [SpacePreview] {
+        order.compactMap { previews[$0] }.filter {
+            $0.visible && $0.panelSpaceVerified && $0.panel?.isVisible == true
+                && $0.hostWindow?.pid == host.pid && $0.hostWindow?.windowID == host.windowID
+        }
+    }
+
+    @discardableResult fileprivate func restoreOrdering(host: PreviewHostWindow) -> Bool {
+        let members = visiblePreviews(host: host)
+        guard !members.isEmpty else { return false }
+        let selected = groups[hostKey(host)]?.selected
+        let frontToBack = members.sorted { left, right in
+            left.deckID == selected && right.deckID != selected
+        }
+        let status = PreviewHostOrdering.restoreStatus(panels: frontToBack.reversed().compactMap(\.panel), host: host)
+        for preview in members { preview.acceptHostOrdering(status) }
+        return status == .verified
     }
 
     fileprivate func move(from preview: SpacePreview, frame: CGRect, host: PreviewHostWindow) -> Bool {

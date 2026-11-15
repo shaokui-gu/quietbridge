@@ -468,6 +468,25 @@ class TaskWindowTests(unittest.TestCase):
             self.assertEqual(structured["execution"]["status"], "dispatched")
             self.assertNotIn("private", json.dumps(structured))
 
+    def test_set_value_reports_readback_without_exposing_or_replaying_input(self):
+        self.bind()
+        self.state.update(snapshot="snap-1", snapshot_app="a", snapshot_window=7)
+        original = self.request
+        for status in ("match", "mismatch", "unavailable"):
+            def request(method, params=None, **kwargs):
+                if method == "setValue":
+                    return {"dispatched": True, "verified": False, "valueReadback": status}
+                return original(method, params, **kwargs)
+            self.fake.request.side_effect = request
+            self.fake.request.reset_mock()
+            result = self.rpc("quietbridge_set_value", elementIndex=1, value="private")
+            self.assertFalse(result.get("isError"), result)
+            self.assertIn("AX 写后即时读回=" + status, self.text(result))
+            self.assertNotIn("private", json.dumps(result, ensure_ascii=False))
+            self.assertEqual(result["structuredContent"]["execution"]["requests"][-1]["valueReadback"], status)
+            self.assertEqual(result["structuredContent"]["verification"]["status"], "not_verified")
+            self.assertEqual(sum(c.args[0] == "setValue" for c in self.fake.request.call_args_list), 1)
+
     def test_unready_application_never_dispatches_input(self):
         self.bind()
         original = self.request

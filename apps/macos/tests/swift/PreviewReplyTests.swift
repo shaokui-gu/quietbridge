@@ -47,6 +47,35 @@ import Testing
         #expect(reply?["captureLifecycle"] == nil)
         #expect(reply?["frameProgress"] == nil)
     }
+
+    @Test func hostOrderingEvidenceIsIndependentOfVideoReadinessAndSpaceMembership() {
+        let waiting = RequestCoordinator.previewDiagnosticsSnapshot(
+            ["panelSpaceVerified": true, "panelOrderVerified": false,
+             "panelOrderError": "等待层级回读", "streamReady": true, "visible": false],
+            holding: true, holdRemainingSeconds: 30).object
+        #expect(waiting?["panelSpaceVerified"] == .bool(true))
+        #expect(waiting?["panelOrderVerified"] == .bool(false))
+        #expect(waiting?["panelOrderError"] == .string("等待层级回读"))
+        #expect(waiting?["streamReady"] == .bool(true))
+        #expect(waiting?["visible"] == .bool(false))
+        let ready = RequestCoordinator.previewDiagnosticsSnapshot(
+            ["panelOrderVerified": true], holding: true, holdRemainingSeconds: 30).object
+        #expect(ready?["panelOrderVerified"] == .bool(true))
+        #expect(ready?["panelOrderError"] == .null)
+        let missing = RequestCoordinator.previewDiagnosticsSnapshot([:], holding: false, holdRemainingSeconds: nil).object
+        #expect(missing?["panelOrderVerified"] == .bool(false))
+    }
+
+    @Test func pendingOrderingKeepsItsActualPresentationSeparateFromVerification() {
+        let reply = RequestCoordinator.previewDiagnosticsSnapshot(
+            ["panelOrderState": "repairing", "panelOrderVerified": false,
+             "panelArtworkVisible": true, "visible": true, "panelSpaceVerified": true],
+            holding: true, holdRemainingSeconds: 30).object
+        #expect(reply?["panelOrderState"] == .string("repairing"))
+        #expect(reply?["panelOrderVerified"] == .bool(false))
+        #expect(reply?["panelArtworkVisible"] == .bool(true))
+        #expect(reply?["visible"] == .bool(true))
+    }
 }
 
 @Test @MainActor func browserContentSourceIsDistinctFromWindowVideo() {

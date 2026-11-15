@@ -20,6 +20,7 @@ ROOT = Path(__file__).resolve().parent
 sys.path[:0] = [str(ROOT / 'tools'), str(ROOT / 'services/mcp')]
 from release_layout import bridge_sources
 from compatibility import LEGACY_SERVER_NAMES, runtime_root
+from adapters.workbuddy.guidance import CONNECTOR_DESCRIPTION
 
 
 def checked_path(path):
@@ -150,8 +151,9 @@ def install(root, home, apply=False, verify_signature=True, with_extension=False
     env = dict(old.get('env', {}))
     env.pop('CUA_HELPER_PATH', None)
     env['QUIETBRIDGE_HELPER_PATH'] = str(helper)
-    entry.update(command=sys.executable, args=['-B', str(destination / 'bridge/server.py')],
-                 env=env, description='QuietBridge：macOS 原生界面观察与操作（AX/坐标/键盘），网页任务默认严格后台，通过扩展 CDP 操作固定标签，断连等待且不回退桌面输入；需已授权辅助功能与屏幕录制')
+    entry.update(command=sys.executable, args=['-B', str(destination / 'bridge/server.py')], env=env)
+    if 'description' not in entry:
+        entry['description'] = CONNECTOR_DESCRIPTION
     servers[key] = entry
     rendered = (json.dumps(data, ensure_ascii=False, indent=2) + '\n').encode()
     plan = {'mode': 'install' if apply else 'preview', 'release': str(destination),
