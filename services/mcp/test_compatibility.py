@@ -17,7 +17,7 @@ class CompatibilityTests(unittest.TestCase):
             self.assertEqual(compatibility.environment('QUIETBRIDGE_READ_ONLY'), '')
             self.assertEqual(compatibility.environment('QUIETBRIDGE_ALLOWLIST', 'unset'), 'unset')
 
-    def test_upgrade_reuses_existing_stable_connector_and_browser_storage(self):
+    def test_upgrade_reuses_existing_stable_connector_and_unifies_browser_storage(self):
         with tempfile.TemporaryDirectory() as temporary:
             home = Path(temporary)
             self.assertEqual(compatibility.runtime_root(home).name, 'QuietBridge')
@@ -25,12 +25,16 @@ class CompatibilityTests(unittest.TestCase):
             legacy.mkdir(parents=True)
             self.assertEqual(compatibility.runtime_root(home), legacy)
             old_browser = home / 'Library/Application Support/WorkbuddyExtension'
-            old_browser.mkdir()
+            (old_browser / 'cua-helper-config').mkdir(parents=True)
             root, host, bridge, state = compatibility.browser_layout(home)
-            self.assertEqual(root, old_browser)
-            self.assertEqual(host.name, 'browser-observer-extension')
-            self.assertEqual(bridge.name, 'cua-mcp-bridge')
-            self.assertEqual(state.name, 'cua-helper-config')
+            # One live browser runtime: the app runtime root, not the legacy
+            # WorkbuddyExtension directory. Legacy dirs stay migration sources.
+            self.assertEqual(root, compatibility.runtime_root(home))
+            self.assertEqual(host, root / 'extension/native-host')
+            self.assertEqual(bridge, host)
+            self.assertEqual(state, root)
+            self.assertIn(old_browser / 'cua-helper-config',
+                          compatibility.legacy_browser_state_dirs(home))
 
     def test_old_tool_calls_enter_the_canonical_dispatch_and_recovery_path(self):
         for tool in server.TOOLS:

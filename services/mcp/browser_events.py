@@ -24,9 +24,10 @@ def config_dir():
     override = environment('QUIETBRIDGE_CONFIG_DIR')
     if override:
         return Path(override)
-    installed = RUNTIME / ('cua-helper-config' if RUNTIME.name == 'WorkbuddyExtension' else 'quietbridge-config')
-    if installed.is_dir():
-        return installed
+    # Unified runtime: the native host and the connector share the app runtime
+    # root (browser task state lives beside releases/ and connector/).
+    if RUNTIME.is_dir():
+        return RUNTIME
     return ROOT / 'quietbridge-config'
 
 

@@ -20,6 +20,7 @@ SPEC.loader.exec_module(deploy)
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / 'tools'))
 from release_layout import copy_bridge
+from compatibility import browser_layout
 
 
 class FakeService:
@@ -425,6 +426,10 @@ class DeploymentTests(unittest.TestCase):
         connector = legacy / 'connector/connector.py'
         browser = self.home / 'Library/Application Support/WorkbuddyExtension'
         browser.mkdir()
+        legacy_state = browser / 'cua-helper-config'
+        legacy_state.mkdir()
+        (legacy_state / 'browser-events.json').write_text('{"version": 1, "legacy": true}')
+        (legacy_state / 'task-windows.json').write_text('{"version": 1, "legacy": true}')
         config = self.original['mcpServers'].pop('quietbridge')
         config.update(args=['-B', str(connector)], disabled=True)
         config['env'] = {'CUA_CONFIG_DIR': str(browser / 'cua-helper-config'),
@@ -450,8 +455,13 @@ class DeploymentTests(unittest.TestCase):
         self.assertIn('adapters/workbuddy/lifecycle.py', hooks[0]['hooks'][0]['command'])
         registration = self.home / 'Library/Application Support/Google/Chrome/NativeMessagingHosts/com.cua.browser_observer.json'
         self.assertEqual(json.loads(registration.read_bytes())['path'],
-                         str(browser / 'browser-observer-extension/native-host-launcher.sh'))
-        self.assertTrue((browser / 'cua-mcp-bridge/compatibility.py').is_file())
+                         str(browser_layout(self.home)[1] / 'native-host-launcher.sh'))
+        # The legacy browser directory is only a migration source: no second
+        # native host is registered from it.
+        self.assertFalse((browser / 'browser-observer-extension').exists())
+        for name in ('browser-events.json', 'task-windows.json'):
+            self.assertEqual((self.runtime / name).read_text(),
+                             '{"version": 1, "legacy": true}')
         self.assertFalse((self.home / 'Library/Application Support/QuietBridgeBrowser').exists())
 
     def test_failed_process_audit_cannot_claim_connection_reloaded(self):
@@ -508,7 +518,7 @@ class DeploymentTests(unittest.TestCase):
         config = self.dsh_config(bundle)
         self.assertEqual(config['connector'], str(connector))
         self.assertEqual(config['helper'], str(self.helper))
-        self.assertEqual(config['configDir'], str(self.runtime))
+        self.assertEqual(config['configDir'], str(browser_layout(self.home)[3]))
         self.assertEqual(config['serverName'], 'quietbridge')
         self.assertEqual(config['python'], self.dsh_python())
         self.assertTrue(Path(config['python']).is_absolute())
@@ -640,7 +650,7 @@ class DeploymentTests(unittest.TestCase):
         self.assertEqual(second_config['connector'],
                          str(second_bundle.parent / 'QuietBridge.app/Contents/Resources/bridge/server.py'))
         self.assertEqual(second_config['helper'], str(self.helper))
-        self.assertEqual(second_config['configDir'], str(self.runtime))
+        self.assertEqual(second_config['configDir'], str(browser_layout(self.home)[3]))
         self.assertNotEqual(second_config['connector'], first_config['connector'])
         self.assertEqual(second['dshBundle']['files'], 7)
 

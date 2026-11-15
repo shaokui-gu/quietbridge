@@ -30,7 +30,7 @@ if not (BRIDGE / 'browser_events.py').is_file():
     raise SystemExit(1)
 sys.path.insert(0, str(BRIDGE))
 from browser_events import atomic_write, directory, read_file, require
-from compatibility import browser_layout, browser_runtime_root
+from compatibility import browser_layout, browser_runtime_root, legacy_browser_state_dirs
 
 NAME = 'com.cua.browser_observer'
 BASE = Path(__file__).resolve().parent
@@ -272,7 +272,13 @@ def install(result, update=False, home=None):
     # 项目内副本只是手工调试用；host 实际读取运行态那一份。
     write_json(BASE / 'native-host-config.json', config)
     launcher_changed = write_launcher(result['launcherPath'])
+    # One live host owns the state directory; import the project copy and the
+    # legacy Workbuddy/QuietBridgeBrowser copies only when the target is absent.
     state = migrate_state(BASE.parents[1] / 'quietbridge-config', result['statePath'])
+    for legacy in legacy_browser_state_dirs(home):
+        for name in migrate_state(legacy, result['statePath']):
+            if name not in state:
+                state.append(name)
     write_json(registration, result['manifest'])
     return {'mode': '已更新' if previous is not None else '已安装',
             'changed': bool(copied or launcher_changed or changed_config or state),

@@ -107,10 +107,12 @@ Verified in this repository round (source-level):
 
 Not verified, and not claimed:
 
-- The real Chrome extension channel was not connected in the user profile
-  (`BROWSER_HOST_UNAVAILABLE`). Browser tab assignment, mapping verification and
-  page operations in the real profile are not verified; enable QuietBridge
-  Browser in Chrome and grant the site permission to test them.
+- The real Chrome extension channel is connected after 116: the Chrome native
+  host and browser task state now live in the single QuietBridge runtime
+  (`~/Library/Application Support/QuietBridge`), so the connector and extension
+  read one state directory (probe: `browserChannel=True`, client 0.4.14, six real
+  candidate tabs). Full page operations and tab assignment still need acceptance
+  after installing 116 and restarting DSH/Chrome.
 - DSH preview host binding is not implemented yet; the native side still selects
   preview hosts from its historical host logic. Do not claim DSH preview support.
 - Screenshot/image tool results still reach the model as text plus a saved PNG

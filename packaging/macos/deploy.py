@@ -35,7 +35,8 @@ if (_module_root / 'services/mcp').is_dir():
     sys.path[:0] = [str(_module_root / 'services/mcp'), str(_module_root)]
 from compatibility import (LEGACY_APP_NAMES, LEGACY_SERVER_NAMES, PUBLISHED_CONNECTOR_DIGESTS,
                            MENU_IDENTIFIER, HELPER_IDENTIFIER,
-                           LEGACY_MENU_IDENTIFIER, LEGACY_HELPER_IDENTIFIER, runtime_root)
+                           LEGACY_MENU_IDENTIFIER, LEGACY_HELPER_IDENTIFIER, runtime_root,
+                           legacy_browser_state_dirs)
 from adapters.workbuddy import configuration as workbuddy
 
 # Keep the existing launchd storage key so upgrades can stop/restore the same job.
@@ -703,15 +704,24 @@ def deploy(home, helper, app=APP, support=SUPPORT, service=None, upgrade=None):
     if previous is not None:
         value = json.loads(previous)
         if (not isinstance(value, dict) or value.get('name') != host.NAME or
-                value.get('allowed_origins') != plan['manifest']['allowed_origins'] or
-                Path(value.get('path', '')) != Path(plan['launcherPath'])):
+                value.get('allowed_origins') != plan['manifest']['allowed_origins']):
             raise ValueError('原生宿主注册被其他组件占用；未覆盖')
+        # Same host name and origin: a legacy WorkbuddyExtension launcher path is
+        # this product's own previous registration and is migrated below.
     manifest = connector.with_name('active.json')
     generation = str(uuid.uuid4())
     active = json.dumps({'generation': generation, 'bridge': str(bridge), 'helper': str(helper),
                          'version': menu_info['CFBundleShortVersionString']}).encode()
     files = [(config, original, rendered, 0o600),
              (settings, old_settings, rendered_settings, 0o600)]
+    # Migrate the legacy browser task state into the single QuietBridge runtime;
+    # never keep two live native hosts or two state directories.
+    for legacy_state in legacy_browser_state_dirs(home):
+        for name in ('browser-events.json', 'task-windows.json'):
+            source_state = legacy_state / name
+            target_state = Path(plan['statePath']) / name
+            if source_state.is_file() and not target_state.exists():
+                files.append((target_state, read(target_state), source_state.read_bytes(), 0o600))
     stable_modules = ['connector.py', 'stdio_transport.py', 'compatibility.py', 'lifecycle_store.py',
                       'session_routing.py', 'session_registry.py', 'browser_events.py', 'browser_preview.py']
     stable_modules += [str(path.relative_to(bridge.parent)) for path in sorted((bridge.parent / 'adapters').rglob('*.py'))]
@@ -744,7 +754,10 @@ def deploy(home, helper, app=APP, support=SUPPORT, service=None, upgrade=None):
     # Render the optional DeepSeek Harness bundle from the already verified
     # release and add it to the same transaction. Failure here is recorded, not
     # raised: the Workbuddy package install remains the primary contract.
-    dsh_files, dsh_summary = dsh_bundle_plan(release, bridge, helper, runtime)
+    # The DSH connector must read the same browser state directory as the Chrome
+    # native host (browser-events.json, task-windows.json, host-lifecycle), or
+    # the extension channel reports BRIDGE_HOST_UNAVAILABLE forever.
+    dsh_files, dsh_summary = dsh_bundle_plan(release, bridge, helper, Path(plan['statePath']))
     files.extend(dsh_files)
     # Publish last: a running connector only sees a fully committed file set.
     files.append((manifest, read(manifest), active, 0o600))

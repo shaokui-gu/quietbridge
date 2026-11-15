@@ -758,9 +758,13 @@ PKG 0.6.29（113）安装成功后，用官方 CLI 把部署的 bundle 加入用
 - 契约性拒绝（非故障）：`quietbridge_type_text`/`quietbridge_key`/`quietbridge_paste`
   对 desktop 绑定任务返回 `UNSAFE_WINDOW_DELIVERY`，未发生焦点窃取；
   `quietbridge_wait_ready` 在无 AXWebArea 的原生窗口返回 `needs_visual_review`。
-- 浏览器能力未验收：`browserChannel=false`，`quietbridge_browser_events` 返回
-  `BROWSER_HOST_UNAVAILABLE`（需用户在 Chrome 启用 QuietBridge Browser 扩展并授权站点）；
-  `quietbridge_browser_session` 的 prepare/list 正常。
+- 浏览器能力：114/115 阶段 `browserChannel=false`。根因是 Chrome 原生宿主与任务状态在
+  `WorkbuddyExtension` 旧目录，而 bundle `configDir` 在
+  `~/Library/Application Support/QuietBridge`，扩展心跳与连接器读的不是同一目录。
+  116 把原生宿主、bridge 副本与浏览器任务状态统一到 QuietBridge 运行态（旧目录仅作
+  一次性迁移来源，Chrome 只注册一个 host）；连接器级实测 `browserChannel=True`、
+  `clientVersion=0.4.14`、6 个真实候选标签。完整网页操作需安装 116 并重启 DSH/Chrome
+  后继续验收。
 - 发现并修复回执缺陷：真实 session 事件 `tool/call.data.arguments` 是 JSON 字符串，
   bundle 原样透传导致 lifecycle `toolInput` 非对象、begin/bind 回执被丢弃；同一宿主
   轮次内第一次 `end` 后再 `end` 第二个阶段即 `SESSION_ROUTING_REQUIRED`。修复为 bundle

@@ -23,7 +23,7 @@ import tempfile
 ROOT = Path(__file__).resolve().parent
 sys.path[:0] = [str(ROOT / 'tools'), str(ROOT / 'services/mcp')]
 from release_layout import bridge_sources
-from compatibility import LEGACY_SERVER_NAMES, runtime_root
+from compatibility import LEGACY_SERVER_NAMES, browser_layout, runtime_root
 from adapters.workbuddy.guidance import CONNECTOR_DESCRIPTION
 
 
@@ -266,7 +266,7 @@ def dsh_bundle(root, home, destination, *, apply=False, connector=None, helper=N
     # setup inputs and the helper stay under the strict symlink-free resolver.
     plan = bundle_render(source, target, python=sys.executable,
                          connector=bridge, helper=resolved_helper,
-                         config_dir=checked_path(runtime_root(home)), server_name=server_name,
+                         config_dir=checked_path(browser_layout(home)[3]), server_name=server_name,
                          apply=apply)
     plan['mode'] = 'install' if apply else 'preview'
     plan['profileChanged'] = False

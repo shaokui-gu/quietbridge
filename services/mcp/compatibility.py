@@ -39,17 +39,28 @@ def runtime_root(home=None):
 
 
 def browser_runtime_root(home=None):
+    """The one browser runtime root, inside the QuietBridge app runtime.
+
+    Chrome's native host, browser task state and the Harness connector must all
+    read and write the same directory. Legacy WorkbuddyExtension /
+    QuietBridgeBrowser storage is only a migration source; it must never stay
+    registered as a second live host.
+    """
+    return runtime_root(home)
+
+
+def legacy_browser_state_dirs(home=None):
     base = Path(home or Path.home()) / 'Library/Application Support'
-    legacy = base / 'WorkbuddyExtension'
-    return legacy if legacy.exists() else base / 'QuietBridgeBrowser'
+    return (base / 'WorkbuddyExtension' / 'cua-helper-config',
+            base / 'QuietBridgeBrowser' / 'quietbridge-config')
 
 
 def browser_layout(home=None):
     root = browser_runtime_root(home)
-    legacy = root.name == 'WorkbuddyExtension'
-    return (root, root / ('browser-observer-extension' if legacy else 'extensions/chromium'),
-            root / ('cua-mcp-bridge' if legacy else 'services/mcp'),
-            root / ('cua-helper-config' if legacy else 'quietbridge-config'))
+    host = root / 'extension' / 'native-host'
+    # Host, bridge modules and task state live together so the Chrome native
+    # host and the connector cannot drift into two state directories.
+    return (root, host, host, root)
 
 
 def application_runtime():

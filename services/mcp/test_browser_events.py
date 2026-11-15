@@ -1444,14 +1444,15 @@ class BrowserEventsTests(unittest.TestCase):
                                 env={'HOME': str(self.base), 'PATH': '/usr/bin:/bin'})
         self.assertEqual(result.returncode, 0, result.stderr)
         plan = json.loads(result.stdout)
-        runtime = self.base / 'Library/Application Support/QuietBridgeBrowser'
+        runtime = self.base / 'Library/Application Support/QuietBridge'
+        host_dir = runtime / 'extension/native-host'
         # 注册与运行态都在用户 Library，不在项目或 Documents 下：Chrome 派生的解释器
-        # 读不了 TCC 保护的 ~/Documents。
-        self.assertEqual(plan['launcherPath'], str(runtime / 'extensions/chromium'
-                                                   / 'native-host-launcher.sh'))
+        # 读不了 TCC 保护的 ~/Documents；浏览器 host 与 connector 共享同一运行态根。
+        self.assertEqual(plan['launcherPath'], str(host_dir / 'native-host-launcher.sh'))
         self.assertEqual(plan['manifest']['path'], plan['launcherPath'])
-        self.assertEqual(plan['hostPath'], str(runtime / 'extensions/chromium' / 'native_host.py'))
-        self.assertEqual(plan['bridgePath'], str(runtime / 'services/mcp' / 'browser_events.py'))
+        self.assertEqual(plan['hostPath'], str(host_dir / 'native_host.py'))
+        self.assertEqual(plan['bridgePath'], str(host_dir / 'browser_events.py'))
+        self.assertEqual(plan['statePath'], str(runtime))
         self.assertEqual(plan['manifestPath'], str(self.base / 'Library/Application Support'
                                                    / 'Google/Chrome/NativeMessagingHosts'
                                                    / 'com.cua.browser_observer.json'))
@@ -2089,8 +2090,8 @@ class BrowserEventsTests(unittest.TestCase):
             self.assertEqual(events.config_dir(), self.base / 'env')
             os.environ.pop('QUIETBRIDGE_CONFIG_DIR')
             self.assertEqual(events.config_dir(), self.base / 'proj' / 'quietbridge-config')
-            (self.base / 'rt' / 'quietbridge-config').mkdir(parents=True)
-            self.assertEqual(events.config_dir(), self.base / 'rt' / 'quietbridge-config')
+            (self.base / 'rt').mkdir(parents=True)
+            self.assertEqual(events.config_dir(), self.base / 'rt')
 
     def test_launcher_uses_system_interpreter_not_session_python(self):
         path = installer.pick_interpreter()
@@ -2111,18 +2112,18 @@ class BrowserEventsTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         outcome = json.loads(result.stdout)
         self.assertEqual(outcome['mode'], '已安装')
-        runtime = self.base / 'Library/Application Support/QuietBridgeBrowser'
-        host_dir = runtime / 'extensions/chromium'
+        runtime = self.base / 'Library/Application Support/QuietBridge'
+        host_dir = runtime / 'extension/native-host'
         # 运行态是自包含副本：host 与 bridge 都不再指向项目目录。
         self.assertEqual((host_dir / 'native_host.py').read_bytes(),
                          (ext / 'native_host.py').read_bytes())
-        self.assertEqual((runtime / 'services/mcp' / 'browser_events.py').read_bytes(),
+        self.assertEqual((host_dir / 'browser_events.py').read_bytes(),
                          (ext.parents[1] / 'services/mcp' / 'browser_events.py').read_bytes())
         self.assertEqual(json.loads((host_dir / 'native-host-config.json').read_text()),
                          {'allowed_origins': [DERIVED_ORIGIN]})
-        # 首次部署把项目内的记录迁到运行态。
+        # 首次部署把项目内的记录迁到运行态根。
         self.assertIn('task-windows.json', outcome['migratedState'])
-        state = json.loads((runtime / 'quietbridge-config' / 'task-windows.json').read_text())
+        state = json.loads((runtime / 'task-windows.json').read_text())
         self.assertEqual(state['activeTaskId'], None)
         registration = json.loads((self.base / 'Library/Application Support/Google/Chrome'
                                   / 'NativeMessagingHosts/com.cua.browser_observer.json').read_text())

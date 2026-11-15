@@ -109,15 +109,34 @@ store 未清理旧墓碑。新进程的 `turn/start` 命中 `_tombstone()`，被
   lifecycle store 中新 turn 直接为存活状态（`stoppedAt=null`、`sessionEnded=false`），
   `permissions`/`apps` 与两阶段任务再次全部通过，回执自动落盘。
 
-## 4. 浏览器通道（未验收）
+## 4. 浏览器通道：目录分叉定位与统一（116）
 
-`quietbridge_permissions.browserChannel=False`；`quietbridge_browser_events` 的
-status/candidates 返回 `nativeConnection: host_unavailable`、
-`BROWSER_HOST_UNAVAILABLE`，恢复要求用户在 Chrome 中启用 QuietBridge Browser
-扩展、授权站点并让面板显示扩展已连接。因此以下能力本轮**未执行、不宣称**：
-`assign`、`verify_mapping`、`snapshot`、`read`、`click/fill/select`、`navigate`、
-`tabs`、`create_target`、`render_probe`、`browser_session start/attach`。
-隔离测试与扩展单元测试（117 项）仍是这些路径的现有证据。
+现象：Chrome 扩展面板显示“已连接 / 已准备就绪”（最后握手正常），但连接器始终
+`browserChannel=False`，`browser_events` 返回 `BROWSER_HOST_UNAVAILABLE`。
+
+根因：Chrome 的 `com.cua.browser_observer` 原生宿主注册仍指向旧
+`WorkbuddyExtension/browser-observer-extension`，状态写入
+`WorkbuddyExtension/cua-helper-config`；而 DSH bundle 的 `configDir` 是
+`~/Library/Application Support/QuietBridge`。扩展心跳与连接器读取的是两个不同目录，
+所以扩展明明在线，连接器却认为宿主不可用。
+
+按“只保留一个 QuietBridge 运行态、不为浏览器装第二套扩展/原生宿主”修复：
+
+- `compatibility.browser_layout()` 统一到应用运行态根：host 位于
+  `~/Library/Application Support/QuietBridge/extension/native-host/`，bridge 模块与
+  `browser-events.json` / `task-windows.json` 位于 QuietBridge 根；
+- Chrome 原生宿主注册改为 QuietBridge 自己的 launcher，旧 WorkbuddyExtension 不再注册
+  第二个 host；`install_native_host.py` 与 `deploy.py` 将旧
+  `WorkbuddyExtension/cua-helper-config`、`QuietBridgeBrowser/quietbridge-config` 作为
+  迁移来源，首次部署时复制任务状态到 QuietBridge 根（不覆盖已有文件）；
+- DSH bundle `configDir` 保持 QuietBridge 根，与原生宿主、任务状态共用同一目录。
+
+连接器级实测（使用 115 release bridge + 真实扩展，仅把 configDir 指向统一状态目录）：
+`browserChannel=True`、`clientVersion=0.4.14`、`globalPermission=true`，candidates 返回
+6 个真实 Chrome 标签（URL 可见），`browser_session list` 正常。完整页面操作
+（`snapshot/read/click/fill/select/navigate/screenshot/scroll/keypress/diagnostics`、
+`assign`、`verify_mapping`、`tabs/select_tab`）仍需安装 116 并重启 DSH/Chrome 后，
+经宿主实际通道验收；在此之前不宣称 DSH 网页自动化已完成。
 
 ## 5. 回归与产物
 
@@ -128,7 +147,7 @@ status/candidates 返回 `nativeConnection: host_unavailable`、
 | 打包回归 | 57 项通过 |
 | 浏览器扩展 | 117 项通过 |
 | DSH 隔离实机 | `--agents 3` passed（19 工具、turn、路由、容量） |
-| PKG | 0.6.29（115）重新打包并离线核验，见发布说明 |
+| PKG | 0.6.29（116）重新打包并离线核验，见发布说明 |
 
 验证证据：
 
@@ -141,7 +160,7 @@ status/candidates 返回 `nativeConnection: host_unavailable`、
 
 ## 6. 剩余限制
 
-- 真实 Chrome 扩展通道、标签分配与 mapping 未验收（需用户启用扩展）；
+- 真实 Chrome 扩展通道已连通（116），但完整页面操作/标签分配与 mapping 需安装 116 并重启 DSH/Chrome 后验收；
 - DSH 原生预览宿主窗口绑定未实现；图片结果仍以文本 + 落盘路径返回；
 - 真实 profile 的并发 Agent、长跑与 Workbuddy 预览视觉验收未做；
 - PKG 外层未签名/未公证（沿用现行发布策略）。
