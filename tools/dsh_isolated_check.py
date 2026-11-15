@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """Reproduce the isolated DeepSeek Harness live check for the QuietBridge bundle.
 
 One throwaway temp root and one throwaway ``DSH_HOME``: the check never reads or

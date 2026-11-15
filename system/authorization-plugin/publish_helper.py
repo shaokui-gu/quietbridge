@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """Publish signed helper code for system authorization-host signature inspection.
 
 Does not change authorization rules, start the helper, or edit user configuration.

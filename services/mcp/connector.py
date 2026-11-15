@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """Stable stdio endpoint; switch bridge releases only between complete requests.
 
 No request is replayed. Each bridge generation owns its handles/helper client.

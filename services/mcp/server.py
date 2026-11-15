@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """MCP stdio bridge for the quietbridge-native macOS helper.
 
 The host speaks MCP (JSON-RPC over stdio); the helper speaks a private

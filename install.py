@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """quietbridge user installer. Preview by default; --install applies changes.
 
 加 --with-extension 可一并部署浏览器扩展的原生宿主并拉起本机安装页；

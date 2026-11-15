@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """Package an already-built release executable; never install it on this Mac."""
 import argparse
 import gzip

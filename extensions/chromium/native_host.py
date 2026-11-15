@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """原生端口多请求 framing；标准输出只承载协议，不操作浏览器。"""
 import json
 from pathlib import Path

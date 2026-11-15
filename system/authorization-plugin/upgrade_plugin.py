@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """Swap the installed plug-in for the locally built one and move the remote
 branch back to SecurityAgent's user-level host.
 

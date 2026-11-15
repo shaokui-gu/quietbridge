@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """quietbridge 浏览器扩展安装页（仅监听 127.0.0.1）。
 
 为什么要这个页面：Chrome 137 起移除了 --load-extension，扩展无法再被程序

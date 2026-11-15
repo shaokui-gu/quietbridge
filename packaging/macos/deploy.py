@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """Deploy user components transactionally. Never change authorizationdb.
 
 Run as the desktop user, after the root installer has published the signed helper.

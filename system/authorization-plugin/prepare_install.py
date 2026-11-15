@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """Stage the explicit experimental installation outside protected Documents.
 
 Run as the desktop user. sudo handles administrator authentication locally;

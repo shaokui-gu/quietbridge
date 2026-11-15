@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """Local fixture and content-free analysis; never controls a browser or desktop."""
 import argparse
 from collections import defaultdict
