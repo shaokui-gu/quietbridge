@@ -14,6 +14,12 @@ Current release: **0.6.29 (build 118)**. The locally built package is
 helper and authorization plug-in are Developer ID signed; the outer PKG is
 intentionally unsigned and not notarized in this build.
 
+## Product preview
+
+[![QuietBridge macOS control panel in light and dark appearances](docs/images/quietbridge-control-panel.png)](https://www.figma.com/design/Tr6hAfLgUAulbXkagRyX3S?node-id=7-4)
+
+[![QuietBridge single browser shared preview](docs/images/quietbridge-shared-preview.png)](https://www.figma.com/design/Tr6hAfLgUAulbXkagRyX3S?node-id=153-1092)
+
 ## What it provides
 
 - **One macOS application** (`QuietBridge.app`, menu-bar accessory) with the

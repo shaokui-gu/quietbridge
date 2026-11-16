@@ -10,6 +10,12 @@ QuietBridge 把 AI Agent 接到 **macOS 后台原生应用与浏览器操作** �
 （SHA256 `de679aea9de8d62affff2f97de77f24e74f16c06f3d6b9dd3ead12580fad85c7`）。
 app、helper 与授权插件使用 Developer ID 签名；外层 PKG 按现行策略不签名、不公证。
 
+## 产品预览
+
+[![QuietBridge macOS 控制面板浅色与深色外观](docs/images/quietbridge-control-panel.png)](https://www.figma.com/design/Tr6hAfLgUAulbXkagRyX3S?node-id=7-4)
+
+[![QuietBridge 浏览器单窗口共享预览](docs/images/quietbridge-shared-preview.png)](https://www.figma.com/design/Tr6hAfLgUAulbXkagRyX3S?node-id=153-1092)
+
 ## 提供什么
 
 - **一个 macOS 应用**（`QuietBridge.app`，菜单栏常驻）：签名原生 helper、权限管理与可选
